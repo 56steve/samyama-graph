@@ -37,20 +37,88 @@ struct LdbcQuery {
     category: &'static str,
 }
 
+/// LDBC SNB query substitution parameters, externalized per scale factor.
+///
+/// Query templates use `{{placeholder}}` tokens; these are filled from a
+/// `--params-file <json>` (see the competitor-benchmarks repo,
+/// `config/ldbc-snb-interactive/<sf>.json`). Omitted fields fall back to the
+/// SF1 defaults below (person 933 = "Mahinda Perera"). Static reference data
+/// (countries, tag class) and the dataset's time span are scale-independent, so
+/// a larger-scale config need only override the entity ids, `firstName`, and `tagName`.
+#[derive(serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct Params {
+    person_id: i64,
+    person2_id: i64,
+    message_id: i64,
+    post_id: i64,
+    first_name: String,
+    country_x: String,
+    country_y: String,
+    tag_name: String,
+    tag_class_name: String,
+    max_date: i64,
+    start_date: i64,
+    end_date: i64,
+}
+
+impl Default for Params {
+    fn default() -> Self {
+        Params {
+            person_id: 933,
+            person2_id: 4139,
+            message_id: 1236950581249,
+            post_id: 1236950581248,
+            first_name: "Mahinda".into(),
+            country_x: "India".into(),
+            country_y: "Pakistan".into(),
+            tag_name: "Hamid_Karzai".into(),
+            tag_class_name: "MusicalArtist".into(),
+            max_date: 1354320000000,
+            start_date: 1338508800000,
+            end_date: 1341100800000,
+        }
+    }
+}
+
+impl Params {
+    fn load(path: &str) -> Result<Self, String> {
+        let s = std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path, e))?;
+        serde_json::from_str(&s).map_err(|e| format!("parse {}: {}", path, e))
+    }
+
+    /// Substitute `{{token}}` placeholders in a query template.
+    fn apply(&self, template: &str) -> String {
+        template
+            .replace("{{personId}}", &self.person_id.to_string())
+            .replace("{{person2Id}}", &self.person2_id.to_string())
+            .replace("{{messageId}}", &self.message_id.to_string())
+            .replace("{{postId}}", &self.post_id.to_string())
+            .replace("{{firstName}}", &self.first_name)
+            .replace("{{countryX}}", &self.country_x)
+            .replace("{{countryY}}", &self.country_y)
+            .replace("{{tagName}}", &self.tag_name)
+            .replace("{{tagClassName}}", &self.tag_class_name)
+            .replace("{{maxDate}}", &self.max_date.to_string())
+            .replace("{{startDate}}", &self.start_date.to_string())
+            .replace("{{endDate}}", &self.end_date.to_string())
+    }
+}
+
 /// Build the list of 21 LDBC SNB Interactive queries adapted for Samyama.
 ///
 /// Parameter choices (from SF1 dataset):
-///   personId    = 933              (Mahinda Perera)
-///   person2Id   = 4139             (Mahinda's first KNOWS target)
-///   messageId   = 1236950581249    (first comment)
-///   postId      = 1236950581248    (first post, by person 933)
-///   firstName   = "Mahinda"
-///   countryX    = "India", countryY = "Pakistan"
-///   tagName     = "Hamid_Karzai"
-///   tagClassName = "MusicalArtist"
-///   maxDate     = 1354320000000    (2012-12-01)
-///   startDate   = 1338508800000    (2012-06-01)
-///   endDate     = 1341100800000    (2012-07-01)
+///   personId    = {{personId}}              ({{firstName}} Perera)
+///   person2Id   = {{person2Id}}             ({{firstName}}'s first KNOWS target)
+///   messageId   = {{messageId}}    (first comment)
+///   postId      = {{postId}}    (first post, by person {{personId}})
+///   firstName   = "{{firstName}}"
+///   countryX    = "{{countryX}}", countryY = "{{countryY}}"
+///   tagName     = "{{tagName}}"
+///   tagClassName = "{{tagClassName}}"
+///   maxDate     = {{maxDate}}    (2012-12-01)
+///   startDate   = {{startDate}}    (2012-06-01)
+///   endDate     = {{endDate}}    (2012-07-01)
 fn ldbc_queries() -> Vec<LdbcQuery> {
     vec![
         // ================================================================
@@ -62,7 +130,7 @@ fn ldbc_queries() -> Vec<LdbcQuery> {
             name: "Person Profile",
             category: "short",
             cypher: "\
-MATCH (p:Person {id: 933})
+MATCH (p:Person {id: {{personId}}})
 RETURN p.firstName, p.lastName, p.birthday, p.locationIP, p.browserUsed, p.gender, p.creationDate",
         },
 
@@ -72,7 +140,7 @@ RETURN p.firstName, p.lastName, p.birthday, p.locationIP, p.browserUsed, p.gende
             category: "short",
             // Adapted: query Posts only (Comment variant would be a separate UNION)
             cypher: "\
-MATCH (p:Person {id: 933})<-[:HAS_CREATOR]-(m:Post)
+MATCH (p:Person {id: {{personId}}})<-[:HAS_CREATOR]-(m:Post)
 RETURN m.id, m.content, m.creationDate
 ORDER BY m.creationDate DESC
 LIMIT 10",
@@ -83,7 +151,7 @@ LIMIT 10",
             name: "Friends of Person",
             category: "short",
             cypher: "\
-MATCH (p:Person {id: 933})-[:KNOWS]-(friend:Person)
+MATCH (p:Person {id: {{personId}}})-[:KNOWS]-(friend:Person)
 RETURN friend.id, friend.firstName, friend.lastName
 ORDER BY friend.firstName, friend.lastName",
         },
@@ -93,7 +161,7 @@ ORDER BY friend.firstName, friend.lastName",
             name: "Post Content",
             category: "short",
             cypher: "\
-MATCH (m:Post {id: 1236950581248})
+MATCH (m:Post {id: {{postId}}})
 RETURN m.creationDate, coalesce(m.content, m.imageFile)",
         },
 
@@ -102,7 +170,7 @@ RETURN m.creationDate, coalesce(m.content, m.imageFile)",
             name: "Post Creator",
             category: "short",
             cypher: "\
-MATCH (m:Post {id: 1236950581248})-[:HAS_CREATOR]->(p:Person)
+MATCH (m:Post {id: {{postId}}})-[:HAS_CREATOR]->(p:Person)
 RETURN p.id, p.firstName, p.lastName",
         },
 
@@ -111,7 +179,7 @@ RETURN p.id, p.firstName, p.lastName",
             name: "Forum of Post",
             category: "short",
             cypher: "\
-MATCH (m:Post {id: 1236950581248})<-[:CONTAINER_OF]-(f:Forum)-[:HAS_MODERATOR]->(mod:Person)
+MATCH (m:Post {id: {{postId}}})<-[:CONTAINER_OF]-(f:Forum)-[:HAS_MODERATOR]->(mod:Person)
 RETURN f.id, f.title, mod.id, mod.firstName, mod.lastName",
         },
 
@@ -122,7 +190,7 @@ RETURN f.id, f.title, mod.id, mod.firstName, mod.lastName",
             // LDBC IS7: replies with isKnows check — uses EXISTS subquery (equivalent to OPTIONAL MATCH + CASE)
             // Note: OPTIONAL MATCH version is semantically correct but triggers full Post scan in planner
             cypher: "\
-MATCH (m:Post {id: 1236950581248})<-[:REPLY_OF]-(c:Comment)-[:HAS_CREATOR]->(author:Person)
+MATCH (m:Post {id: {{postId}}})<-[:REPLY_OF]-(c:Comment)-[:HAS_CREATOR]->(author:Person)
 MATCH (m)-[:HAS_CREATOR]->(op:Person)
 RETURN c.id, c.content, c.creationDate, author.id, author.firstName, author.lastName, EXISTS { MATCH (op)-[:KNOWS]-(author) } AS isKnows
 ORDER BY c.creationDate DESC
@@ -139,8 +207,8 @@ LIMIT 20",
             category: "complex",
             // Friends up to distance 3 with a given first name
             cypher: "\
-MATCH (p:Person {id: 933})-[:KNOWS*1..3]-(friend:Person {firstName: \"Mahinda\"})
-WHERE friend.id <> 933
+MATCH (p:Person {id: {{personId}}})-[:KNOWS*1..3]-(friend:Person {firstName: \"{{firstName}}\"})
+WHERE friend.id <> {{personId}}
 RETURN DISTINCT friend.id, friend.lastName, friend.birthday, friend.creationDate,
        friend.gender, friend.browserUsed, friend.locationIP
 ORDER BY friend.lastName
@@ -153,8 +221,8 @@ LIMIT 20",
             category: "complex",
             // Recent posts by direct friends
             cypher: "\
-MATCH (p:Person {id: 933})-[:KNOWS]-(friend:Person)<-[:HAS_CREATOR]-(m:Post)
-WHERE m.creationDate < 1354320000000
+MATCH (p:Person {id: {{personId}}})-[:KNOWS]-(friend:Person)<-[:HAS_CREATOR]-(m:Post)
+WHERE m.creationDate < {{maxDate}}
 RETURN friend.id, friend.firstName, friend.lastName,
        m.id, m.content, m.creationDate
 ORDER BY m.creationDate DESC
@@ -167,12 +235,12 @@ LIMIT 20",
             category: "complex",
             // Friends who posted in two given countries within a date range
             cypher: "\
-MATCH (p:Person {id: 933})-[:KNOWS*1..2]-(friend:Person)
-WHERE friend.id <> 933
+MATCH (p:Person {id: {{personId}}})-[:KNOWS*1..2]-(friend:Person)
+WHERE friend.id <> {{personId}}
 WITH DISTINCT friend
 MATCH (friend)<-[:HAS_CREATOR]-(m:Post)-[:IS_LOCATED_IN]->(place:Place)
-WHERE m.creationDate >= 1338508800000 AND m.creationDate < 1341100800000
-  AND (place.name = \"India\" OR place.name = \"Pakistan\")
+WHERE m.creationDate >= {{startDate}} AND m.creationDate < {{endDate}}
+  AND (place.name = \"{{countryX}}\" OR place.name = \"{{countryY}}\")
 RETURN friend.id, friend.firstName, friend.lastName, count(m) AS msgCount
 ORDER BY msgCount DESC
 LIMIT 20",
@@ -184,8 +252,8 @@ LIMIT 20",
             category: "complex",
             // Tags on posts created by friends within a date window
             cypher: "\
-MATCH (p:Person {id: 933})-[:KNOWS]-(friend:Person)<-[:HAS_CREATOR]-(post:Post)-[:HAS_TAG]->(tag:Tag)
-WHERE post.creationDate >= 1338508800000 AND post.creationDate < 1341100800000
+MATCH (p:Person {id: {{personId}}})-[:KNOWS]-(friend:Person)<-[:HAS_CREATOR]-(post:Post)-[:HAS_TAG]->(tag:Tag)
+WHERE post.creationDate >= {{startDate}} AND post.creationDate < {{endDate}}
 RETURN tag.name, count(post) AS postCount
 ORDER BY postCount DESC
 LIMIT 10",
@@ -197,8 +265,8 @@ LIMIT 10",
             category: "complex",
             // Forums joined by friends-of-friends after a given date
             cypher: "\
-MATCH (p:Person {id: 933})-[:KNOWS*1..2]-(friend:Person)
-WHERE friend.id <> 933
+MATCH (p:Person {id: {{personId}}})-[:KNOWS*1..2]-(friend:Person)
+WHERE friend.id <> {{personId}}
 WITH DISTINCT friend
 MATCH (friend)<-[:HAS_MEMBER]-(forum:Forum)
 RETURN forum.id, forum.title, count(friend) AS memberCount
@@ -212,11 +280,11 @@ LIMIT 20",
             category: "complex",
             // Tags that co-occur with a given tag on posts by friends-of-friends
             cypher: "\
-MATCH (p:Person {id: 933})-[:KNOWS*1..2]-(friend:Person)<-[:HAS_CREATOR]-(post:Post)-[:HAS_TAG]->(tag:Tag {name: \"Hamid_Karzai\"})
-WHERE friend.id <> 933
+MATCH (p:Person {id: {{personId}}})-[:KNOWS*1..2]-(friend:Person)<-[:HAS_CREATOR]-(post:Post)-[:HAS_TAG]->(tag:Tag {name: \"{{tagName}}\"})
+WHERE friend.id <> {{personId}}
 WITH DISTINCT post
 MATCH (post)-[:HAS_TAG]->(otherTag:Tag)
-WHERE otherTag.name <> \"Hamid_Karzai\"
+WHERE otherTag.name <> \"{{tagName}}\"
 RETURN otherTag.name, count(post) AS postCount
 ORDER BY postCount DESC
 LIMIT 10",
@@ -228,7 +296,7 @@ LIMIT 10",
             category: "complex",
             // People who liked a person's posts, with recency
             cypher: "\
-MATCH (p:Person {id: 933})<-[:HAS_CREATOR]-(m:Post)<-[:LIKES]-(liker:Person)
+MATCH (p:Person {id: {{personId}}})<-[:HAS_CREATOR]-(m:Post)<-[:LIKES]-(liker:Person)
 RETURN liker.id, liker.firstName, liker.lastName, m.id, m.creationDate
 ORDER BY m.creationDate DESC
 LIMIT 20",
@@ -240,7 +308,7 @@ LIMIT 20",
             category: "complex",
             // Recent reply-comments to a person's posts
             cypher: "\
-MATCH (p:Person {id: 933})<-[:HAS_CREATOR]-(m:Post)<-[:REPLY_OF]-(c:Comment)-[:HAS_CREATOR]->(author:Person)
+MATCH (p:Person {id: {{personId}}})<-[:HAS_CREATOR]-(m:Post)<-[:REPLY_OF]-(c:Comment)-[:HAS_CREATOR]->(author:Person)
 RETURN author.id, author.firstName, author.lastName, c.creationDate, c.id, c.content
 ORDER BY c.creationDate DESC
 LIMIT 20",
@@ -252,8 +320,8 @@ LIMIT 20",
             category: "complex",
             // Recent posts by friends-of-friends
             cypher: "\
-MATCH (p:Person {id: 933})-[:KNOWS*1..2]-(friend:Person)<-[:HAS_CREATOR]-(m:Post)
-WHERE friend.id <> 933 AND m.creationDate < 1354320000000
+MATCH (p:Person {id: {{personId}}})-[:KNOWS*1..2]-(friend:Person)<-[:HAS_CREATOR]-(m:Post)
+WHERE friend.id <> {{personId}} AND m.creationDate < {{maxDate}}
 RETURN DISTINCT friend.id, friend.firstName, friend.lastName,
        m.id, coalesce(m.content, m.imageFile), m.creationDate
 ORDER BY m.creationDate DESC
@@ -266,8 +334,8 @@ LIMIT 20",
             category: "complex",
             // Full LDBC IC10: friends-of-friends NOT already friends, ranked by shared interests
             cypher: "\
-MATCH (p:Person {id: 933})-[:KNOWS*2]-(stranger:Person)
-WHERE stranger.id <> 933 AND NOT EXISTS { MATCH (p)-[:KNOWS]-(stranger) }
+MATCH (p:Person {id: {{personId}}})-[:KNOWS*2]-(stranger:Person)
+WHERE stranger.id <> {{personId}} AND NOT EXISTS { MATCH (p)-[:KNOWS]-(stranger) }
 WITH DISTINCT stranger
 MATCH (stranger)-[:HAS_INTEREST]->(tag:Tag)
 RETURN stranger.id, stranger.firstName, stranger.lastName, count(tag) AS commonInterests
@@ -281,8 +349,8 @@ LIMIT 10",
             category: "complex",
             // Friends-of-friends who worked at a company before a given year
             cypher: "\
-MATCH (p:Person {id: 933})-[:KNOWS*1..2]-(friend:Person)-[wa:WORK_AT]->(org:Organisation)
-WHERE friend.id <> 933 AND org.name = \"MDLR_Airlines\" AND wa.workFrom < 2012
+MATCH (p:Person {id: {{personId}}})-[:KNOWS*1..2]-(friend:Person)-[wa:WORK_AT]->(org:Organisation)
+WHERE friend.id <> {{personId}} AND org.name = \"MDLR_Airlines\" AND wa.workFrom < 2012
 RETURN DISTINCT friend.id, friend.firstName, friend.lastName, wa.workFrom, org.name
 ORDER BY wa.workFrom
 LIMIT 10",
@@ -294,8 +362,8 @@ LIMIT 10",
             category: "complex",
             // Full LDBC IC12: friends who replied to posts tagged with a given tag class, count distinct replies
             cypher: "\
-MATCH (p:Person {id: 933})-[:KNOWS]-(friend:Person)<-[:HAS_CREATOR]-(c:Comment)-[:REPLY_OF]->(post:Post)-[:HAS_TAG]->(tag:Tag)-[:HAS_TYPE]->(tc:TagClass)
-WHERE tc.name = \"MusicalArtist\"
+MATCH (p:Person {id: {{personId}}})-[:KNOWS]-(friend:Person)<-[:HAS_CREATOR]-(c:Comment)-[:REPLY_OF]->(post:Post)-[:HAS_TAG]->(tag:Tag)-[:HAS_TYPE]->(tc:TagClass)
+WHERE tc.name = \"{{tagClassName}}\"
 RETURN friend.id, friend.firstName, friend.lastName, count(DISTINCT c) AS replyCount
 ORDER BY replyCount DESC
 LIMIT 10",
@@ -307,7 +375,7 @@ LIMIT 10",
             name: "Single Shortest Path",
             category: "complex",
             cypher: "\
-MATCH p = shortestPath((p1:Person {id: 933})-[:KNOWS*]-(p2:Person {id: 4139}))
+MATCH p = shortestPath((p1:Person {id: {{personId}}})-[:KNOWS*]-(p2:Person {id: {{person2Id}}}))
 RETURN length(p) AS pathLength",
         },
 
@@ -317,7 +385,7 @@ RETURN length(p) AS pathLength",
             name: "Trusted Connection Paths",
             category: "complex",
             cypher: "\
-MATCH p = allShortestPaths((p1:Person {id: 933})-[:KNOWS*]-(p2:Person {id: 4139}))
+MATCH p = allShortestPaths((p1:Person {id: {{personId}}})-[:KNOWS*]-(p2:Person {id: {{person2Id}}}))
 RETURN length(p) AS pathLength, nodes(p) AS pathNodes",
         },
     ]
@@ -338,7 +406,7 @@ CREATE (p:Person {id: 999999, firstName: \"TestUser\", lastName: \"Benchmark\", 
             name: "Add Like to Post",
             category: "update",
             cypher: "\
-MATCH (p:Person {id: 999999}), (m:Post {id: 1236950581248})
+MATCH (p:Person {id: 999999}), (m:Post {id: {{postId}}})
 CREATE (p)-[:LIKES {creationDate: 1709251200000}]->(m)",
         },
         LdbcQuery {
@@ -346,7 +414,7 @@ CREATE (p)-[:LIKES {creationDate: 1709251200000}]->(m)",
             name: "Add Like to Comment",
             category: "update",
             cypher: "\
-MATCH (p:Person {id: 999999}), (m:Comment {id: 1236950581249})
+MATCH (p:Person {id: 999999}), (m:Comment {id: {{messageId}}})
 CREATE (p)-[:LIKES {creationDate: 1709251200000}]->(m)",
         },
         LdbcQuery {
@@ -361,7 +429,7 @@ CREATE (f:Forum {id: 999998, title: \"Benchmark Forum\", creationDate: 170925120
             name: "Add Forum Member",
             category: "update",
             cypher: "\
-MATCH (f:Forum {id: 999998}), (p:Person {id: 933})
+MATCH (f:Forum {id: 999998}), (p:Person {id: {{personId}}})
 CREATE (f)-[:HAS_MEMBER {joinDate: 1709251200000}]->(p)",
         },
         LdbcQuery {
@@ -383,7 +451,7 @@ CREATE (c:Comment {id: 999996, creationDate: 1709251200000, locationIP: \"1.2.3.
             name: "Add Friendship",
             category: "update",
             cypher: "\
-MATCH (p1:Person {id: 933}), (p2:Person {id: 999999})
+MATCH (p1:Person {id: {{personId}}}), (p2:Person {id: 999999})
 CREATE (p1)-[:KNOWS {creationDate: 1709251200000}]->(p2)",
         },
     ]
@@ -410,7 +478,7 @@ DETACH DELETE p",
             name: "Delete Like (Post)",
             category: "delete",
             cypher: "\
-MATCH (p:Person {id: 933})-[l:LIKES]->(m:Post {id: 1236950581248})
+MATCH (p:Person {id: {{personId}}})-[l:LIKES]->(m:Post {id: {{postId}}})
 DELETE l",
         },
         // DEL-3: Remove LIKES edge from Person to Comment
@@ -419,7 +487,7 @@ DELETE l",
             name: "Delete Like (Comment)",
             category: "delete",
             cypher: "\
-MATCH (p:Person {id: 933})-[l:LIKES]->(c:Comment {id: 1236950581249})
+MATCH (p:Person {id: {{personId}}})-[l:LIKES]->(c:Comment {id: {{messageId}}})
 DELETE l",
         },
         // DEL-4: Remove a Forum (cascading via DETACH DELETE)
@@ -437,7 +505,7 @@ DETACH DELETE f",
             name: "Delete Forum Member",
             category: "delete",
             cypher: "\
-MATCH (f:Forum {id: 999998})-[m:HAS_MEMBER]->(p:Person {id: 933})
+MATCH (f:Forum {id: 999998})-[m:HAS_MEMBER]->(p:Person {id: {{personId}}})
 DELETE m",
         },
         // DEL-6: Remove a Post (cascading via DETACH DELETE)
@@ -464,7 +532,7 @@ DETACH DELETE c",
             name: "Delete Friendship",
             category: "delete",
             cypher: "\
-MATCH (p1:Person {id: 933})-[k:KNOWS]->(p2:Person {id: 999999})
+MATCH (p1:Person {id: {{personId}}})-[k:KNOWS]->(p2:Person {id: 999999})
 DELETE k",
         },
     ]
@@ -500,14 +568,15 @@ fn format_ms(d: Duration) -> String {
 async fn run_benchmark(
     client: &EmbeddedClient,
     query: &LdbcQuery,
+    cypher: &str,
     runs: usize,
 ) -> BenchResult {
     let is_update = query.category == "update" || query.category == "delete";
     // Warm-up: 1 run, discard (skip for updates — they mutate state)
     let warmup = if is_update {
-        client.query("default", query.cypher).await
+        client.query("default", cypher).await
     } else {
-        client.query_readonly("default", query.cypher).await
+        client.query_readonly("default", cypher).await
     };
     if let Err(e) = &warmup {
         return BenchResult {
@@ -529,9 +598,9 @@ async fn run_benchmark(
     for _ in 0..actual_runs {
         let start = Instant::now();
         let run_result = if is_update {
-            client.query("default", query.cypher).await
+            client.query("default", cypher).await
         } else {
-            client.query_readonly("default", query.cypher).await
+            client.query_readonly("default", cypher).await
         };
         match run_result {
             Ok(result) => {
@@ -598,6 +667,17 @@ async fn main() -> Result<(), Error> {
     let include_updates = args.iter().any(|a| a == "--updates");
     let include_deletes = args.iter().any(|a| a == "--deletes");
 
+    // Substitution parameters: --params-file <json> (per scale factor), else SF1 defaults.
+    let params = if let Some(pos) = args.iter().position(|a| a == "--params-file") {
+        let p = args.get(pos + 1).expect("--params-file requires a path argument");
+        Params::load(p).unwrap_or_else(|e| {
+            eprintln!("ERROR loading params file: {}", e);
+            std::process::exit(1);
+        })
+    } else {
+        Params::default()
+    };
+
     if !data_dir.exists() {
         eprintln!("ERROR: Data directory not found: {}", data_dir.display());
         eprintln!("Download LDBC SF1 data and extract to: {}", default_dir);
@@ -607,7 +687,10 @@ async fn main() -> Result<(), Error> {
     // ========================================================================
     // Load dataset
     // ========================================================================
-    eprintln!("LDBC SNB Interactive Benchmark — Samyama v0.5.8");
+    eprintln!(
+        "LDBC SNB Interactive Benchmark — Samyama v{}",
+        env!("CARGO_PKG_VERSION")
+    );
     eprintln!();
 
     let client = EmbeddedClient::new();
@@ -651,6 +734,10 @@ async fn main() -> Result<(), Error> {
     );
 
     eprintln!("Runs per query: {}", runs);
+    eprintln!(
+        "Params: personId={} person2Id={} postId={} firstName=\"{}\" tagName=\"{}\"",
+        params.person_id, params.person2_id, params.post_id, params.first_name, params.tag_name
+    );
     eprintln!();
 
     // ========================================================================
@@ -708,7 +795,8 @@ async fn main() -> Result<(), Error> {
 
         eprint!("  Running {}...\r", query.id);
 
-        let result = run_benchmark(&client, query, runs).await;
+        let cypher = params.apply(query.cypher);
+        let result = run_benchmark(&client, query, &cypher, runs).await;
 
         if let Some(ref err) = result.error {
             println!("{:<6}{:<32}{:>8}{:>12}{:>12}{:>12}  ERROR",
