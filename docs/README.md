@@ -29,7 +29,7 @@ If you're new to the codebase, start with the book; if you're touching a subsyst
 - **[product/](./product/)** — product management artifacts (personas, workflows, test cases).
 - **[test-results/](./test-results/)** — test execution reports.
 - **[optimization/](./optimization/)** — optimization case study + workflow notes (see also `crates/samyama-optimization/` and ADR-026).
-- **[ldbc/](./ldbc/)** — LDBC benchmark results (SNB Interactive, FinBench, Graphalytics).
+- **[BENCHMARKS.md](./BENCHMARKS.md)** — LDBC SNB Interactive benchmark results (SF1 + SF10).
 - **[archive/](./archive/)** — historical documents and earlier-phase records.
 
 ### Retired

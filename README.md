@@ -493,7 +493,7 @@ samyama
 | **The Book** | [graph.samyama.cloud/book](https://graph.samyama.cloud/book/) |
 | Biomedical Benchmark | [100 queries, 96 pass](https://graph.samyama.cloud/book/biomedical_benchmark.html) |
 | Cypher Compatibility | [docs/CYPHER_COMPATIBILITY.md](docs/CYPHER_COMPATIBILITY.md) |
-| LDBC Results | [docs/ldbc/](docs/ldbc/) |
+| LDBC Results | [docs/BENCHMARKS.md](docs/BENCHMARKS.md) |
 | Architecture Decisions | [docs/ADR/](docs/ADR/) |
 | API Spec | [api/openapi.yaml](api/openapi.yaml) |
 | Troubleshooting & Support | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) |
