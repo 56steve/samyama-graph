@@ -10,12 +10,14 @@ name: GPU CI (self-hosted)
 #   - for pull_request, is gated behind the `gpu-ci` GitHub Environment, which the repo
 #     admin configures with required reviewers — a maintainer must approve each run.
 # Configure: Settings → Environments → gpu-ci → Required reviewers. Do NOT remove the gate.
+#
+# MANUAL-ONLY: this lane targets a `[self-hosted, gpu]` runner. When that runner is
+# offline, push/pull_request triggers queue a job that waits forever (and shows a
+# cancelled ✗ when killed). So it is dispatch-only — run it by hand from the Actions
+# tab (or `gh workflow run gpu-ci.yml`) once a GPU runner is online. Re-add push/
+# pull_request triggers when the self-hosted GPU runner is permanently available.
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
 env:
