@@ -176,6 +176,17 @@ async fn main() -> Result<(), Error> {
     let mondo_snap = get_arg(&args, "--mondo-snap");
     let combined_snapshot = get_arg(&args, "--combined-snapshot");
     let skip_queries = args.iter().any(|a| a == "--skip-queries");
+    // Optional cross-KG entity dedup (ADR-018): merge nodes sharing any of these
+    // property keys within a label (e.g. Disease by mondo_id across ClinVar/OpenTargets/MONDO).
+    let dedup_keys_str: Option<String> = args
+        .iter()
+        .position(|a| a == "--dedup-keys")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let dedup_keys: Vec<&str> = dedup_keys_str
+        .as_deref()
+        .map(|s| s.split(',').map(|k| k.trim()).filter(|k| !k.is_empty()).collect())
+        .unwrap_or_default();
     let di_data = get_arg(&args, "--di-data");
     let surv_data = get_arg(&args, "--surv-data");
     let hd_data = get_arg(&args, "--hd-data");
@@ -208,9 +219,17 @@ async fn main() -> Result<(), Error> {
         ("MONDO", &mondo_snap),
     ] {
         if let Some(ref p) = path {
-            eprint!("Importing {} snapshot... ", name);
+            if dedup_keys.is_empty() {
+                eprint!("Importing {} snapshot... ", name);
+            } else {
+                eprint!("Importing {} snapshot (dedup {:?})... ", name, dedup_keys);
+            }
             let t0 = Instant::now();
-            let stats = client.import_snapshot("default", p).await?;
+            let stats = if dedup_keys.is_empty() {
+                client.import_snapshot("default", p).await?
+            } else {
+                client.import_snapshot_dedup("default", p, &dedup_keys).await?
+            };
             eprintln!(
                 "{} nodes, {} edges in {:.1}s",
                 stats.node_count,
