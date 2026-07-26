@@ -174,6 +174,8 @@ async fn main() -> Result<(), Error> {
     let opentargets_snap = get_arg(&args, "--opentargets-snap");
     let hpo_snap = get_arg(&args, "--hpo-snap");
     let mondo_snap = get_arg(&args, "--mondo-snap");
+    let combined_snapshot = get_arg(&args, "--combined-snapshot");
+    let skip_queries = args.iter().any(|a| a == "--skip-queries");
     let di_data = get_arg(&args, "--di-data");
     let surv_data = get_arg(&args, "--surv-data");
     let hd_data = get_arg(&args, "--hd-data");
@@ -457,6 +459,18 @@ async fn main() -> Result<(), Error> {
         idx_ok,
         idx_start.elapsed().as_secs_f64()
     );
+
+    // ── Combined-snapshot export (optional) ──
+    if let Some(ref cs) = combined_snapshot {
+        eprintln!("Exporting combined snapshot to {} ...", cs.display());
+        let t0 = Instant::now();
+        client.export_snapshot("default", cs).await?;
+        eprintln!("Combined snapshot exported in {:.1}s", t0.elapsed().as_secs_f64());
+    }
+    if skip_queries {
+        eprintln!("--skip-queries set; skipping query phase.");
+        return Ok(());
+    }
 
     // ── Phase 4: Load and run queries ──
     let mut all_queries = Vec::new();
