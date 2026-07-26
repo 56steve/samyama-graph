@@ -169,6 +169,11 @@ async fn main() -> Result<(), Error> {
     let surv_snap = get_arg(&args, "--surv-snap");
     let hd_snap = get_arg(&args, "--hd-snap");
     let hs_snap = get_arg(&args, "--hs-snap");
+    let clinvar_snap = get_arg(&args, "--clinvar-snap");
+    let chembl_snap = get_arg(&args, "--chembl-snap");
+    let opentargets_snap = get_arg(&args, "--opentargets-snap");
+    let hpo_snap = get_arg(&args, "--hpo-snap");
+    let mondo_snap = get_arg(&args, "--mondo-snap");
     let di_data = get_arg(&args, "--di-data");
     let surv_data = get_arg(&args, "--surv-data");
     let hd_data = get_arg(&args, "--hd-data");
@@ -194,6 +199,11 @@ async fn main() -> Result<(), Error> {
         ("Surveillance", &surv_snap),
         ("Health Determinants", &hd_snap),
         ("Health Systems", &hs_snap),
+        ("ClinVar", &clinvar_snap),
+        ("ChEMBL", &chembl_snap),
+        ("OpenTargets", &opentargets_snap),
+        ("HPO", &hpo_snap),
+        ("MONDO", &mondo_snap),
     ] {
         if let Some(ref p) = path {
             eprint!("Importing {} snapshot... ", name);
@@ -464,6 +474,9 @@ async fn main() -> Result<(), Error> {
         "faers-queries.csv",
         "omop-queries.csv",
         "mega-benchmark-queries.csv",
+        "public-health-complex-queries.csv",
+        "omics-complex-queries.csv",
+        "emr-clinical-complex-queries.csv",
     ] {
         let path = queries_dir.join(filename);
         let queries = parse_csv_queries(&path);
