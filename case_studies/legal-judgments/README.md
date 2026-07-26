@@ -8,6 +8,20 @@ laws span the widest range of subjects?") become single Cypher traversals.
 Reproduces a public reference demo (PostgreSQL + Apache AGE + pgvector) by Shreyas Rao
 on Samyama — one engine instead of three.
 
+## Live on graph.samyama.cloud
+
+The same 589-judgment graph, loaded into the hosted **Samyama Visualizer** (Enterprise) at
+[graph.samyama.cloud](https://graph.samyama.cloud): the dashboard reports the graph at a glance
+(4,462 nodes · 8,363 edges · 5 labels · 4 edge types), and the query console runs live Cypher with
+interactive, force-directed graph exploration — including full-screen network views. One engine —
+no Postgres + Apache AGE + pgvector stack to operate, and no ETL between three systems.
+
+![Samyama Cloud Visualizer — legal judgments](cloud-demo.gif)
+
+*Full-resolution screen recording: [`cloud-demo.mp4`](cloud-demo.mp4).*
+
+### Terminal quick-look
+
 ![Legal Judgments demo](demo.gif)
 
 ```bash
@@ -62,6 +76,18 @@ narrows to 1.5× on the 2-hop join, where both engines do real traversal work.
 
 *Method: same host, warm connection, median of 40 round-trips; two client transports (Postgres binary vs
 HTTP). A like-for-like local comparison at this dataset size — not a large-scale benchmark.*
+
+**What this means for a scaling workload**
+
+- **One engine, not three.** The reference stack needs PostgreSQL + Apache AGE (Cypher) + pgvector
+  (semantic search). Samyama does graph, vector and analytics in a single process — fewer moving parts,
+  one query language, no cross-system ETL.
+- **The gap compounds with query volume.** Apache AGE re-plans every `cypher()` call, so its per-query
+  cost stays roughly fixed no matter how often the query runs; Samyama caches the plan and executes over a
+  native in-memory graph, so repeated and analytics-heavy workloads compound the 8–36× advantage.
+- **Interactive by default.** The same graph is explorable live on
+  [graph.samyama.cloud](https://graph.samyama.cloud) (see above) — the sub-millisecond reads are exactly
+  what make that force-directed exploration feel instant.
 
 ## Showcase queries
 
