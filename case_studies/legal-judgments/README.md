@@ -89,6 +89,36 @@ HTTP). A like-for-like local comparison at this dataset size — not a large-sca
   [graph.samyama.cloud](https://graph.samyama.cloud) (see above) — the sub-millisecond reads are exactly
   what make that force-directed exploration feel instant.
 
+## Benchmark — vector search vs pgvector
+
+The reference stack uses **pgvector** for semantic search. We loaded the *same* vectors
+(dimension 384, HNSW + cosine) into both **PostgreSQL 17 + pgvector** and **Samyama**, and ran
+identical k-NN queries (k = 10, median of 40 warm queries, multiple runs):
+
+| Corpus | pgvector (server compute) | pgvector (client, over TCP) | Samyama (embedded) |
+|---|---|---|---|
+| 589 vectors (this dataset) | ~0.18 ms | ~0.85 ms | ~0.20 ms |
+| 50,000 vectors | ~2.1 ms | ~3.0 ms | **~0.67 ms** |
+
+**Read honestly:**
+
+- **At this dataset's size (589), vector search is a tie.** pgvector's HNSW is excellent — its pure
+  search compute (~0.18 ms) matches Samyama's (~0.20 ms). No vector-search win is claimed at small scale.
+- **The advantage appears with scale.** At 50k vectors Samyama's search compute is **~3× faster** than
+  pgvector's (0.67 ms vs 2.1 ms), and the gap widens as the corpus grows — the case for workloads that
+  keep scaling up.
+- **One engine, not a separate service.** pgvector runs *inside* PostgreSQL, reached over the network on
+  every query (~0.85 ms client latency here, even on localhost). Samyama can run **embedded (in-process)**
+  — skipping the network hop entirely — or as a service (HTTP/RESP) when needed.
+
+Together with the graph benchmark above (8–36× vs Apache AGE), the takeaway is a **single engine for
+graph *and* vectors** instead of PostgreSQL + Apache AGE + pgvector.
+
+*Method: identical vectors in both engines; HNSW cosine (pgvector `hnsw`, `ef_search = 100`); k = 10;
+median of 40 warm queries; single host. pgvector via psycopg2 (server-side time isolated with
+`EXPLAIN ANALYZE`); Samyama via the embedded SDK. The 50k set is synthetic vectors at the same
+dimension, to show how search scales beyond this dataset — it measures latency, not embedding quality.*
+
 ## Showcase queries
 
 See [`queries.cypher`](queries.cypher). Every query passes the **Definition-of-Done gate**
