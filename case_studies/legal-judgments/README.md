@@ -91,33 +91,39 @@ HTTP). A like-for-like local comparison at this dataset size — not a large-sca
 
 ## Benchmark — vector search vs pgvector
 
-The reference stack uses **pgvector** for semantic search. We loaded the *same* vectors
-(dimension 384, HNSW + cosine) into both **PostgreSQL 17 + pgvector** and **Samyama**, and ran
-identical k-NN queries (k = 10, median of 40 warm queries, multiple runs):
+The reference stack uses **pgvector** for semantic search. To compare k-NN *search speed*, we
+loaded the *same synthetic vectors* — at dimensions **128** and **768** (standard sizes in Samyama's
+own [`vector_benchmark`](../../benches/vector_benchmark.rs) suite) — with an HNSW + cosine index into
+both **PostgreSQL 17 + pgvector** and **Samyama**, and ran identical k-NN queries (k = 10, median of
+40 warm queries). This isolates search latency; it is **not** a semantic-quality test, and the vectors
+are not embeddings of the judgments.
 
-| Corpus | pgvector (server compute) | pgvector (client, over TCP) | Samyama (embedded) |
-|---|---|---|---|
-| 589 vectors (this dataset) | ~0.18 ms | ~0.85 ms | ~0.20 ms |
-| 50,000 vectors | ~2.1 ms | ~3.0 ms | **~0.67 ms** |
+| Dim | Vectors | pgvector (server compute) | pgvector (client, over TCP) | Samyama (embedded) |
+|---|---|---|---|---|
+| 128 | 589 | 0.135 ms | 0.561 ms | **0.090 ms** |
+| 128 | 10,000 | 0.869 ms | 1.557 ms | **0.253 ms** |
+| 768 | 589 | 1.244 ms | 2.166 ms | **0.473 ms** |
+| 768 | 10,000 | 1.867 ms | 2.978 ms | **0.993 ms** |
 
 **Read honestly:**
 
-- **At this dataset's size (589), vector search is a tie.** pgvector's HNSW is excellent — its pure
-  search compute (~0.18 ms) matches Samyama's (~0.20 ms). No vector-search win is claimed at small scale.
-- **The advantage appears with scale.** At 50k vectors Samyama's search compute is **~3× faster** than
-  pgvector's (0.67 ms vs 2.1 ms), and the gap widens as the corpus grows — the case for workloads that
-  keep scaling up.
-- **One engine, not a separate service.** pgvector runs *inside* PostgreSQL, reached over the network on
-  every query (~0.85 ms client latency here, even on localhost). Samyama can run **embedded (in-process)**
-  — skipping the network hop entirely — or as a service (HTTP/RESP) when needed.
+- **On pure search compute, Samyama is faster in every case** — from **1.5×** (dim 128, 589) to
+  **3.4×** (dim 128, 10k). The gap is widest at lower dimension / larger corpus and narrows to **1.9×**
+  at dim 768 / 10k, where pgvector's SIMD-optimized distance compute is strongest.
+- **Real-world the gap is 3–6×**, because pgvector runs *inside* PostgreSQL and is reached over the
+  network on every query (client latency includes the TCP hop, even on localhost). Samyama can run
+  **embedded (in-process)**, skipping the hop — or as a service (HTTP/RESP) when needed.
+- **One engine, not a separate service** — one engine for graph *and* vectors, versus a three-part
+  PostgreSQL + Apache AGE + pgvector stack.
 
 Together with the graph benchmark above (8–36× vs Apache AGE), the takeaway is a **single engine for
-graph *and* vectors** instead of PostgreSQL + Apache AGE + pgvector.
+graph *and* vectors**.
 
-*Method: identical vectors in both engines; HNSW cosine (pgvector `hnsw`, `ef_search = 100`); k = 10;
-median of 40 warm queries; single host. pgvector via psycopg2 (server-side time isolated with
-`EXPLAIN ANALYZE`); Samyama via the embedded SDK. The 50k set is synthetic vectors at the same
-dimension, to show how search scales beyond this dataset — it measures latency, not embedding quality.*
+*Method: identical synthetic vectors in both engines (dims 128 & 768, matching Samyama's
+`vector_benchmark` dimension set); HNSW cosine (pgvector `hnsw`, `ef_search = 100`); k = 10; median of
+40 warm queries; single host. pgvector via psycopg2 (server-side time isolated with `EXPLAIN ANALYZE`);
+Samyama via the embedded SDK — the same in-process timing model as Samyama's published LDBC results.
+Measures k-NN search latency, not embedding quality.*
 
 ## Showcase queries
 
