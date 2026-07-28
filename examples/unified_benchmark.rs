@@ -200,7 +200,11 @@ async fn main() -> Result<(), Error> {
     let client = EmbeddedClient::new();
     let total_start = Instant::now();
 
-    // ── Phase 1: Import large snapshots ──
+    // ── Phase 1: Import bulk sources (plain, no dedup) ──
+    // These carry the mass of the graph (Articles, Persons, Visits, reports…) whose
+    // entities are unique to their source, so running them through the dedup index
+    // would cost a full-store scan per import for zero merges (mirrors enterprise
+    // ADR-018 Phase-1 / Phase-1.5 split).
     for (name, path) in &[
         ("PubMed", &pubmed_snap),
         ("Clinical Trials", &ct_snap),
@@ -212,6 +216,25 @@ async fn main() -> Result<(), Error> {
         ("Surveillance", &surv_snap),
         ("Health Determinants", &hd_snap),
         ("Health Systems", &hs_snap),
+    ] {
+        if let Some(ref p) = path {
+            eprint!("Importing {} snapshot... ", name);
+            let t0 = Instant::now();
+            let stats = client.import_snapshot("default", p).await?;
+            eprintln!(
+                "{} nodes, {} edges, {} merged in {:.1}s",
+                stats.node_count,
+                stats.edge_count,
+                stats.merged_count,
+                t0.elapsed().as_secs_f64()
+            );
+        }
+    }
+
+    // ── Phase 1.5: Import cross-KG entity sources (deduped when --dedup-keys set) ──
+    // These share entities with each other and with Phase 1 (Disease, Gene, Protein,
+    // Drug, Country…), so they are the ones worth merging.
+    for (name, path) in &[
         ("ClinVar", &clinvar_snap),
         ("ChEMBL", &chembl_snap),
         ("OpenTargets", &opentargets_snap),
@@ -231,9 +254,10 @@ async fn main() -> Result<(), Error> {
                 client.import_snapshot_dedup("default", p, &dedup_keys).await?
             };
             eprintln!(
-                "{} nodes, {} edges in {:.1}s",
+                "{} nodes, {} edges, {} MERGED in {:.1}s",
                 stats.node_count,
                 stats.edge_count,
+                stats.merged_count,
                 t0.elapsed().as_secs_f64()
             );
         }
