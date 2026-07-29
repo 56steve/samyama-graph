@@ -169,6 +169,24 @@ async fn main() -> Result<(), Error> {
     let surv_snap = get_arg(&args, "--surv-snap");
     let hd_snap = get_arg(&args, "--hd-snap");
     let hs_snap = get_arg(&args, "--hs-snap");
+    let clinvar_snap = get_arg(&args, "--clinvar-snap");
+    let chembl_snap = get_arg(&args, "--chembl-snap");
+    let opentargets_snap = get_arg(&args, "--opentargets-snap");
+    let hpo_snap = get_arg(&args, "--hpo-snap");
+    let mondo_snap = get_arg(&args, "--mondo-snap");
+    let combined_snapshot = get_arg(&args, "--combined-snapshot");
+    let skip_queries = args.iter().any(|a| a == "--skip-queries");
+    // Optional cross-KG entity dedup (ADR-018): merge nodes sharing any of these
+    // property keys within a label (e.g. Disease by mondo_id across ClinVar/OpenTargets/MONDO).
+    let dedup_keys_str: Option<String> = args
+        .iter()
+        .position(|a| a == "--dedup-keys")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let dedup_keys: Vec<&str> = dedup_keys_str
+        .as_deref()
+        .map(|s| s.split(',').map(|k| k.trim()).filter(|k| !k.is_empty()).collect())
+        .unwrap_or_default();
     let di_data = get_arg(&args, "--di-data");
     let surv_data = get_arg(&args, "--surv-data");
     let hd_data = get_arg(&args, "--hd-data");
@@ -182,18 +200,56 @@ async fn main() -> Result<(), Error> {
     let client = EmbeddedClient::new();
     let total_start = Instant::now();
 
-    // ── Phase 1: Import large snapshots ──
+    // ── Phase 1: Import cross-KG entity sources FIRST, with dedup ──
+    // Ordered small -> large deliberately. `import_tenant_with_dedup` rebuilds its
+    // index by scanning `store.all_nodes()` on EVERY import, so deduping while the
+    // store is still small keeps total scan cost ~65M node visits instead of ~2.5B
+    // (which is what deduping after the 207M-node bulk load would cost). See #316.
+    for (name, path) in &[
+        ("HPO", &hpo_snap),
+        ("MONDO", &mondo_snap),
+        ("Health Systems", &hs_snap),
+        ("Pathways", &pw_snap),
+        ("Health Determinants", &hd_snap),
+        ("Surveillance", &surv_snap),
+        ("Drug Interactions", &di_snap),
+        ("UniProt", &uniprot_snap),
+        ("OpenTargets", &opentargets_snap),
+        ("ChEMBL", &chembl_snap),
+        ("Clinical Trials", &ct_snap),
+        ("FAERS", &faers_snap),
+        ("ClinVar", &clinvar_snap),
+    ] {
+        if let Some(ref p) = path {
+            if dedup_keys.is_empty() {
+                eprint!("Importing {} snapshot... ", name);
+            } else {
+                eprint!("Importing {} snapshot (dedup)... ", name);
+            }
+            let t0 = Instant::now();
+            let stats = if dedup_keys.is_empty() {
+                client.import_snapshot("default", p).await?
+            } else {
+                client.import_snapshot_dedup("default", p, &dedup_keys).await?
+            };
+            eprintln!(
+                "{} nodes, {} edges, {} MERGED in {:.1}s",
+                stats.node_count,
+                stats.edge_count,
+                stats.merged_count,
+                t0.elapsed().as_secs_f64()
+            );
+        }
+    }
+
+    // ── Phase 2: Import bulk sources LAST, plain ──
+    // Per the .sgsnap header inventory, PubMed (Article/Author/Chemical/Grant/
+    // Journal/MeSHTerm) and OMOP (Person/Visit/ConditionOccurrence/DrugExposure/
+    // Measurement/ProcedureOccurrence) share NO label with any other snapshot, so
+    // they can never merge — running them through dedup is pure cost.
     for (name, path) in &[
         ("PubMed", &pubmed_snap),
-        ("Clinical Trials", &ct_snap),
-        ("Pathways", &pw_snap),
-        ("FAERS", &faers_snap),
-        ("UniProt", &uniprot_snap),
         ("OMOP", &omop_snap),
-        ("Drug Interactions", &di_snap),
-        ("Surveillance", &surv_snap),
-        ("Health Determinants", &hd_snap),
-        ("Health Systems", &hs_snap),
     ] {
         if let Some(ref p) = path {
             eprint!("Importing {} snapshot... ", name);
@@ -448,6 +504,18 @@ async fn main() -> Result<(), Error> {
         idx_start.elapsed().as_secs_f64()
     );
 
+    // ── Combined-snapshot export (optional) ──
+    if let Some(ref cs) = combined_snapshot {
+        eprintln!("Exporting combined snapshot to {} ...", cs.display());
+        let t0 = Instant::now();
+        client.export_snapshot("default", cs).await?;
+        eprintln!("Combined snapshot exported in {:.1}s", t0.elapsed().as_secs_f64());
+    }
+    if skip_queries {
+        eprintln!("--skip-queries set; skipping query phase.");
+        return Ok(());
+    }
+
     // ── Phase 4: Load and run queries ──
     let mut all_queries = Vec::new();
     for filename in &[
@@ -464,6 +532,9 @@ async fn main() -> Result<(), Error> {
         "faers-queries.csv",
         "omop-queries.csv",
         "mega-benchmark-queries.csv",
+        "public-health-complex-queries.csv",
+        "omics-complex-queries.csv",
+        "emr-clinical-complex-queries.csv",
     ] {
         let path = queries_dir.join(filename);
         let queries = parse_csv_queries(&path);
