@@ -1,0 +1,4 @@
+# Runtime dependencies for the Claude <-> Samyama Graph MCP demo.
+# `samyama` ships the client, `samyama_mcp`, the `samyama-mcp-serve` CLI, and fastmcp.
+samyama>=0.6.0
+PyYAML>=6.0

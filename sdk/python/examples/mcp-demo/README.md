@@ -40,9 +40,7 @@ one KG (AssetOps) that ships a **code-based** server instead of a `config.yaml`.
 ## Install
 
 ```bash
-pip install samyama    # ships the samyama client, samyama_mcp, and the
-                       # `samyama-mcp-serve` CLI this demo builds on
-pip install pyyaml
+pip install -r requirements.txt   # samyama (client + samyama_mcp + samyama-mcp-serve) + PyYAML
 ```
 
 Also needs the **Claude Code CLI** (`claude`) on `PATH`.
