@@ -1,6 +1,6 @@
 """Samyama MCP Server — auto-generated MCP tools from graph schema."""
 
-__version__ = "0.6.1"
+__version__ = "0.7.0"
 
 from samyama_mcp.server import SamyamaMCPServer
 from samyama_mcp.schema import CypherSchemaDiscovery, GraphSchema
