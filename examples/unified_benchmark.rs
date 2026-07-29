@@ -200,52 +200,31 @@ async fn main() -> Result<(), Error> {
     let client = EmbeddedClient::new();
     let total_start = Instant::now();
 
-    // ── Phase 1: Import bulk sources (plain, no dedup) ──
-    // These carry the mass of the graph (Articles, Persons, Visits, reports…) whose
-    // entities are unique to their source, so running them through the dedup index
-    // would cost a full-store scan per import for zero merges (mirrors enterprise
-    // ADR-018 Phase-1 / Phase-1.5 split).
+    // ── Phase 1: Import cross-KG entity sources FIRST, with dedup ──
+    // Ordered small -> large deliberately. `import_tenant_with_dedup` rebuilds its
+    // index by scanning `store.all_nodes()` on EVERY import, so deduping while the
+    // store is still small keeps total scan cost ~65M node visits instead of ~2.5B
+    // (which is what deduping after the 207M-node bulk load would cost). See #316.
     for (name, path) in &[
-        ("PubMed", &pubmed_snap),
-        ("Clinical Trials", &ct_snap),
-        ("Pathways", &pw_snap),
-        ("FAERS", &faers_snap),
-        ("UniProt", &uniprot_snap),
-        ("OMOP", &omop_snap),
-        ("Drug Interactions", &di_snap),
-        ("Surveillance", &surv_snap),
-        ("Health Determinants", &hd_snap),
-        ("Health Systems", &hs_snap),
-    ] {
-        if let Some(ref p) = path {
-            eprint!("Importing {} snapshot... ", name);
-            let t0 = Instant::now();
-            let stats = client.import_snapshot("default", p).await?;
-            eprintln!(
-                "{} nodes, {} edges, {} merged in {:.1}s",
-                stats.node_count,
-                stats.edge_count,
-                stats.merged_count,
-                t0.elapsed().as_secs_f64()
-            );
-        }
-    }
-
-    // ── Phase 1.5: Import cross-KG entity sources (deduped when --dedup-keys set) ──
-    // These share entities with each other and with Phase 1 (Disease, Gene, Protein,
-    // Drug, Country…), so they are the ones worth merging.
-    for (name, path) in &[
-        ("ClinVar", &clinvar_snap),
-        ("ChEMBL", &chembl_snap),
-        ("OpenTargets", &opentargets_snap),
         ("HPO", &hpo_snap),
         ("MONDO", &mondo_snap),
+        ("Health Systems", &hs_snap),
+        ("Pathways", &pw_snap),
+        ("Health Determinants", &hd_snap),
+        ("Surveillance", &surv_snap),
+        ("Drug Interactions", &di_snap),
+        ("UniProt", &uniprot_snap),
+        ("OpenTargets", &opentargets_snap),
+        ("ChEMBL", &chembl_snap),
+        ("Clinical Trials", &ct_snap),
+        ("FAERS", &faers_snap),
+        ("ClinVar", &clinvar_snap),
     ] {
         if let Some(ref p) = path {
             if dedup_keys.is_empty() {
                 eprint!("Importing {} snapshot... ", name);
             } else {
-                eprint!("Importing {} snapshot (dedup {:?})... ", name, dedup_keys);
+                eprint!("Importing {} snapshot (dedup)... ", name);
             }
             let t0 = Instant::now();
             let stats = if dedup_keys.is_empty() {
@@ -258,6 +237,28 @@ async fn main() -> Result<(), Error> {
                 stats.node_count,
                 stats.edge_count,
                 stats.merged_count,
+                t0.elapsed().as_secs_f64()
+            );
+        }
+    }
+
+    // ── Phase 2: Import bulk sources LAST, plain ──
+    // Per the .sgsnap header inventory, PubMed (Article/Author/Chemical/Grant/
+    // Journal/MeSHTerm) and OMOP (Person/Visit/ConditionOccurrence/DrugExposure/
+    // Measurement/ProcedureOccurrence) share NO label with any other snapshot, so
+    // they can never merge — running them through dedup is pure cost.
+    for (name, path) in &[
+        ("PubMed", &pubmed_snap),
+        ("OMOP", &omop_snap),
+    ] {
+        if let Some(ref p) = path {
+            eprint!("Importing {} snapshot... ", name);
+            let t0 = Instant::now();
+            let stats = client.import_snapshot("default", p).await?;
+            eprintln!(
+                "{} nodes, {} edges in {:.1}s",
+                stats.node_count,
+                stats.edge_count,
                 t0.elapsed().as_secs_f64()
             );
         }
