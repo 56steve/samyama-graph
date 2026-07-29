@@ -1,0 +1,105 @@
+# Registry for the Claude <-> Samyama Graph MCP demo.
+# One entry per knowledge graph. Consumed by serve_kg.py, register.py and demo.py.
+#
+# Fields:
+#   key       short id (used on the serve_kg.py / register.py command line)
+#   server    MCP server name registered with Claude Code (-> mcp__<server>__<tool>)
+#   graph     tenant / graph name inside the running engine
+#   repo      KG repo directory name under the workspace root ($SAMYAMA_WS)
+#   tools:    where the MCP tools come from —
+#               config  = load <repo>/mcp_server/config.yaml (curated tools)
+#               auto    = SDK auto-generates tools from the live schema (ToolConfig())
+#               code    = the repo ships a code-based FastMCP server (assetops)
+#   title     human label shown in the demo output
+#   question  the natural-language prompt sent to Claude
+#   allow     MCP tool names Claude is allowed to call for this question
+
+- key: legal
+  server: samyama-legal
+  graph: legal
+  repo: legal-judgments-graph-kg
+  tools: config
+  title: Legal Judgments
+  question: "Use the samyama-legal MCP: which judge decided the most cases?"
+  allow: [top_judges]
+
+- key: football
+  server: samyama-football
+  graph: football
+  repo: football-kg
+  tools: config
+  title: Football / World Cup
+  question: "Use the samyama-football MCP: which countries hosted the most World Cups?"
+  allow: [top_host_nations, cypher_query]
+
+- key: cricket
+  server: samyama-cricket
+  graph: cricket
+  repo: cricket-kg
+  tools: config
+  title: Cricket
+  question: "Use the samyama-cricket MCP: who are the top 3 run scorers of all time?"
+  allow: [top_run_scorers, cypher_query]
+
+- key: bank
+  server: samyama-bank
+  graph: bank
+  repo: bank-model-risk-kg
+  tools: auto
+  title: Bank Model Risk
+  question: "Use the samyama-bank MCP: which 3 models have the most validation findings?"
+  allow: [cypher_query, schema_info]
+
+- key: assetops
+  server: samyama-assetops
+  graph: industrial
+  repo: assetops-kg
+  tools: code
+  title: Industrial AssetOps
+  question: "Use the samyama-assetops MCP: if Boiler-1 fails, what does it impact?"
+  allow: [impact_analysis, dependency_chain]
+
+- key: surveillance
+  server: samyama-surveillance
+  graph: surveillance
+  repo: surveillance-kg
+  tools: auto
+  title: Disease Surveillance
+  question: "Use the samyama-surveillance MCP: which 3 diseases have the most reports?"
+  allow: [cypher_query, schema_info]
+
+- key: druginteractions
+  server: samyama-druginteractions
+  graph: druginteractions
+  repo: druginteractions-kg
+  tools: config
+  title: Drug Interactions
+  question: "Use the samyama-druginteractions MCP: which 3 drugs interact with the most genes?"
+  allow: [cypher_query, schema_info]
+
+- key: pathways
+  server: samyama-pathways
+  graph: pathways
+  repo: pathways-kg
+  tools: config
+  title: Biological Pathways
+  question: "Use the samyama-pathways MCP: which 3 proteins are in the most pathways?"
+  allow: [cypher_query, schema_info]
+
+- key: healthdet
+  server: samyama-healthdet
+  graph: health-determinants
+  repo: health-determinants-kg
+  tools: config
+  title: Health Determinants
+  question: "Use the samyama-healthdet MCP: which 3 countries have the highest GNI per capita?"
+  allow: [cypher_query, schema_info]
+
+- key: healthsys
+  server: samyama-healthsys
+  graph: health-systems
+  repo: health-systems-kg
+  tools: config
+  title: Health Systems
+  question: "Use the samyama-healthsys MCP: how many countries are in the graph?"
+  allow: [cypher_query, count_country]
