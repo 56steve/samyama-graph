@@ -230,9 +230,16 @@ pub async fn search_handler(
     };
 
     let store = state.store.read().await;
-    let label = payload.label.as_deref().unwrap_or("Paper");
+    // When the caller pins a `label`, search just that index. When no `label`
+    // is given, fan out across EVERY index (all labels + properties) and merge to
+    // a global top-k — so the default matches against all nodes rather than a
+    // single hardcoded label.
+    let search_result = match payload.label.as_deref() {
+        Some(label) => store.vector_search(label, property_key, &query_vector, k),
+        None => store.vector_search_all(&query_vector, k),
+    };
 
-    match store.vector_search(label, property_key, &query_vector, k) {
+    match search_result {
         Ok(results) => {
             let search_results: Vec<_> = results
                 .iter()
@@ -240,12 +247,16 @@ pub async fn search_handler(
                     let node_info = store
                         .get_node(*node_id)
                         .map(|n| {
+                            // Resolve the FULL property set (inline HashMap +
+                            // ColumnStore). Iterating `n.properties` alone misses
+                            // ColumnStore-backed scalars (name/title/ids), leaving
+                            // an empty map for stub/bulk/v2-snapshot-loaded nodes.
                             let mut properties = serde_json::Map::new();
-                            for (prop_key, v) in &n.properties {
+                            for (prop_key, v) in store.node_properties_full(*node_id) {
                                 // Use the caller-supplied property_key, not the literal "embedding",
                                 // so nodes indexed under a different key are correctly filtered.
                                 if prop_key != property_key || payload.include_vectors {
-                                    properties.insert(prop_key.clone(), v.to_json());
+                                    properties.insert(prop_key, v.to_json());
                                 }
                             }
                             json!({
@@ -274,16 +285,19 @@ pub async fn search_handler(
             }))
             .into_response()
         }
-        Err(e) => (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": format!(
-                    "Vector search failed: {}. Index may not be built for label '{}' property '{}'.",
-                    e, label, property_key
-                )
-            })),
-        )
-            .into_response(),
+        Err(e) => {
+            let scope = match payload.label.as_deref() {
+                Some(l) => format!("label '{}' property '{}'", l, property_key),
+                None => "any indexed label".to_string(),
+            };
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!("Vector search failed: {}. Index may not be built for {}.", e, scope)
+                })),
+            )
+                .into_response()
+        }
     }
 }
 

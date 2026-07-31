@@ -95,6 +95,45 @@ impl VectorIndexManager {
         indices.keys().cloned().collect()
     }
 
+    /// Search across ALL indices (every label + property), merge the per-index
+    /// hits, and return the global top-k by distance.
+    ///
+    /// This backs the "no label given" default in the vector-search API: instead
+    /// of guessing a single label, the query vector is run against every index
+    /// whose dimensionality matches, so a caller who doesn't know (or care) which
+    /// label holds the answer still gets the best matches across the whole graph.
+    /// Indices whose dimension differs from the query are skipped (a query vector
+    /// can only be compared within its own embedding space).
+    pub fn search_all(&self, query: &[f32], k: usize) -> VectorResult<Vec<(NodeId, f32)>> {
+        // Snapshot the key list first so we don't hold the map lock across the
+        // per-index searches (each of which takes the index's own lock).
+        let keys = self.list_indices();
+        // A node can be indexed under more than one (label, property); keep only
+        // its best (smallest) distance so it isn't returned twice.
+        let mut best: HashMap<NodeId, f32> = HashMap::new();
+        for key in keys {
+            if let Some(index_lock) = self.get_index(&key.label, &key.property_key) {
+                let index = index_lock.read().unwrap();
+                if index.dimensions() != query.len() {
+                    continue;
+                }
+                for (node_id, distance) in index.search(query, k)? {
+                    best.entry(node_id)
+                        .and_modify(|d| {
+                            if distance < *d {
+                                *d = distance;
+                            }
+                        })
+                        .or_insert(distance);
+                }
+            }
+        }
+        let mut merged: Vec<(NodeId, f32)> = best.into_iter().collect();
+        merged.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        merged.truncate(k);
+        Ok(merged)
+    }
+
     /// Drop and rebuild a specific HNSW index from a caller-supplied vector list.
     ///
     /// Snapshot import (create_node_stub / create_node) bypasses the event loop

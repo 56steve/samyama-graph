@@ -2635,6 +2635,32 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
         self.vector_index.search(label, property_key, query, k)
     }
 
+    /// Vector search across ALL indices (every label + property), merged to a
+    /// global top-k. Backs the "no label given" default in the vector-search API.
+    pub fn vector_search_all(&self, query: &[f32], k: usize) -> VectorResult<Vec<(NodeId, f32)>> {
+        self.vector_index.search_all(query, k)
+    }
+
+    /// Resolve the FULL property set of a node: inline `Node.properties` HashMap
+    /// merged with the ColumnStore (late-materialized scalar props). Row HashMap
+    /// wins on conflict. This is what the Cypher `RETURN n.<prop>` path sees;
+    /// callers that iterate only `node.properties` miss ColumnStore-backed scalars
+    /// (name/title/ids from stub/bulk loads and v2 snapshot import).
+    pub fn node_properties_full(&self, id: NodeId) -> HashMap<String, PropertyValue> {
+        let mut out: HashMap<String, PropertyValue> = HashMap::new();
+        if let Some(node) = self.get_node(id) {
+            for (k, v) in &node.properties {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+        let idx = id.as_u64() as usize;
+        for key in self.node_columns.get_property_keys(idx) {
+            out.entry(key.clone())
+                .or_insert_with(|| self.node_columns.get_property(idx, &key));
+        }
+        out
+    }
+
     // ============================================================
     // Recovery methods - used to rebuild graph from persisted data
     // ============================================================
