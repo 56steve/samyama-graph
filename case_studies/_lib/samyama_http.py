@@ -46,10 +46,12 @@ class SamyamaClient:
         return r.json()
 
     def node_count(self) -> int:
-        return int(self.status().get("storage", {}).get("nodes", 0))
+        # Scope the count to THIS graph, not the engine-wide /api/status storage —
+        # a shared server hosts many tenants, so global storage over-reports.
+        return int(self.query("MATCH (n) RETURN count(n) AS c").records[0][0])
 
     def edge_count(self) -> int:
-        return int(self.status().get("storage", {}).get("edges", 0))
+        return int(self.query("MATCH ()-[r]->() RETURN count(r) AS c").records[0][0])
 
     def query(self, cypher: str, graph: str | None = None) -> QueryResult:
         t0 = time.perf_counter()
