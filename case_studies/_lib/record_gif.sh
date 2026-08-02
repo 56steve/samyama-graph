@@ -19,19 +19,27 @@ export SG_BASE_URL="${SG_BASE_URL:-http://127.0.0.1:8080}"
 export SG_GRAPH="${SG_GRAPH:-default}"
 
 echo "[gif] recording $DEMO → $CAST"
-# 100x30 reads well in a README. asciinema 2.x takes the recording size from
-# COLUMNS/LINES (verified), so set them for both asciinema and the inner python.
-# Record idle up to 6s so the demo's read-pauses survive into the cast (the cast
-# is committed and is the pausable artifact: `asciinema play demo.cast`).
+# Long-form: record a TALL terminal so the whole narrated report renders in one
+# vertical image with nothing scrolling off — the format used by the lea-triage
+# demo. asciinema 3.x ignores COLUMNS/LINES and needs --window-size, so set both.
+# GIF_ROWS tunes the height per case study (enough rows for the full report);
+# PYTHON lets a venv with rich/requests be used instead of the system python3.
+# Record idle up to 6s so the demo's read-pauses survive into the cast.
+ROWS="${GIF_ROWS:-120}"
+PYTHON="${PYTHON:-python3}"
 rm -f "$CAST"
-COLUMNS=100 LINES=30 TERM=xterm-256color asciinema rec --overwrite -q -i 6 \
-  -c "env COLUMNS=100 LINES=30 TERM=xterm-256color python3 $DEMO" "$CAST" \
+COLUMNS=100 LINES="$ROWS" TERM=xterm-256color asciinema rec --overwrite -q -i 6 \
+  --window-size "100x${ROWS}" \
+  -c "env COLUMNS=100 LINES=$ROWS TERM=xterm-256color $PYTHON $DEMO" "$CAST" \
   || { echo "[gif] asciinema failed"; exit 1; }
 
 echo "[gif] rendering $CAST → $OUT"
 # speed 1.0 (real-time) + a 4s idle cap so the post-result read pauses render in
 # full — a looping GIF can't be paused, so the reading time must be in the frames.
-agg --speed 1.0 --idle-time-limit 4.0 --font-size 18 --theme asciinema "$CAST" "$OUT" \
+# --last-frame-duration holds the completed report for a few seconds before the
+# GIF loops, so the final infographic is readable without freezing forever.
+agg --speed 1.0 --idle-time-limit 4.0 --last-frame-duration 8 \
+  --font-size 18 --theme asciinema "$CAST" "$OUT" \
   || { echo "[gif] agg failed"; exit 1; }
 
 SZ=$(du -h "$OUT" | cut -f1)
