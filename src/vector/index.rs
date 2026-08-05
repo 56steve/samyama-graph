@@ -104,9 +104,17 @@ impl Distance<f32> for CosineDistance {
             return 1.0;
         }
         
-        // Cosine distance = 1.0 - cosine similarity
-        let sim = dot / (norm_a.sqrt() * norm_b.sqrt());
-        1.0 - sim
+        // Cosine distance = 1.0 - cosine similarity.
+        // Cosine similarity is mathematically in [-1, 1], but floating-point
+        // rounding on near-duplicate vectors can push it just past 1.0, yielding a
+        // tiny NEGATIVE distance (or a tiny positive distance between two identical
+        // vectors that should be exactly 0). Either violates hnsw_rs 0.2.1's internal
+        // `dist_to_ref <= 0` invariant and panics mid-insert (hnsw.rs:938), aborting
+        // the whole index rebuild. Clamp the similarity into range and floor the
+        // distance at 0 so identical vectors give exactly 0 and the metric stays in
+        // [0, 2].
+        let sim = (dot / (norm_a.sqrt() * norm_b.sqrt())).clamp(-1.0, 1.0);
+        (1.0 - sim).max(0.0)
     }
 }
 
@@ -181,6 +189,13 @@ impl VectorIndex {
             });
         }
         
+        // Not wrapped in catch_unwind on purpose: hnsw_rs registers the point in its
+        // layer index before doing any of the work that could panic, so catching would
+        // leave a half-linked point live in the graph while this function returns Err
+        // and skips the stored_vectors push below — desynchronising the HNSW from the
+        // vector list that backs len(), dump() and the brute-force fallback. The
+        // CosineDistance clamp keeps the metric in [0, 2], which is what the
+        // search_layer assertions (hnsw.rs:937-938) actually require.
         self.hnsw.insert((vector, node_id.0 as usize));
 
         // Store vector for persistence
