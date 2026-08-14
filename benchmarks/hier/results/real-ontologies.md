@@ -11,13 +11,22 @@ the generated HIER dataset. Part of #353.
 
 ## Results
 
-| Ontology | Nodes | Covering edges | Verdict | Chain width vs cap | Order embedding | Build |
-|---|---:|---:|---|---:|---:|---:|
-| **NCBI Taxonomy** (`nodes.dmp`) | 2,944,492 | 2,944,491 | **nested-set** (tree) | n/a | **12.00 B/node** | **6.81 s** |
-| GeoNames (`hierarchy.txt`, ADM) | 544,093 | 512,678 | declined | 477,763 vs 5,901 | — | 1.19 s |
-| Gene Ontology (`go-basic.obo`) | 38,092 | 63,726 | declined | 24,135 vs 1,561 | — | 42 ms |
-| HPO (`hp.obo`) | 19,836 | 24,378 | declined | 13,979 vs 1,126 | — | 19 ms |
-| MONDO (`mondo.obo`) | 58,656 | 81,474 | **error: cycle** | — | — | — |
+| Ontology | Nodes | Covering edges | Verdict | Order embedding | Build |
+|---|---:|---:|---|---:|---:|
+| **NCBI Taxonomy** (`nodes.dmp`) | 2,944,492 | 2,944,491 | **nested-set** (tree) | **12.00 B/node** | 8.83 s |
+| **GeoNames** (`hierarchy.txt`, ADM) | 544,093 | 512,678 | **near-tree** ¹ | **12.11 B/node** | 1.00 s |
+| **MeSH 2025** (`mtrees.bin`) | 64,899 | 64,883 | **nested-set** (tree) | **12.00 B/node** | 0.10 s |
+| Gene Ontology (`go-basic.obo`) | 38,092 | 63,726 | declined (width 24,138 vs cap 1,561) | — | — |
+| HPO (`hp.obo`) | 19,836 | 24,378 | declined (width 13,979 vs cap 1,126) | — | — |
+| MONDO (`mondo.obo`) | 58,656 | 81,474 | **error: cycle** ² | — | — |
+
+¹ GeoNames declined on the first run of this table. #371 added the **near-tree** encoding —
+nested-set over a spanning forest with the 6,540 residual parent edges carried as
+exceptions — which costs 0.11 B/node over a pure tree. Roll-up in that encoding folds the
+descendant set rather than a range, so it is correct but not index-resident.
+
+² MONDO's cycle diagnostic now names the offending nodes (#372) rather than only counting
+them.
 
 Peak RSS for the NCBI build was 3.5 GB — the whole 2.9M-node graph plus index.
 
@@ -63,15 +72,21 @@ can fix their data rather than just learn that 14 of 58,647 are bad.
 
 ## Honest summary
 
-Of five real ontologies: one builds, three decline, one is rejected as cyclic. The paper's
-"genuinely low-width multi-parent DAGs are rare in practice" is *understated* — in this
-sample there were none at all. Every multi-parent ontology tested was high-width.
+**Three of six real ontologies now build** — NCBI Taxonomy (2.9M nodes), GeoNames (544k) and
+MeSH (65k) — where the first run of this table had only one. Two decline correctly and one
+is rejected as cyclic.
 
-That does not invalidate the index; it sharpens where it applies. Strict hierarchies —
-taxonomies, calendars, ATC-style coded classifications, administrative geography *if the
-exceptions are handled* — are exactly its regime, and NCBI Taxonomy shows the payoff at 2.9M
-nodes. But the HIER benchmark's generated DAG axis is more favourable than reality, and the
-results should be read with that in mind.
+The change is not that the index got better at poly-hierarchies; it is that "near-tree" was
+a missing category. GeoNames was never a poly-hierarchy — it is 98.7% a tree that the
+all-or-nothing `is_tree()` test threw away. Gene Ontology and HPO, which *are*
+poly-hierarchical by design (63% and 70% of nodes carry extra parents), still decline, and
+should: a 2-hop index is the right structure there.
+
+So the paper's "genuinely low-width multi-parent DAGs are rare in practice" holds, and the
+sharper statement is this: **real ontologies are either trees, near-trees, or thoroughly
+poly-hierarchical — the middle ground the chain encoding targets is where none of them
+live.** Chain decomposition remains correct and is exercised by the HIER benchmark's
+synthetic DAG axis, but no real ontology tested has landed in its regime.
 
 ## Right-sizing
 
