@@ -188,6 +188,38 @@ impl Fenwick {
         }
     }
 
+    /// Add `delta` at `pos`, in O(log n).
+    ///
+    /// A Fenwick tree updates in place because SUM has an inverse — the caller supplies the
+    /// difference and every covering node absorbs it. This is what lets a measure write
+    /// avoid invalidating the whole index (#351).
+    pub fn add(&mut self, pos: usize, delta: RollupValue) {
+        match self {
+            Fenwick::Int(t) => {
+                let d = match delta {
+                    RollupValue::Int(v) => v,
+                    RollupValue::Float(f) => f as i128,
+                    RollupValue::Null => return,
+                };
+                let n = t.len() - 1;
+                let mut j = pos + 1;
+                while j <= n {
+                    t[j] += d;
+                    j += j & j.wrapping_neg();
+                }
+            }
+            Fenwick::Float(t) => {
+                let d = delta.as_f64().unwrap_or(0.0);
+                let n = t.len() - 1;
+                let mut j = pos + 1;
+                while j <= n {
+                    t[j] += d;
+                    j += j & j.wrapping_neg();
+                }
+            }
+        }
+    }
+
     /// Sum of positions `[0, i)`.
     fn prefix(&self, i: usize) -> RollupValue {
         let mut i = i.min(self.len());

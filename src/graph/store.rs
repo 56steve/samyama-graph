@@ -1040,8 +1040,8 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
     /// Set a property directly in the columnar store, bypassing the Node's row HashMap.
     pub fn set_column_property(&mut self, node_id: NodeId, key: &str, value: PropertyValue) {
         let idx = node_id.as_u64() as usize;
-        self.node_columns.set_property(idx, key, value);
-        self.invalidate_hierarchies_for_property(key);
+        self.node_columns.set_property(idx, key, value.clone());
+        self.update_hierarchies_for_property(node_id, key, &value);
     }
 
     /// Intern an edge type string → u16 index. Returns existing index if already interned.
@@ -1087,7 +1087,7 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
 
         // Update columnar storage (always latest)
         self.node_columns.set_property(idx, &key_str, val.clone());
-        self.invalidate_hierarchies_for_property(&key_str);
+        self.update_hierarchies_for_property(node_id, &key_str, &val);
 
         // Get access to versions
         let versions = self.nodes.get_mut(idx).ok_or(GraphError::NodeNotFound(node_id))?;
@@ -2022,6 +2022,23 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
     pub fn invalidate_hierarchies_for_property(&self, property: &str) {
         if !self.hierarchy_index.is_empty() {
             self.hierarchy_index.mark_stale_for_property(property);
+        }
+    }
+
+    /// Apply a measure write to any hierarchy that declares `property`, in place.
+    ///
+    /// Only the value changes, not the shape of the poset, so the index absorbs it in
+    /// O(log n) rather than being invalidated (ADR-035 §6, #351). Falls back to marking
+    /// stale for any hierarchy that cannot take the update.
+    #[inline]
+    pub fn update_hierarchies_for_property(
+        &self,
+        node_id: NodeId,
+        property: &str,
+        value: &PropertyValue,
+    ) {
+        if !self.hierarchy_index.is_empty() {
+            self.hierarchy_index.update_measure(node_id, property, value);
         }
     }
 
