@@ -107,94 +107,116 @@ impl PartialOrd for PropertyValue {
 }
 
 impl Ord for PropertyValue {
+    /// Total order over property values, following openCypher where it has an opinion.
+    ///
+    /// Two rules here are load-bearing and were both wrong before:
+    ///
+    /// **Numbers compare numerically across `Integer` and `Float`.** Ordering by variant
+    /// first made every `Integer` sort below every `Float` regardless of magnitude, so
+    /// `999999` compared less than `6.9`. That produced a wrong `min()` against a mixed-type
+    /// sentinel, and made `WHERE float_prop > 0` match nothing until written as `0.0` — a
+    /// quirk long carried as a query-writing rule rather than recognised as this bug.
+    ///
+    /// **`Null` is the greatest value**, as openCypher specifies: last on `ASC`, first on
+    /// `DESC`. Sorting it smallest made `min()` return `NULL` whenever any row was null,
+    /// since null then won every comparison.
+    ///
+    /// A numeric tie between variants breaks toward `Integer`, and never returns `Equal`.
+    /// That matters beyond taste: `PartialEq` is derived, so `Integer(2) != Float(2.0)`, and
+    /// this `Ord` backs the B-tree property index. Returning `Equal` for values that are not
+    /// `Eq` would collapse them into one index key and violate the `Ord`/`Eq` contract.
     fn cmp(&self, other: &Self) -> Ordering {
         use PropertyValue::*;
+
+        /// Rank of the bucket a value sorts into. Null is last; the two numeric variants
+        /// share a bucket so they can be compared by value.
+        fn bucket(v: &PropertyValue) -> u8 {
+            match v {
+                Boolean(_) => 0,
+                Integer(_) | Float(_) => 1,
+                String(_) => 2,
+                DateTime(_) => 3,
+                Array(_) => 4,
+                Map(_) => 5,
+                Vector(_) => 6,
+                Duration { .. } => 7,
+                Null => 8,
+            }
+        }
+
         match (self, other) {
-            (Null, Null) => Ordering::Equal,
-            (Null, _) => Ordering::Less,
-            (_, Null) => Ordering::Greater,
+            // --- numbers: by value, then by variant so the order stays strict ---
+            (Integer(a), Integer(b)) => a.cmp(b),
+            (Float(a), Float(b)) => a.total_cmp(b),
+            (Integer(a), Float(b)) => (*a as f64)
+                .partial_cmp(b)
+                .unwrap_or(Ordering::Less)
+                .then(Ordering::Less),
+            (Float(a), Integer(b)) => a
+                .partial_cmp(&(*b as f64))
+                .unwrap_or(Ordering::Greater)
+                .then(Ordering::Greater),
 
             (Boolean(a), Boolean(b)) => a.cmp(b),
-            (Boolean(_), _) => Ordering::Less,
-            (_, Boolean(_)) => Ordering::Greater,
-
-            (Integer(a), Integer(b)) => a.cmp(b),
-            (Integer(_), _) => Ordering::Less,
-            (_, Integer(_)) => Ordering::Greater,
-
-            (Float(a), Float(b)) => a.total_cmp(b),
-            (Float(_), _) => Ordering::Less,
-            (_, Float(_)) => Ordering::Greater,
-
             (String(a), String(b)) => a.cmp(b),
-            (String(_), _) => Ordering::Less,
-            (_, String(_)) => Ordering::Greater,
-
             (DateTime(a), DateTime(b)) => a.cmp(b),
-            (DateTime(_), _) => Ordering::Less,
-            (_, DateTime(_)) => Ordering::Greater,
-
             (Array(a), Array(b)) => a.cmp(b),
-            (Array(_), _) => Ordering::Less,
-            (_, Array(_)) => Ordering::Greater,
-
-            // Maps are not trivially comparable because HashMap doesn't implement Ord.
-            // We'll skip Maps for indexing or define a canonical order (e.g. sorted keys).
-            // For now, let's just use memory address or length as a fallback to satisfy trait?
-            // No, that breaks determinism. 
-            // Let's implement a slow but deterministic comparison for Maps.
+            (Vector(a), Vector(b)) => a
+                .iter()
+                .map(|x| x.to_bits())
+                .cmp(b.iter().map(|x| x.to_bits())),
+            (
+                Duration {
+                    months: m1,
+                    days: d1,
+                    seconds: s1,
+                    nanos: n1,
+                },
+                Duration {
+                    months: m2,
+                    days: d2,
+                    seconds: s2,
+                    nanos: n2,
+                },
+            ) => m1
+                .cmp(m2)
+                .then(d1.cmp(d2))
+                .then(s1.cmp(s2))
+                .then(n1.cmp(n2)),
+            (Null, Null) => Ordering::Equal,
             (Map(a), Map(b)) => {
                 let mut keys_a: Vec<_> = a.keys().collect();
                 let mut keys_b: Vec<_> = b.keys().collect();
                 keys_a.sort();
                 keys_b.sort();
-                
+
                 // Compare keys first
                 for (ka, kb) in keys_a.iter().zip(keys_b.iter()) {
                     match ka.cmp(kb) {
-                        Ordering::Equal => {},
+                        Ordering::Equal => {}
                         ord => return ord,
                     }
                 }
-                
+
                 if keys_a.len() != keys_b.len() {
                     return keys_a.len().cmp(&keys_b.len());
                 }
-                
+
                 // Compare values
                 for k in keys_a {
                     let va = a.get(k).unwrap();
                     let vb = b.get(k).unwrap();
                     match va.cmp(vb) {
-                        Ordering::Equal => {},
+                        Ordering::Equal => {}
                         ord => return ord,
                     }
                 }
                 Ordering::Equal
             }
-            (Map(_), _) => Ordering::Less,
-            (_, Map(_)) => Ordering::Greater,
 
-            (Vector(a), Vector(b)) => {
-                // Lexicographical comparison using total_cmp for floats
-                for (va, vb) in a.iter().zip(b.iter()) {
-                    match va.total_cmp(vb) {
-                        Ordering::Equal => {},
-                        ord => return ord,
-                    }
-                }
-                a.len().cmp(&b.len())
-            }
-            (Vector(_), _) => Ordering::Less,
-            (_, Vector(_)) => Ordering::Greater,
-
-            (Duration { months: m1, days: d1, seconds: s1, nanos: n1 },
-             Duration { months: m2, days: d2, seconds: s2, nanos: n2 }) => {
-                m1.cmp(m2)
-                    .then(d1.cmp(d2))
-                    .then(s1.cmp(s2))
-                    .then(n1.cmp(n2))
-            }
+            // Different buckets: order by bucket. Numeric variants share a bucket and are
+            // handled above, so this only sees genuinely different types.
+            (a, b) => bucket(a).cmp(&bucket(b)),
         }
     }
 }
@@ -243,7 +265,12 @@ impl std::hash::Hash for PropertyValue {
                     val.to_bits().hash(state);
                 }
             }
-            PropertyValue::Duration { months, days, seconds, nanos } => {
+            PropertyValue::Duration {
+                months,
+                days,
+                seconds,
+                nanos,
+            } => {
                 8.hash(state);
                 months.hash(state);
                 days.hash(state);
@@ -363,7 +390,12 @@ impl PropertyValue {
                 serde_json::Value::Object(json_map)
             }
             PropertyValue::Vector(v) => json!(v),
-            PropertyValue::Duration { months, days, seconds, nanos } => {
+            PropertyValue::Duration {
+                months,
+                days,
+                seconds,
+                nanos,
+            } => {
                 json!({
                     "months": months,
                     "days": days,
@@ -414,23 +446,40 @@ impl fmt::Display for PropertyValue {
                 }
                 write!(f, "])")
             }
-            PropertyValue::Duration { months, days, seconds, nanos } => {
+            PropertyValue::Duration {
+                months,
+                days,
+                seconds,
+                nanos,
+            } => {
                 write!(f, "P")?;
                 if *months > 0 {
                     let years = months / 12;
                     let rem_months = months % 12;
-                    if years > 0 { write!(f, "{}Y", years)?; }
-                    if rem_months > 0 { write!(f, "{}M", rem_months)?; }
+                    if years > 0 {
+                        write!(f, "{}Y", years)?;
+                    }
+                    if rem_months > 0 {
+                        write!(f, "{}M", rem_months)?;
+                    }
                 }
-                if *days > 0 { write!(f, "{}D", days)?; }
+                if *days > 0 {
+                    write!(f, "{}D", days)?;
+                }
                 if *seconds > 0 || *nanos > 0 {
                     write!(f, "T")?;
                     let h = seconds / 3600;
                     let m = (seconds % 3600) / 60;
                     let s = seconds % 60;
-                    if h > 0 { write!(f, "{}H", h)?; }
-                    if m > 0 { write!(f, "{}M", m)?; }
-                    if s > 0 || *nanos > 0 { write!(f, "{}S", s)?; }
+                    if h > 0 {
+                        write!(f, "{}H", h)?;
+                    }
+                    if m > 0 {
+                        write!(f, "{}M", m)?;
+                    }
+                    if s > 0 || *nanos > 0 {
+                        write!(f, "{}S", s)?;
+                    }
                 }
                 Ok(())
             }
@@ -513,10 +562,7 @@ mod tests {
         assert_eq!(PropertyValue::Boolean(true).type_name(), "Boolean");
         assert_eq!(PropertyValue::DateTime(1234567890).type_name(), "DateTime");
         assert_eq!(PropertyValue::Array(vec![]).type_name(), "Array");
-        assert_eq!(
-            PropertyValue::Map(HashMap::new()).type_name(),
-            "Map"
-        );
+        assert_eq!(PropertyValue::Map(HashMap::new()).type_name(), "Map");
         assert_eq!(PropertyValue::Vector(vec![0.1]).type_name(), "Vector");
         assert_eq!(PropertyValue::Null.type_name(), "Null");
     }
@@ -564,7 +610,10 @@ mod tests {
 
         // Test map property
         let mut map = HashMap::new();
-        map.insert("key".to_string(), PropertyValue::String("value".to_string()));
+        map.insert(
+            "key".to_string(),
+            PropertyValue::String("value".to_string()),
+        );
         let map_prop = PropertyValue::Map(map);
         assert!(map_prop.as_map().unwrap().contains_key("key"));
     }
@@ -572,16 +621,56 @@ mod tests {
     // ========== Batch 1: Ord impl tests ==========
 
     #[test]
-    fn test_ord_null_less_than_everything() {
-        assert!(PropertyValue::Null < PropertyValue::Boolean(false));
-        assert!(PropertyValue::Null < PropertyValue::Integer(0));
-        assert!(PropertyValue::Null < PropertyValue::Float(0.0));
-        assert!(PropertyValue::Null < PropertyValue::String("".to_string()));
+    fn test_ord_null_is_greater_than_everything() {
+        // openCypher orders NULL as the largest value: last on ASC, first on DESC (#369).
+        // Sorting it smallest made min() return NULL whenever any row was null, since null
+        // then won every comparison (#357).
+        assert!(PropertyValue::Null > PropertyValue::Boolean(false));
+        assert!(PropertyValue::Null > PropertyValue::Integer(0));
+        assert!(PropertyValue::Null > PropertyValue::Float(0.0));
+        assert!(PropertyValue::Null > PropertyValue::String("zzz".to_string()));
+        assert!(PropertyValue::Null > PropertyValue::Integer(i64::MAX));
+    }
+
+    #[test]
+    fn test_ord_is_a_strict_total_order() {
+        // Sorting a mixed bag must be deterministic and must not report Equal for values
+        // that are not Eq — the property BTreeMap relies on.
+        let mut vals = vec![
+            PropertyValue::Null,
+            PropertyValue::Float(2.0),
+            PropertyValue::Integer(2),
+            PropertyValue::Integer(-1),
+            PropertyValue::Float(1.5),
+            PropertyValue::String("a".into()),
+            PropertyValue::Boolean(true),
+        ];
+        vals.sort();
+        // booleans, then numbers by value, then strings, then null
+        assert_eq!(vals[0], PropertyValue::Boolean(true));
+        assert_eq!(vals[1], PropertyValue::Integer(-1));
+        assert_eq!(vals[2], PropertyValue::Float(1.5));
+        assert_eq!(vals[3], PropertyValue::Integer(2));
+        assert_eq!(vals[4], PropertyValue::Float(2.0));
+        assert_eq!(vals[5], PropertyValue::String("a".into()));
+        assert_eq!(vals[6], PropertyValue::Null);
+        for w in vals.windows(2) {
+            assert_ne!(
+                w[0].cmp(&w[1]),
+                std::cmp::Ordering::Equal,
+                "{:?} vs {:?}",
+                w[0],
+                w[1]
+            );
+        }
     }
 
     #[test]
     fn test_ord_null_equal() {
-        assert_eq!(PropertyValue::Null.cmp(&PropertyValue::Null), std::cmp::Ordering::Equal);
+        assert_eq!(
+            PropertyValue::Null.cmp(&PropertyValue::Null),
+            std::cmp::Ordering::Equal
+        );
     }
 
     #[test]
@@ -597,18 +686,43 @@ mod tests {
     #[test]
     fn test_ord_integer_comparison() {
         assert!(PropertyValue::Integer(1) < PropertyValue::Integer(2));
-        assert_eq!(PropertyValue::Integer(5).cmp(&PropertyValue::Integer(5)), std::cmp::Ordering::Equal);
+        assert_eq!(
+            PropertyValue::Integer(5).cmp(&PropertyValue::Integer(5)),
+            std::cmp::Ordering::Equal
+        );
     }
 
     #[test]
-    fn test_ord_integer_less_than_float() {
-        assert!(PropertyValue::Integer(100) < PropertyValue::Float(0.0));
+    fn test_ord_numbers_compare_by_value_across_variants() {
+        // Integers and floats share a bucket and compare numerically. Ordering by variant
+        // first made 999999 sort below 6.9, which broke min() against a mixed-type
+        // sentinel and made `WHERE float_prop > 0` match nothing (#365).
+        assert!(PropertyValue::Integer(100) > PropertyValue::Float(0.0));
+        assert!(PropertyValue::Integer(999_999) > PropertyValue::Float(6.9));
+        assert!(PropertyValue::Integer(1) < PropertyValue::Float(2.0));
+        assert!(PropertyValue::Float(2.5) > PropertyValue::Integer(2));
+
+        // A numeric tie must not report Equal: PartialEq is derived, so these are not Eq,
+        // and this Ord backs the B-tree property index — collapsing them into one key would
+        // violate the Ord/Eq contract.
+        assert_ne!(PropertyValue::Integer(2), PropertyValue::Float(2.0));
+        assert_eq!(
+            PropertyValue::Integer(2).cmp(&PropertyValue::Float(2.0)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            PropertyValue::Float(2.0).cmp(&PropertyValue::Integer(2)),
+            std::cmp::Ordering::Greater
+        );
     }
 
     #[test]
     fn test_ord_float_comparison() {
         assert!(PropertyValue::Float(1.0) < PropertyValue::Float(2.0));
-        assert_eq!(PropertyValue::Float(3.14).cmp(&PropertyValue::Float(3.14)), std::cmp::Ordering::Equal);
+        assert_eq!(
+            PropertyValue::Float(3.14).cmp(&PropertyValue::Float(3.14)),
+            std::cmp::Ordering::Equal
+        );
     }
 
     #[test]
@@ -684,29 +798,69 @@ mod tests {
 
     #[test]
     fn test_ord_duration_comparison() {
-        let d1 = PropertyValue::Duration { months: 1, days: 0, seconds: 0, nanos: 0 };
-        let d2 = PropertyValue::Duration { months: 2, days: 0, seconds: 0, nanos: 0 };
+        let d1 = PropertyValue::Duration {
+            months: 1,
+            days: 0,
+            seconds: 0,
+            nanos: 0,
+        };
+        let d2 = PropertyValue::Duration {
+            months: 2,
+            days: 0,
+            seconds: 0,
+            nanos: 0,
+        };
         assert!(d1 < d2);
     }
 
     #[test]
     fn test_ord_duration_tiebreak_days() {
-        let d1 = PropertyValue::Duration { months: 1, days: 5, seconds: 0, nanos: 0 };
-        let d2 = PropertyValue::Duration { months: 1, days: 10, seconds: 0, nanos: 0 };
+        let d1 = PropertyValue::Duration {
+            months: 1,
+            days: 5,
+            seconds: 0,
+            nanos: 0,
+        };
+        let d2 = PropertyValue::Duration {
+            months: 1,
+            days: 10,
+            seconds: 0,
+            nanos: 0,
+        };
         assert!(d1 < d2);
     }
 
     #[test]
     fn test_ord_duration_tiebreak_seconds() {
-        let d1 = PropertyValue::Duration { months: 1, days: 5, seconds: 100, nanos: 0 };
-        let d2 = PropertyValue::Duration { months: 1, days: 5, seconds: 200, nanos: 0 };
+        let d1 = PropertyValue::Duration {
+            months: 1,
+            days: 5,
+            seconds: 100,
+            nanos: 0,
+        };
+        let d2 = PropertyValue::Duration {
+            months: 1,
+            days: 5,
+            seconds: 200,
+            nanos: 0,
+        };
         assert!(d1 < d2);
     }
 
     #[test]
     fn test_ord_duration_tiebreak_nanos() {
-        let d1 = PropertyValue::Duration { months: 1, days: 5, seconds: 100, nanos: 10 };
-        let d2 = PropertyValue::Duration { months: 1, days: 5, seconds: 100, nanos: 20 };
+        let d1 = PropertyValue::Duration {
+            months: 1,
+            days: 5,
+            seconds: 100,
+            nanos: 10,
+        };
+        let d2 = PropertyValue::Duration {
+            months: 1,
+            days: 5,
+            seconds: 100,
+            nanos: 20,
+        };
         assert!(d1 < d2);
     }
 
@@ -721,8 +875,8 @@ mod tests {
 
     #[test]
     fn test_hash_deterministic_map() {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut m1 = HashMap::new();
         m1.insert("b".to_string(), PropertyValue::Integer(2));
@@ -747,8 +901,8 @@ mod tests {
 
     #[test]
     fn test_hash_deterministic_vector() {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let v1 = PropertyValue::Vector(vec![1.0, 2.0, 3.0]);
         let v2 = PropertyValue::Vector(vec![1.0, 2.0, 3.0]);
@@ -768,11 +922,21 @@ mod tests {
 
     #[test]
     fn test_hash_deterministic_duration() {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
-        let d1 = PropertyValue::Duration { months: 1, days: 2, seconds: 3, nanos: 4 };
-        let d2 = PropertyValue::Duration { months: 1, days: 2, seconds: 3, nanos: 4 };
+        let d1 = PropertyValue::Duration {
+            months: 1,
+            days: 2,
+            seconds: 3,
+            nanos: 4,
+        };
+        let d2 = PropertyValue::Duration {
+            months: 1,
+            days: 2,
+            seconds: 3,
+            nanos: 4,
+        };
 
         let hash1 = {
             let mut h = DefaultHasher::new();
@@ -789,8 +953,8 @@ mod tests {
 
     #[test]
     fn test_hash_different_types_different_hashes() {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let int_hash = {
             let mut h = DefaultHasher::new();
@@ -807,8 +971,8 @@ mod tests {
 
     #[test]
     fn test_hash_null() {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let hash = {
             let mut h = DefaultHasher::new();
@@ -821,8 +985,8 @@ mod tests {
 
     #[test]
     fn test_hash_float() {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let hash1 = {
             let mut h = DefaultHasher::new();
@@ -839,8 +1003,8 @@ mod tests {
 
     #[test]
     fn test_hash_array() {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let arr = PropertyValue::Array(vec![PropertyValue::Integer(1), PropertyValue::Integer(2)]);
         let hash = {
@@ -853,8 +1017,8 @@ mod tests {
 
     #[test]
     fn test_hash_boolean() {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let hash1 = {
             let mut h = DefaultHasher::new();
@@ -871,8 +1035,8 @@ mod tests {
 
     #[test]
     fn test_hash_datetime() {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let hash1 = {
             let mut h = DefaultHasher::new();
@@ -891,7 +1055,10 @@ mod tests {
 
     #[test]
     fn test_display_string() {
-        assert_eq!(format!("{}", PropertyValue::String("hello".to_string())), "\"hello\"");
+        assert_eq!(
+            format!("{}", PropertyValue::String("hello".to_string())),
+            "\"hello\""
+        );
     }
 
     #[test]
@@ -912,7 +1079,10 @@ mod tests {
 
     #[test]
     fn test_display_datetime() {
-        assert_eq!(format!("{}", PropertyValue::DateTime(1234567890)), "DateTime(1234567890)");
+        assert_eq!(
+            format!("{}", PropertyValue::DateTime(1234567890)),
+            "DateTime(1234567890)"
+        );
     }
 
     #[test]
@@ -953,7 +1123,12 @@ mod tests {
 
     #[test]
     fn test_display_duration_years_months() {
-        let d = PropertyValue::Duration { months: 14, days: 0, seconds: 0, nanos: 0 };
+        let d = PropertyValue::Duration {
+            months: 14,
+            days: 0,
+            seconds: 0,
+            nanos: 0,
+        };
         let s = format!("{}", d);
         assert!(s.contains("1Y"));
         assert!(s.contains("2M"));
@@ -961,7 +1136,12 @@ mod tests {
 
     #[test]
     fn test_display_duration_days_time() {
-        let d = PropertyValue::Duration { months: 0, days: 5, seconds: 7261, nanos: 0 };
+        let d = PropertyValue::Duration {
+            months: 0,
+            days: 5,
+            seconds: 7261,
+            nanos: 0,
+        };
         let s = format!("{}", d);
         assert!(s.contains("5D"));
         assert!(s.contains("T"));
@@ -972,14 +1152,24 @@ mod tests {
 
     #[test]
     fn test_display_duration_empty() {
-        let d = PropertyValue::Duration { months: 0, days: 0, seconds: 0, nanos: 0 };
+        let d = PropertyValue::Duration {
+            months: 0,
+            days: 0,
+            seconds: 0,
+            nanos: 0,
+        };
         let s = format!("{}", d);
         assert_eq!(s, "P");
     }
 
     #[test]
     fn test_display_duration_nanos_only() {
-        let d = PropertyValue::Duration { months: 0, days: 0, seconds: 0, nanos: 100 };
+        let d = PropertyValue::Duration {
+            months: 0,
+            days: 0,
+            seconds: 0,
+            nanos: 100,
+        };
         let s = format!("{}", d);
         assert!(s.contains("T"));
         assert!(s.contains("0S"));
@@ -1025,7 +1215,10 @@ mod tests {
 
     #[test]
     fn test_to_json_array() {
-        let arr = PropertyValue::Array(vec![PropertyValue::Integer(1), PropertyValue::String("x".to_string())]);
+        let arr = PropertyValue::Array(vec![
+            PropertyValue::Integer(1),
+            PropertyValue::String("x".to_string()),
+        ]);
         let json = arr.to_json();
         assert_eq!(json, serde_json::json!([1, "x"]));
     }
@@ -1033,7 +1226,10 @@ mod tests {
     #[test]
     fn test_to_json_map() {
         let mut map = HashMap::new();
-        map.insert("name".to_string(), PropertyValue::String("Alice".to_string()));
+        map.insert(
+            "name".to_string(),
+            PropertyValue::String("Alice".to_string()),
+        );
         map.insert("age".to_string(), PropertyValue::Integer(30));
         let json = PropertyValue::Map(map).to_json();
         assert_eq!(json["name"], serde_json::json!("Alice"));
@@ -1050,7 +1246,12 @@ mod tests {
 
     #[test]
     fn test_to_json_duration() {
-        let d = PropertyValue::Duration { months: 1, days: 2, seconds: 3, nanos: 4 };
+        let d = PropertyValue::Duration {
+            months: 1,
+            days: 2,
+            seconds: 3,
+            nanos: 4,
+        };
         let json = d.to_json();
         assert_eq!(json["months"], serde_json::json!(1));
         assert_eq!(json["days"], serde_json::json!(2));
@@ -1132,7 +1333,12 @@ mod tests {
 
     #[test]
     fn test_duration_type_name() {
-        let d = PropertyValue::Duration { months: 0, days: 0, seconds: 0, nanos: 0 };
+        let d = PropertyValue::Duration {
+            months: 0,
+            days: 0,
+            seconds: 0,
+            nanos: 0,
+        };
         assert_eq!(d.type_name(), "Duration");
     }
 
@@ -1143,21 +1349,45 @@ mod tests {
         assert_eq!(PropertyValue::Integer(1), PropertyValue::Integer(1));
         assert_ne!(PropertyValue::Integer(1), PropertyValue::Integer(2));
         assert_eq!(PropertyValue::Float(1.0), PropertyValue::Float(1.0));
-        assert_eq!(PropertyValue::String("a".to_string()), PropertyValue::String("a".to_string()));
-        assert_ne!(PropertyValue::String("a".to_string()), PropertyValue::String("b".to_string()));
+        assert_eq!(
+            PropertyValue::String("a".to_string()),
+            PropertyValue::String("a".to_string())
+        );
+        assert_ne!(
+            PropertyValue::String("a".to_string()),
+            PropertyValue::String("b".to_string())
+        );
     }
 
     #[test]
     fn test_eq_different_types() {
         assert_ne!(PropertyValue::Integer(1), PropertyValue::Float(1.0));
-        assert_ne!(PropertyValue::Integer(1), PropertyValue::String("1".to_string()));
+        assert_ne!(
+            PropertyValue::Integer(1),
+            PropertyValue::String("1".to_string())
+        );
     }
 
     #[test]
     fn test_eq_duration() {
-        let d1 = PropertyValue::Duration { months: 1, days: 2, seconds: 3, nanos: 4 };
-        let d2 = PropertyValue::Duration { months: 1, days: 2, seconds: 3, nanos: 4 };
-        let d3 = PropertyValue::Duration { months: 1, days: 2, seconds: 3, nanos: 5 };
+        let d1 = PropertyValue::Duration {
+            months: 1,
+            days: 2,
+            seconds: 3,
+            nanos: 4,
+        };
+        let d2 = PropertyValue::Duration {
+            months: 1,
+            days: 2,
+            seconds: 3,
+            nanos: 4,
+        };
+        let d3 = PropertyValue::Duration {
+            months: 1,
+            days: 2,
+            seconds: 3,
+            nanos: 5,
+        };
         assert_eq!(d1, d2);
         assert_ne!(d1, d3);
     }
