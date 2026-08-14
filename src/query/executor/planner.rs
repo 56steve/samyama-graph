@@ -903,13 +903,18 @@ impl QueryPlanner {
 
             operator = Some(match operator {
                 Some(existing) => {
-                    let shared: Vec<String> = known_vars.intersection(&clause_vars).cloned().collect();
+                    // ALL shared variables form the join key. Taking one of them left the
+                    // rest uncorrelated — a silent cartesian product — and since this comes
+                    // from a HashSet intersection, which one varied between runs (#360).
+                    let mut shared: Vec<String> =
+                        known_vars.intersection(&clause_vars).cloned().collect();
+                    shared.sort();
                     if !shared.is_empty() {
                         if match_clause.optional {
                             let right_only: Vec<String> = clause_vars.difference(&known_vars).cloned().collect();
-                            Box::new(LeftOuterJoinOperator::new(existing, match_op, shared[0].clone(), right_only)) as OperatorBox
+                            Box::new(LeftOuterJoinOperator::new(existing, match_op, shared.clone(), right_only)) as OperatorBox
                         } else {
-                            Box::new(JoinOperator::new(existing, match_op, shared[0].clone())) as OperatorBox
+                            Box::new(JoinOperator::new(existing, match_op, shared.clone())) as OperatorBox
                         }
                     } else {
                         Box::new(CartesianProductOperator::new(existing, match_op)) as OperatorBox
@@ -1093,13 +1098,18 @@ impl QueryPlanner {
 
                     operator = Some(match operator {
                         Some(existing) => {
-                            let shared: Vec<String> = known_vars.intersection(&clause_vars).cloned().collect();
+                            // ALL shared variables form the join key. Taking one of them left the
+                    // rest uncorrelated — a silent cartesian product — and since this comes
+                    // from a HashSet intersection, which one varied between runs (#360).
+                    let mut shared: Vec<String> =
+                        known_vars.intersection(&clause_vars).cloned().collect();
+                    shared.sort();
                             if !shared.is_empty() {
                                 if match_clause.optional {
                                     let right_only: Vec<String> = clause_vars.difference(&known_vars).cloned().collect();
-                                    Box::new(LeftOuterJoinOperator::new(existing, match_op, shared[0].clone(), right_only)) as OperatorBox
+                                    Box::new(LeftOuterJoinOperator::new(existing, match_op, shared.clone(), right_only)) as OperatorBox
                                 } else {
-                                    Box::new(JoinOperator::new(existing, match_op, shared[0].clone())) as OperatorBox
+                                    Box::new(JoinOperator::new(existing, match_op, shared.clone())) as OperatorBox
                                 }
                             } else {
                                 Box::new(CartesianProductOperator::new(existing, match_op)) as OperatorBox
@@ -1156,8 +1166,9 @@ impl QueryPlanner {
                 }
 
                 if !shared_vars.is_empty() {
-                    // Use JoinOperator on the first shared variable
-                    operator = Some(Box::new(JoinOperator::new(existing_op, call_op, shared_vars[0].clone())));
+                    // Join on every shared variable, not just the first — see #360.
+                    shared_vars.sort();
+                    operator = Some(Box::new(JoinOperator::new(existing_op, call_op, shared_vars.clone())));
                 } else {
                     // Fallback to Cartesian Product
                     operator = Some(Box::new(CartesianProductOperator::new(existing_op, call_op)));
@@ -2001,7 +2012,7 @@ impl QueryPlanner {
         for (op, vars) in operators.into_iter().zip(path_vars.into_iter()) {
             let shared: Vec<String> = combined_vars.intersection(&vars).cloned().collect();
             if !shared.is_empty() {
-                result = Box::new(JoinOperator::new(result, op, shared[0].clone()));
+                result = Box::new(JoinOperator::new(result, op, shared.clone()));
             } else {
                 result = Box::new(CartesianProductOperator::new(result, op));
             }

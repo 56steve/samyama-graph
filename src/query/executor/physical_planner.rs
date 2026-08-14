@@ -114,7 +114,7 @@ pub fn logical_to_physical(plan: &LogicalPlanNode) -> OperatorBox {
             let physical_right = logical_to_physical(right);
             // JoinOperator takes a single join variable
             let join_var = join_keys.first().cloned().unwrap_or_default();
-            Box::new(JoinOperator::new(physical_left, physical_right, join_var))
+            Box::new(JoinOperator::new(physical_left, physical_right, vec![join_var]))
         }
 
         LogicalPlanNode::CartesianProduct { left, right } => {
