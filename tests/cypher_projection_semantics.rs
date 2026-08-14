@@ -557,7 +557,6 @@ fn exists_subquery_applies_inline_property_constraints() {
 }
 
 #[test]
-#[ignore = "blocked on #347: NOT binds tighter than STARTS WITH"]
 fn not_binds_looser_than_string_comparison() {
     let s = fixture();
     assert_eq!(
