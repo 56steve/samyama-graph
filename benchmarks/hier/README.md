@@ -179,9 +179,13 @@ Stated rather than skipped, and tracked in #353:
 - **TimescaleDB continuous aggregates** for H10, the paper's head-to-head. The reference
   implementation matches TimescaleDB to the unit (day 704,800; month 21,168,000); that
   comparison has not been reproduced in-engine.
-- **Real ontologies at scale** — NCBI Taxonomy (1.3M), GeoNames (330k), GO. The generated
-  dataset covers the *shapes*; it does not prove the constants on real data, and Gene
-  Ontology specifically is expected to *decline* (high-width DAG) rather than build.
+- ~~**Real ontologies at scale**~~ — **done, 2026-08-14**: see
+  [`results/real-ontologies.md`](results/real-ontologies.md). NCBI Taxonomy builds at 2.9M
+  nodes in 6.8 s at exactly 12 B/node; Gene Ontology declines as predicted. Two findings
+  worth reading: **GeoNames declines despite being 98.7% a tree** (#371 — there is no
+  encoding between "perfect tree" and "give up"), and **MONDO contains an `is_a` cycle**
+  (#372). Of five real ontologies, one builds, three decline, one is cyclic — the paper's
+  "low-width multi-parent DAGs are rare" is understated; in this sample there were none.
 - **2-hop / PLL space-and-build comparison.** The paper's "half the space, 6–7× faster
   build at query parity" claim is not reproduced here because Samyama has no PLL
   implementation to compare against.
