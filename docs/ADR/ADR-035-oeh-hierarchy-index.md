@@ -289,24 +289,26 @@ mode.
 
 ## Follow-ups
 
-1. **Order-test rewrite.** Detect `MATCH (d:L), (r:L {pin}) WHERE subsumes(d, r)` and emit
+1. **Order-test rewrite** (#349). Detect `MATCH (d:L), (r:L {pin}) WHERE subsumes(d, r)` and emit
    `LabelScan → HierarchyOrderTest` instead of a cartesian product. Highest-value
    remaining work; H1/H6 measure exactly what it is worth.
-2. **A hierarchy-driven plan for cross-hierarchy conjunctions.** HIER H4 runs at 1.1×
+2. **A hierarchy-driven plan for cross-hierarchy conjunctions** (#350). HIER H4 runs at 1.1×
    because the fact scan dominates both plans. Starting from `HierarchyDescendantScan` and
    driving into the fact table would make the paper's motivating query fast, not merely
    expressible.
-3. **`CALL … YIELD` composition** (engine gap, not ADR-035's). `CALL db.index.vector.queryNodes(...)
-   YIELD node` cannot be followed by a `MATCH` or `WHERE` referencing `node`, which blocks
+3. **`CALL … YIELD` composition** (engine gap, not ADR-035's, tracked as #348).
+   `YIELD`-bound variables are not in scope for a following `WHERE`, which blocks
    hierarchy-filtered vector search — HIER class H9 — entirely.
-4. **Online maintenance.** Incremental insert/delete instead of mark-stale-and-rebuild.
+4. **Online maintenance** (#351). Incremental insert/delete instead of mark-stale-and-rebuild.
    Nested-set intervals are the hard case; a gap-leaving labelling would absorb some
    inserts without a full relabel.
-5. **Cheaper MIN/MAX.** The sparse table costs O(n log n) and dominates index size
+5. **Cheaper MIN/MAX** (#352). The sparse table costs O(n log n) and dominates index size
    (7.5 MB of roll-up structures over 112 KB of order embedding on a 9,331-node ontology).
    A sqrt-decomposition or segment tree would trade a little query time for a lot of space.
-6. **Real-ontology validation and a PLL baseline** — see the "Not yet covered" section of
-   `benchmarks/hier/README.md`.
+6. **Real-ontology validation and a PLL baseline** (#353) — see the "Not yet covered"
+   section of `benchmarks/hier/README.md`.
+
+Tracked together in #354, with the four engine bugs the corpus surfaced (#345–#348).
 
 ## References
 

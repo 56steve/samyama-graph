@@ -202,9 +202,10 @@ for a, b in PAIRS:
         f'RETURN max(c.level) AS lvl')
 
 # ------------------------------------------------------- H8 top-k over roll-up
-# ORDER BY without LIMIT: the engine currently does not apply ORDER BY consistently to a
-# scalar-function projection when a LIMIT is present (see README, Known engine gaps), so
-# the corpus orders the full result rather than asserting a truncated one it cannot trust.
+# ORDER BY without LIMIT: `ORDER BY sum(...) DESC` does not sort in this engine (issue
+# #345), so a LIMIT would truncate an unsorted result and the two sides of the comparison
+# would disagree for reasons that have nothing to do with the index. The class exists to
+# measure roll-up called in a loop, which ordering the full result still does.
 n = 0
 for level in [1, 2, 3]:
     n += 1
