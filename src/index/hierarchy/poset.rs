@@ -167,7 +167,7 @@ impl Poset {
             edge_count += 1;
         }
 
-        let topo_up = Self::topo_sort_up(&parents, n, &nodes)?;
+        let topo_up = Self::topo_sort_up(&parents, &children, n, &nodes)?;
         Ok(Poset {
             nodes,
             index_of,
@@ -202,7 +202,12 @@ impl Poset {
     }
 
     /// Kahn topological sort on `child -> parent` edges, producing children before parents.
-    fn topo_sort_up(parents: &[Vec<u32>], n: usize, nodes: &[NodeId]) -> HierarchyResult<Vec<u32>> {
+    fn topo_sort_up(
+        parents: &[Vec<u32>],
+        children: &[Vec<u32>],
+        n: usize,
+        nodes: &[NodeId],
+    ) -> HierarchyResult<Vec<u32>> {
         // in-degree counted on the *parent* side: how many children point at me.
         let mut indeg = vec![0u32; n];
         for plist in parents.iter() {
@@ -232,7 +237,7 @@ impl Poset {
                 .collect();
             let example_cycle = stalled
                 .first()
-                .map(|&start| Self::recover_cycle(parents, &indeg, start))
+                .map(|&start| Self::recover_cycle(children, &indeg, start))
                 .unwrap_or_default();
             return Err(HierarchyError::NotAcyclic {
                 ordered: order.len(),
@@ -246,12 +251,19 @@ impl Poset {
         Ok(order)
     }
 
-    /// Walk parents from `start`, staying inside the stalled set, until a node repeats.
+    /// Walk **children** from `start`, staying inside the stalled set, until a node repeats.
     ///
-    /// The repeat closes a cycle; everything before the first occurrence is the tail that
-    /// led into it and is dropped. Returns the cycle with the entry node repeated at the
-    /// end so it reads as `a -> b -> a`.
-    fn recover_cycle(parents: &[Vec<u32>], indeg: &[u32], start: u32) -> Vec<u32> {
+    /// Direction matters here and is easy to get backwards. In-degree is counted on the
+    /// parent side — `indeg[p]` is how many children point at `p` — so a node left with
+    /// non-zero in-degree has an unprocessed *child*. Following children therefore descends
+    /// toward the cycle and is guaranteed to reach it; following parents can walk away from
+    /// it and dead-end, which is what happened on MONDO, where most stalled nodes are
+    /// merely downstream of the cycle rather than on it.
+    ///
+    /// The first repeated node closes the cycle; everything before its first occurrence is
+    /// the tail that led in and is dropped. The entry node is repeated at the end so the
+    /// result reads as `a -> b -> a`.
+    fn recover_cycle(children: &[Vec<u32>], indeg: &[u32], start: u32) -> Vec<u32> {
         let mut path: Vec<u32> = Vec::new();
         let mut seen: HashMap<u32, usize> = HashMap::new();
         let mut cur = start;
@@ -263,8 +275,8 @@ impl Poset {
             }
             seen.insert(cur, path.len());
             path.push(cur);
-            // stay inside the stalled set — a parent that was ordered cannot be on a cycle
-            match parents[cur as usize]
+            // stay inside the stalled set — an ordered node cannot be on a cycle
+            match children[cur as usize]
                 .iter()
                 .copied()
                 .find(|&p| indeg[p as usize] > 0)
@@ -481,6 +493,35 @@ mod tests {
             "node 3 is a tail into the cycle, not on it: {example_cycle:?}"
         );
         assert_eq!(members, [0, 1, 2].into_iter().collect());
+    }
+
+    #[test]
+    fn a_cycle_is_found_from_a_node_that_is_only_downstream_of_it() {
+        // The MONDO shape, and the one my first fixtures were too simple to catch. Node 9
+        // is a parent of 2, so it inherits 2's stall without being on the cycle itself.
+        // Recovery starting there must still find 0 -> 1 -> 2, not dead-end.
+        let err = Poset::from_edges(
+            vec![
+                (nid(0), nid(1)),
+                (nid(1), nid(2)),
+                (nid(2), nid(0)),
+                (nid(2), nid(9)),
+            ],
+            std::iter::empty(),
+        )
+        .unwrap_err();
+        let HierarchyError::NotAcyclic { example_cycle, .. } = &err else {
+            panic!("expected NotAcyclic")
+        };
+        assert!(
+            !example_cycle.is_empty(),
+            "a cycle exists and must be recoverable from any stalled node: {err}"
+        );
+        assert_eq!(example_cycle.first(), example_cycle.last());
+        let members: std::collections::HashSet<u64> =
+            example_cycle.iter().map(|n| n.as_u64()).collect();
+        assert_eq!(members, [0, 1, 2].into_iter().collect(), "got {example_cycle:?}");
+        assert!(!members.contains(&9), "9 is downstream, not on the cycle");
     }
 
     #[test]
