@@ -12,6 +12,7 @@
 //! cargo run --release --example ontology_loader -- --format obo --path mondo.obo
 //! cargo run --release --example ontology_loader -- --format obo --path go-basic.obo   # declines
 //! cargo run --release --example ontology_loader -- --format geonames --path hierarchy.txt
+//! cargo run --release --example ontology_loader -- --format mesh --path mtrees2025.bin
 //! cargo run --release --example ontology_loader -- --format prefix --path atc.csv --cuts 1,3,4,5,7
 //! cargo run --release --example ontology_loader -- --format edgelist --path cwe.csv
 //! cargo run --release --example ontology_loader -- --format calendar --from 2015 --to 2026
@@ -89,6 +90,7 @@ fn main() {
         "obo" => load_obo(&mut store, &args),
         "taxdump" => load_taxdump(&mut store, &args),
         "geonames" => load_geonames(&mut store, &args),
+        "mesh" => load_mesh(&mut store, &args),
         "prefix" => load_prefix(&mut store, &args),
         "edgelist" => load_edgelist(&mut store, &args),
         "calendar" => load_calendar(&mut store, &args),
@@ -169,7 +171,7 @@ fn main() {
 
 fn usage() -> String {
     format!(
-        "ontology_loader --format <obo|taxdump|geonames|prefix|edgelist|calendar> [--path FILE]\n\
+        "ontology_loader --format <obo|taxdump|geonames|mesh|prefix|edgelist|calendar> [--path FILE]\n\
          \n\
          Options:\n\
          \x20 --label L          node label to create           (default Concept)\n\
@@ -406,6 +408,47 @@ fn load_prefix(store: &mut GraphStore, args: &Args) -> (usize, usize) {
                 if store.create_edge(id, p, args.edge_type.as_str()).is_ok() {
                     edges += 1;
                 }
+            }
+        }
+        if args.limit.is_some_and(|l| edges >= l) {
+            break;
+        }
+    }
+    (interner.ids.len(), edges)
+}
+
+/// NLM MeSH tree file (`mtrees<year>.bin`): `Descriptor Name;TreeNumber`, one line per
+/// tree position.
+///
+/// The hierarchy is carried by the **tree number**, not the descriptor: `C01.252.400` sits
+/// under `C01.252` under `C01`. Modelling tree numbers as the nodes matters — a descriptor
+/// may occupy several positions in the tree ("Breast Neoplasms" is both a breast disease
+/// and a neoplasm), so a descriptor-to-descriptor graph is a poly-hierarchy that the probe
+/// would likely decline. Tree numbers give a strict tree, and the descriptor name rides
+/// along as a property, so an article annotated with a descriptor can still be rolled up
+/// through every position that descriptor occupies.
+fn load_mesh(store: &mut GraphStore, args: &Args) -> (usize, usize) {
+    let reader = open(&args.path);
+    let mut interner = Interner::new();
+    let mut edges = 0usize;
+    for line in reader.lines().map_while(Result::ok) {
+        let Some((name, tree)) = line.split_once(';') else { continue };
+        let (name, tree) = (name.trim(), tree.trim());
+        if tree.is_empty() {
+            continue;
+        }
+        let id = interner.get(store, &args.label, tree);
+        store.set_column_property(id, "name", PropertyValue::String(name.to_string()));
+        // Depth is free here and makes level-wise roll-up queries expressible.
+        store.set_column_property(
+            id,
+            "level",
+            PropertyValue::Integer(tree.matches('.').count() as i64),
+        );
+        if let Some((parent, _)) = tree.rsplit_once('.') {
+            let p = interner.get(store, &args.label, parent);
+            if store.create_edge(id, p, args.edge_type.as_str()).is_ok() {
+                edges += 1;
             }
         }
         if args.limit.is_some_and(|l| edges >= l) {
