@@ -25,10 +25,22 @@ use crate::graph::GraphStore;
 /// Errors raised while building or using a hierarchy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HierarchyError {
-    /// The covering relation contains a directed cycle. Carries how many nodes could be
-    /// topologically ordered before the sort stalled, which is a useful size hint when
-    /// debugging a bad ontology import.
-    NotAcyclic { ordered: usize, total: usize },
+    /// The covering relation contains a directed cycle.
+    ///
+    /// Carries an example cycle, not just a count. A count tells a user their data is bad;
+    /// the node ids tell them *where*, which is the difference between a dead end and a
+    /// fixable import. Real ontologies do contain these — MONDO has a 14-node `is_a` cycle
+    /// — and the user's next step is to file it upstream or exclude those terms, neither
+    /// of which is possible without the ids.
+    NotAcyclic {
+        /// How many nodes could be ordered before the sort stalled.
+        ordered: usize,
+        /// Total nodes in the poset.
+        total: usize,
+        /// One cycle, as graph node ids, `a -> b -> ... -> a`. Empty only if the cycle
+        /// could not be recovered, which should not happen when `ordered < total`.
+        example_cycle: Vec<NodeId>,
+    },
     /// The poset is a DAG whose chain width exceeds the cap; a 2-hop index is the right
     /// substrate there. This is a *decline*, not a failure — see ADR-035.
     WidthTooHigh {
@@ -51,10 +63,25 @@ pub enum HierarchyError {
 impl std::fmt::Display for HierarchyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HierarchyError::NotAcyclic { ordered, total } => write!(
-                f,
-                "covering relation has a cycle: only {ordered}/{total} nodes could be ordered"
-            ),
+            HierarchyError::NotAcyclic {
+                ordered,
+                total,
+                example_cycle,
+            } => {
+                let unordered = total.saturating_sub(*ordered);
+                write!(
+                    f,
+                    "covering relation has a cycle: {unordered} of {total} nodes could not be ordered"
+                )?;
+                if !example_cycle.is_empty() {
+                    let path: Vec<String> = example_cycle
+                        .iter()
+                        .map(|n| n.as_u64().to_string())
+                        .collect();
+                    write!(f, "; example cycle: {}", path.join(" -> "))?;
+                }
+                Ok(())
+            }
             HierarchyError::WidthTooHigh { width, cap, nodes } => write!(
                 f,
                 "hierarchy declined: chain width {width} exceeds cap {cap} (~8·sqrt({nodes})); \
@@ -140,7 +167,7 @@ impl Poset {
             edge_count += 1;
         }
 
-        let topo_up = Self::topo_sort_up(&parents, n)?;
+        let topo_up = Self::topo_sort_up(&parents, n, &nodes)?;
         Ok(Poset {
             nodes,
             index_of,
@@ -175,7 +202,7 @@ impl Poset {
     }
 
     /// Kahn topological sort on `child -> parent` edges, producing children before parents.
-    fn topo_sort_up(parents: &[Vec<u32>], n: usize) -> HierarchyResult<Vec<u32>> {
+    fn topo_sort_up(parents: &[Vec<u32>], n: usize, nodes: &[NodeId]) -> HierarchyResult<Vec<u32>> {
         // in-degree counted on the *parent* side: how many children point at me.
         let mut indeg = vec![0u32; n];
         for plist in parents.iter() {
@@ -196,12 +223,56 @@ impl Poset {
             }
         }
         if order.len() != n {
+            // Every node still carrying in-degree is inside a cycle or downstream of one.
+            // Walking parents from any of them must re-enter the cycle, so the first
+            // repeated node closes it — that slice is a genuine cycle, not merely the
+            // unordered set.
+            let stalled: Vec<u32> = (0..n as u32)
+                .filter(|&i| indeg[i as usize] > 0)
+                .collect();
+            let example_cycle = stalled
+                .first()
+                .map(|&start| Self::recover_cycle(parents, &indeg, start))
+                .unwrap_or_default();
             return Err(HierarchyError::NotAcyclic {
                 ordered: order.len(),
                 total: n,
+                example_cycle: example_cycle
+                    .into_iter()
+                    .map(|i| nodes[i as usize])
+                    .collect(),
             });
         }
         Ok(order)
+    }
+
+    /// Walk parents from `start`, staying inside the stalled set, until a node repeats.
+    ///
+    /// The repeat closes a cycle; everything before the first occurrence is the tail that
+    /// led into it and is dropped. Returns the cycle with the entry node repeated at the
+    /// end so it reads as `a -> b -> a`.
+    fn recover_cycle(parents: &[Vec<u32>], indeg: &[u32], start: u32) -> Vec<u32> {
+        let mut path: Vec<u32> = Vec::new();
+        let mut seen: HashMap<u32, usize> = HashMap::new();
+        let mut cur = start;
+        loop {
+            if let Some(&at) = seen.get(&cur) {
+                let mut cycle = path[at..].to_vec();
+                cycle.push(cur);
+                return cycle;
+            }
+            seen.insert(cur, path.len());
+            path.push(cur);
+            // stay inside the stalled set — a parent that was ordered cannot be on a cycle
+            match parents[cur as usize]
+                .iter()
+                .copied()
+                .find(|&p| indeg[p as usize] > 0)
+            {
+                Some(next) => cur = next,
+                None => return Vec::new(),
+            }
+        }
     }
 
     /// Number of nodes.
@@ -358,6 +429,72 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, HierarchyError::NotAcyclic { .. }));
+    }
+
+    #[test]
+    fn a_cycle_error_names_the_nodes_on_the_cycle() {
+        // A count tells the user their data is bad; the ids tell them where. Real
+        // ontologies contain these — MONDO has a 14-node is_a cycle — and the next step
+        // is to file it upstream or exclude the terms, neither possible without the ids.
+        let err = Poset::from_edges(
+            vec![(nid(0), nid(1)), (nid(1), nid(2)), (nid(2), nid(0))],
+            std::iter::empty(),
+        )
+        .unwrap_err();
+        let HierarchyError::NotAcyclic { example_cycle, .. } = &err else {
+            panic!("expected NotAcyclic, got {err:?}")
+        };
+        // The cycle closes: first and last are the same node.
+        assert!(example_cycle.len() >= 2, "got {example_cycle:?}");
+        assert_eq!(
+            example_cycle.first(),
+            example_cycle.last(),
+            "a reported cycle must close: {example_cycle:?}"
+        );
+        let members: std::collections::HashSet<u64> =
+            example_cycle.iter().map(|n| n.as_u64()).collect();
+        assert_eq!(members, [0, 1, 2].into_iter().collect(), "got {example_cycle:?}");
+        assert!(format!("{err}").contains("example cycle"), "{err}");
+    }
+
+    #[test]
+    fn a_cycle_reached_through_a_tail_reports_only_the_cycle() {
+        // 3 -> 2 is a tail leading into the 0 -> 1 -> 2 -> 0 cycle. The tail is not part of
+        // the cycle and must not be reported as though it were.
+        let err = Poset::from_edges(
+            vec![
+                (nid(0), nid(1)),
+                (nid(1), nid(2)),
+                (nid(2), nid(0)),
+                (nid(3), nid(2)),
+            ],
+            std::iter::empty(),
+        )
+        .unwrap_err();
+        let HierarchyError::NotAcyclic { example_cycle, .. } = &err else {
+            panic!("expected NotAcyclic")
+        };
+        let members: std::collections::HashSet<u64> =
+            example_cycle.iter().map(|n| n.as_u64()).collect();
+        assert!(
+            !members.contains(&3),
+            "node 3 is a tail into the cycle, not on it: {example_cycle:?}"
+        );
+        assert_eq!(members, [0, 1, 2].into_iter().collect());
+    }
+
+    #[test]
+    fn a_two_node_cycle_is_reported() {
+        let err =
+            Poset::from_edges(vec![(nid(7), nid(8)), (nid(8), nid(7))], std::iter::empty())
+                .unwrap_err();
+        let HierarchyError::NotAcyclic { example_cycle, ordered, total } = &err else {
+            panic!("expected NotAcyclic")
+        };
+        assert_eq!(*total, 2);
+        assert_eq!(*ordered, 0);
+        assert_eq!(example_cycle.first(), example_cycle.last());
+        assert_eq!(example_cycle.len(), 3, "a -> b -> a: {example_cycle:?}");
     }
 
     #[test]
