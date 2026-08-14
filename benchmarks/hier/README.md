@@ -96,10 +96,10 @@ magnitude while the engine aggregation pays O(subtree) every time.
 
 Reporting only H2 would be dishonest. Two classes are **slower** with the index:
 
-**H1 (order test) and H6 (anti-subsumption), 0.2×.** Two causes, both real:
+**H1 (order test) and H6 (anti-subsumption), 0.2×.** Two causes, both real (tracked in #349):
 
 1. The planner rewrite that turns a subsumption test into a `HierarchyOrderTest` over a
-   scan — rewrite #1 in ADR-035 §8 — **is specified but not implemented**. Only the
+   scan — rewrite 1 in ADR-035 §8 — **is specified but not implemented**. Only the
    roll-up and descendant-scan rewrites ship. So these queries run the `subsumes()`
    function form, which binds the root with a cartesian product and then pays a
    per-row index lookup: ~500 ns/row against ~120 ns/row for a native predicate.
@@ -134,17 +134,22 @@ encoding, not a performance one.
 
 Found while building the corpus; all pre-date ADR-035 and none are caused by it.
 
-1. **`CALL … YIELD node` does not compose** with a following `MATCH` (`Variable not found:
-   node`) or a following `WHERE` (parse error). This blocks class **H9**, hierarchy-filtered
-   vector search — the ANN call works and the subsumption predicate works, but they cannot
-   be put in one query. The four H9 queries are kept in `queries.json` with a `skip`
-   reason so the class stays visible rather than quietly vanishing from the table.
-2. **`NOT x STARTS WITH "y"`** evaluates as though the `NOT` binds the operand, returning
-   nothing. `NOT (x STARTS WITH "y")` is correct. A precedence bug.
-3. **`NOT EXISTS { MATCH (d)-[:T*0..]->(r {...}) }`** never matches — the EXISTS subquery
-   with a variable-length pattern always evaluates false.
-4. **`ORDER BY <scalar function> DESC LIMIT k`** returns a different top-k than the
-   equivalent aggregate ordering. The H8 queries therefore order without a `LIMIT`.
+1. **[#345] `ORDER BY sum(...) DESC` does not sort.** Repeating a `sum()` aggregate in
+   `ORDER BY` leaves the rows in natural order, so `LIMIT k` silently returns the wrong
+   top-k. Ordering by the *alias* is correct, and `count()` happens to work. The H8
+   queries therefore order without a `LIMIT`, since the class exists to measure roll-up
+   called in a loop rather than to test truncation.
+2. **[#346] Inline property maps inside `EXISTS { }` never match.**
+   `EXISTS { MATCH (d)-[:IS_A]->(r:T {code: "AB"}) }` returns nothing, so `NOT EXISTS`
+   returns every row. Not specific to variable-length patterns — a single hop reproduces
+   it — and the same constraint written as a `WHERE` inside the subquery works.
+3. **[#347] `NOT x STARTS WITH "y"`** parses as though `NOT` binds the operand.
+   `NOT (x STARTS WITH "y")` is correct. A precedence bug.
+4. **[#348] `CALL … YIELD` variables are not in scope for a following `WHERE`**
+   (`Variable not found: node`); a `WHERE` directly after `YIELD` is a parse error. This
+   blocks class **H9**, hierarchy-filtered vector search. The four H9 queries are kept in
+   `queries.json` with a `skip` reason so the class stays visible rather than quietly
+   vanishing from the table.
 
 ## Corpus
 
@@ -166,7 +171,7 @@ the generator; the JSON is committed so a run needs no Python.
 
 ## Not yet covered
 
-Stated rather than skipped:
+Stated rather than skipped, and tracked in #353:
 
 - **Neo4j / TigerGraph cross-engine baselines.** The corpus is Cypher and the dataset is
   generated, so porting it is mechanical, but it has not been run. `samyama-graph-competitor-benchmarks`
