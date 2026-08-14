@@ -62,7 +62,7 @@ use std::sync::Mutex;
 use crate::query::executor::{
     ExecutionError, ExecutionResult, OperatorBox,
     // Added CreateNodeOperator and CreateNodesAndEdgesOperator for CREATE statement support
-    operator::{NodeScanOperator, FilterOperator, ExpandOperator, ProjectOperator, LimitOperator, SkipOperator, CreateNodeOperator, CreateNodesAndEdgesOperator, CartesianProductOperator, VectorSearchOperator, JoinOperator, LeftOuterJoinOperator, CreateVectorIndexOperator, CreateIndexOperator, CompositeCreateIndexOperator, CreateConstraintOperator, DropIndexOperator, ShowIndexesOperator, ShowConstraintsOperator, ShowLabelsOperator, ShowRelationshipTypesOperator, ShowPropertyKeysOperator, SchemaVisualizationOperator, AlgorithmOperator, IndexScanOperator, AggregateOperator, AggregateType, AggregateFunction, SortOperator, DeleteOperator, SetPropertyOperator, RemovePropertyOperator, UnwindOperator, MergeOperator, ForeachOperator, ShortestPathOperator, VarLengthExpandOperator, WithBarrierOperator, LabelCountOperator, EdgeTypeCountOperator},
+    operator::{NodeScanOperator, FilterOperator, ExpandOperator, ProjectOperator, LimitOperator, SkipOperator, CreateNodeOperator, CreateNodesAndEdgesOperator, CartesianProductOperator, VectorSearchOperator, JoinOperator, LeftOuterJoinOperator, CreateVectorIndexOperator, CreateIndexOperator, CompositeCreateIndexOperator, CreateConstraintOperator, DropIndexOperator, ShowIndexesOperator, ShowConstraintsOperator, DistinctOperator, ShowLabelsOperator, ShowRelationshipTypesOperator, ShowPropertyKeysOperator, SchemaVisualizationOperator, AlgorithmOperator, IndexScanOperator, AggregateOperator, AggregateType, AggregateFunction, SortOperator, DeleteOperator, SetPropertyOperator, RemovePropertyOperator, UnwindOperator, MergeOperator, ForeachOperator, ShortestPathOperator, VarLengthExpandOperator, WithBarrierOperator, LabelCountOperator, EdgeTypeCountOperator},
 };
 use crate::graph::EdgeType;  // Added for CREATE edge support
 use std::collections::{HashMap, HashSet};  // Added for CREATE properties and JOIN logic
@@ -338,7 +338,24 @@ impl QueryPlanner {
     }
 
     /// Plan a query
+    /// Plan a query, then apply `RETURN DISTINCT` if the query asked for it.
+    ///
+    /// The deduplication is applied here, at the single point every planning path funnels
+    /// through, rather than inside the dozen-odd places that build a `ProjectOperator`.
+    /// That matters because several of those paths are specialized fast plans
+    /// (adjacency-count aggregation, hierarchy rewrites, label-count caches) that were
+    /// each individually capable of dropping the flag on the floor — which is how
+    /// `RETURN DISTINCT` came to be a complete no-op (#311). One choke point cannot
+    /// forget.
     pub fn plan(&self, query: &Query, store: &GraphStore) -> ExecutionResult<ExecutionPlan> {
+        let mut plan = self.plan_inner(query, store)?;
+        if query.return_clause.as_ref().is_some_and(|r| r.distinct) {
+            plan.root = Box::new(DistinctOperator::new(plan.root));
+        }
+        Ok(plan)
+    }
+
+    fn plan_inner(&self, query: &Query, store: &GraphStore) -> ExecutionResult<ExecutionPlan> {
         // Handle SHOW INDEXES
         if query.show_indexes {
             return Ok(ExecutionPlan {
