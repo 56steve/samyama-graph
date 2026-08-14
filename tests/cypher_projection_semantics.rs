@@ -276,7 +276,6 @@ fn distinct_composes_with_order_by_at_least_as_far_as_deduplicating() {
 }
 
 #[test]
-#[ignore = "blocked on #356: ORDER BY <alias> is silently ignored"]
 fn distinct_composes_with_order_by() {
     let s = fixture();
     assert_eq!(
@@ -486,7 +485,6 @@ fn order_by_a_property_expression_sorts() {
 }
 
 #[test]
-#[ignore = "blocked on #356: ORDER BY <alias> is silently ignored"]
 fn order_by_a_projected_alias_sorts() {
     let s = fixture();
     let r = rows(
@@ -512,18 +510,17 @@ fn order_by_an_aggregate_alias_sorts_groups() {
 }
 
 #[test]
-#[ignore = "blocked on #356: ORDER BY <alias> is silently ignored"]
 fn order_by_with_limit_returns_the_true_top_k() {
     let s = fixture();
+    // salaries: Carol 300, Eve 250, Bob 200, Dave 150, Alice 100, Frank NULL
     let r = rows(
         &s,
         "MATCH (p:Person) RETURN p.name AS n, p.salary AS v ORDER BY v DESC LIMIT 2",
     );
-    assert_eq!(r, vec!["n=Carol v=300", "n=Bob v=200"], "{r:?}");
+    assert_eq!(r, vec!["n=Carol v=300", "n=Eve v=250"], "{r:?}");
 }
 
 #[test]
-#[ignore = "blocked on #345: ORDER BY sum(...) DESC does not sort; use the alias"]
 fn order_by_a_repeated_aggregate_expression_sorts_like_its_alias() {
     let s = fixture();
     let by_expr = rows(
@@ -587,4 +584,96 @@ fn is_not_null_matches_only_nodes_carrying_the_property() {
         ),
         "n=1"
     );
+}
+
+#[test]
+fn order_by_resolves_the_same_way_on_specialized_plans() {
+    // The adjacency-count-aggregate plan (ADR-017) projects and then sorts, so an ORDER BY
+    // written as a property or a repeated aggregate has to be translated to the emitted
+    // alias. This shape gets a different physical plan from the generic aggregate above,
+    // and it regressed independently — hence its own test rather than trust by proximity.
+    let s = fixture();
+    // KNOWS targets per city: NYC 4, LON 2.
+    let by_alias = rows(
+        &s,
+        "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b.city AS c, count(a) AS n ORDER BY n DESC",
+    );
+    let by_aggregate = rows(
+        &s,
+        "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b.city AS c, count(a) AS n ORDER BY count(a) DESC",
+    );
+    assert_eq!(by_alias, vec!["c=NYC n=4", "c=LON n=2"], "{by_alias:?}");
+    assert_eq!(by_aggregate, by_alias, "both spellings must agree");
+
+    // ...and ordering by the grouping property itself, which is neither the alias nor an
+    // aggregate.
+    let by_group = rows(
+        &s,
+        "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b.city AS c, count(a) AS n ORDER BY b.city DESC",
+    );
+    assert_eq!(by_group, vec!["c=NYC n=4", "c=LON n=2"], "{by_group:?}");
+}
+
+#[test]
+fn every_sort_key_is_honoured_not_just_the_first() {
+    // #362 also reported "only the first sort key is honoured". It is the same defect:
+    // a key that does not resolve evaluates to null for every row, so it contributes
+    // nothing to the comparison and the rows appear ordered by the remaining keys only.
+    // Once aliases resolve, secondary keys work — asserted here in all three spellings
+    // so the symptom cannot come back through a different door.
+    let s = fixture();
+    let expected = vec![
+        "c=LON n=Carol",
+        "c=LON n=Eve",
+        "c=LON n=Frank",
+        "c=NYC n=Alice",
+        "c=NYC n=Bob",
+        "c=NYC n=Dave",
+    ];
+    for query in [
+        "MATCH (p:Person) RETURN p.city AS c, p.name AS n ORDER BY p.city ASC, p.name ASC",
+        "MATCH (p:Person) RETURN p.city AS c, p.name AS n ORDER BY c ASC, n ASC",
+        "MATCH (p:Person) RETURN p.city AS c, p.name AS n ORDER BY c ASC, p.name ASC",
+    ] {
+        assert_eq!(rows(&s, query), expected, "sorting by two keys: {query}");
+    }
+
+    // and the secondary key's own direction is respected
+    let desc_second = rows(
+        &s,
+        "MATCH (p:Person) RETURN p.city AS c, p.name AS n ORDER BY c ASC, n DESC",
+    );
+    assert_eq!(desc_second[0], "c=LON n=Frank", "{desc_second:?}");
+}
+
+#[test]
+fn order_by_with_limit_on_a_grouped_aggregate_returns_the_true_top_k() {
+    let s = fixture();
+    let r = rows(
+        &s,
+        "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b.city AS c, count(a) AS n ORDER BY count(a) DESC LIMIT 1",
+    );
+    assert_eq!(r, vec!["c=NYC n=4"], "{r:?}");
+}
+
+#[test]
+#[ignore = "blocked on #369: NULL sorts as the smallest value, openCypher treats it as the largest"]
+fn null_ordering_follows_opencypher() {
+    // openCypher orders NULL as greater than every value, so it lands last on ASC and
+    // first on DESC. The engine currently does the opposite.
+    let s = fixture();
+    let asc = rows(
+        &s,
+        "MATCH (p:Person) RETURN p.name AS n, p.salary AS v ORDER BY v ASC",
+    );
+    assert_eq!(
+        asc[asc.len() - 1],
+        "n=Frank v=NULL",
+        "nulls last on ASC: {asc:?}"
+    );
+    let desc = rows(
+        &s,
+        "MATCH (p:Person) RETURN p.name AS n, p.salary AS v ORDER BY v DESC",
+    );
+    assert_eq!(desc[0], "n=Frank v=NULL", "nulls first on DESC: {desc:?}");
 }

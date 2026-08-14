@@ -174,6 +174,60 @@ fn extract_agg_inner(
 
 /// An execution plan: a tree of physical operators ready to execute.
 ///
+/// Where the sort sits relative to the projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortPosition {
+    /// Sort runs before `ProjectOperator`, so only the source variables are bound.
+    BeforeProjection,
+    /// Sort runs after `ProjectOperator`, so only the projected aliases are bound.
+    AfterProjection,
+}
+
+/// Rewrite an `ORDER BY` key so it resolves where the sort actually runs.
+///
+/// openCypher lets `ORDER BY` name either a projected alias or an expression over the
+/// variables still in scope. The planner places the sort on one side of the projection or
+/// the other depending on whether the query aggregates, and `ProjectOperator` builds a
+/// *fresh* record containing only the projected aliases. So at the point the sort runs,
+/// exactly one of those two spellings is bound and the other evaluates to null for every
+/// row — which sorts nothing, silently. That is one defect wearing two faces: the alias
+/// form was dead on plain projections (#356) and the expression form was dead on
+/// aggregates (#345).
+///
+/// Moving the sort would only swap which spelling breaks. Instead the key is translated
+/// into whichever form is bound where it lands:
+///
+/// - [`SortPosition::BeforeProjection`] — an alias is replaced by the expression it was
+///   defined as, so `RETURN p.salary AS v ORDER BY v` sorts on `p.salary`.
+/// - [`SortPosition::AfterProjection`] — an expression matching a projected item is
+///   replaced by that item's alias, so `RETURN sum(p.x) AS v ORDER BY sum(p.x)` sorts on
+///   the already-computed `v` rather than re-deriving an aggregate over discarded rows.
+///
+/// A key that matches nothing is returned unchanged: it may legitimately reference a
+/// variable that is still in scope, and rewriting it would be worse than leaving it.
+fn resolve_sort_key(
+    key: &Expression,
+    return_items: &[(Expression, String)],
+    position: SortPosition,
+) -> Expression {
+    match position {
+        SortPosition::BeforeProjection => {
+            if let Expression::Variable(name) = key {
+                if let Some((expr, _)) = return_items.iter().find(|(_, alias)| alias == name) {
+                    return expr.clone();
+                }
+            }
+            key.clone()
+        }
+        SortPosition::AfterProjection => {
+            if let Some((_, alias)) = return_items.iter().find(|(expr, _)| expr == key) {
+                return Expression::Variable(alias.clone());
+            }
+            key.clone()
+        }
+    }
+}
+
 /// The `root` field holds the top-level operator (typically a `ProjectOperator` or
 /// `LimitOperator`). Calling `root.next(store)` begins the Volcano pull-based execution,
 /// cascading `next()` calls down the operator tree until a leaf scan produces a record.
@@ -569,7 +623,7 @@ impl QueryPlanner {
                         output_columns.push(alias.clone());
                         (item.expression.clone(), alias)
                     }).collect();
-                    operator = Box::new(ProjectOperator::new(operator, projections));
+                            operator = Box::new(ProjectOperator::new(operator, projections));
                 }
 
                 return Ok(ExecutionPlan {
@@ -1196,6 +1250,7 @@ impl QueryPlanner {
             let mut projections = Vec::new();
             let mut has_aggregation = false;
             let mut agg_counter = 0usize;
+            let mut return_item_aliases: Vec<(Expression, String)> = Vec::new();
             // Post-projection items: after aggregation, compute final expressions
             // from aggregate aliases (e.g. round(__agg_0 * 100 / __agg_1) AS strike_rate)
             let mut post_projections: Vec<(Expression, String)> = Vec::new();
@@ -1222,6 +1277,9 @@ impl QueryPlanner {
                 });
 
                 output_columns.push(alias.clone());
+                // Kept so ORDER BY can be translated between alias and expression form,
+                // whichever is bound where the sort lands.
+                return_item_aliases.push((item.expression.clone(), alias.clone()));
 
                 // Extract nested aggregates from expressions like round(sum(x) / sum(y))
                 let (rewritten, extracted) = extract_nested_aggregates(&item.expression, &mut agg_counter);
@@ -1279,7 +1337,10 @@ impl QueryPlanner {
                 // Sort after projection
                 if let Some(order_by) = &query.order_by {
                     let sort_items: Vec<(Expression, bool)> = order_by.items.iter()
-                        .map(|i| (i.expression.clone(), i.ascending)).collect();
+                        .map(|i| (
+                            resolve_sort_key(&i.expression, &return_item_aliases, SortPosition::AfterProjection),
+                            i.ascending,
+                        )).collect();
                     operator = Box::new(SortOperator::new(operator, sort_items));
                 }
             } else if use_label_count {
@@ -1300,7 +1361,10 @@ impl QueryPlanner {
                 if let Some(order_by) = &query.order_by {
                     let mut sort_items = Vec::new();
                     for item in &order_by.items {
-                        sort_items.push((item.expression.clone(), item.ascending));
+                        sort_items.push((
+                            resolve_sort_key(&item.expression, &return_item_aliases, SortPosition::AfterProjection),
+                            item.ascending,
+                        ));
                     }
                     operator = Box::new(SortOperator::new(operator, sort_items));
                 }
@@ -1309,7 +1373,10 @@ impl QueryPlanner {
                 if let Some(order_by) = &query.order_by {
                     let mut sort_items = Vec::new();
                     for item in &order_by.items {
-                        sort_items.push((item.expression.clone(), item.ascending));
+                        sort_items.push((
+                            resolve_sort_key(&item.expression, &return_item_aliases, SortPosition::BeforeProjection),
+                            item.ascending,
+                        ));
                     }
                     operator = Box::new(SortOperator::new(operator, sort_items));
                 }
@@ -2129,18 +2196,36 @@ impl QueryPlanner {
                 (expr, alias)
             })
             .collect();
+        // Pair each RETURN item's original expression with the alias this plan actually
+        // emits, so an ORDER BY written either way resolves after the projection.
+        let order_keys: Vec<(Expression, String)> = query
+            .return_clause
+            .as_ref()
+            .map(|rc| {
+                rc.items
+                    .iter()
+                    .zip(projections.iter())
+                    .map(|(item, (_, alias))| (item.expression.clone(), alias.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         operator = Box::new(ProjectOperator::new(operator, projections));
 
         // (GROUP BY is now handled inside AdjacencyCountAggregateOperator
         // via `with_group_by_props` above — no post-aggregate step needed.)
 
-        // ORDER BY — the count alias is already bound, so any ORDER BY
-        // expression the detector accepted evaluates cheaply.
+        // ORDER BY — resolved against the projected aliases, since the sort runs after
+        // the projection and the source variables are gone by then.
         if let Some(order_by) = &query.order_by {
             let sort_items: Vec<(Expression, bool)> = order_by
                 .items
                 .iter()
-                .map(|i| (i.expression.clone(), i.ascending))
+                .map(|i| {
+                    (
+                        resolve_sort_key(&i.expression, &order_keys, SortPosition::AfterProjection),
+                        i.ascending,
+                    )
+                })
                 .collect();
             operator = Box::new(SortOperator::new(operator, sort_items));
         }
@@ -2286,13 +2371,31 @@ impl QueryPlanner {
                 (expr, alias)
             })
             .collect();
+        // Pair each RETURN item's original expression with the alias this plan actually
+        // emits, so an ORDER BY written either way resolves after the projection.
+        let order_keys: Vec<(Expression, String)> = query
+            .return_clause
+            .as_ref()
+            .map(|rc| {
+                rc.items
+                    .iter()
+                    .zip(projections.iter())
+                    .map(|(item, (_, alias))| (item.expression.clone(), alias.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         operator = Box::new(ProjectOperator::new(operator, projections));
 
         if let Some(order_by) = &query.order_by {
             let sort_items: Vec<(Expression, bool)> = order_by
                 .items
                 .iter()
-                .map(|i| (i.expression.clone(), i.ascending))
+                .map(|i| {
+                    (
+                        resolve_sort_key(&i.expression, &order_keys, SortPosition::AfterProjection),
+                        i.ascending,
+                    )
+                })
                 .collect();
             operator = Box::new(SortOperator::new(operator, sort_items));
         }
@@ -2415,13 +2518,31 @@ impl QueryPlanner {
                 (item.expression.clone(), alias)
             })
             .collect();
+        // Pair each RETURN item's original expression with the alias this plan actually
+        // emits, so an ORDER BY written either way resolves after the projection.
+        let order_keys: Vec<(Expression, String)> = query
+            .return_clause
+            .as_ref()
+            .map(|rc| {
+                rc.items
+                    .iter()
+                    .zip(projections.iter())
+                    .map(|(item, (_, alias))| (item.expression.clone(), alias.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         operator = Box::new(ProjectOperator::new(operator, projections));
 
         if let Some(order_by) = &query.order_by {
             let sort_items: Vec<(Expression, bool)> = order_by
                 .items
                 .iter()
-                .map(|i| (i.expression.clone(), i.ascending))
+                .map(|i| {
+                    (
+                        resolve_sort_key(&i.expression, &order_keys, SortPosition::AfterProjection),
+                        i.ascending,
+                    )
+                })
                 .collect();
             operator = Box::new(SortOperator::new(operator, sort_items));
         }
