@@ -361,6 +361,43 @@ impl HierarchyIndexManager {
         }
     }
 
+    /// Apply a measure write in place where possible, falling back to invalidation.
+    ///
+    /// A write to the declared measure changes a value, not the shape of the poset, so the
+    /// order embedding stays valid and the range structures can absorb the change in
+    /// O(log n). Marking the index stale for this — as the first implementation did — meant
+    /// a full rebuild to reflect one number, which on a 2.9M-node taxonomy is nine seconds
+    /// (#351).
+    ///
+    /// Returns the number of indexes updated in place. Any hierarchy that cannot take the
+    /// update — no measure attached yet, or the node is outside its poset — is marked stale
+    /// instead, so correctness never depends on the fast path succeeding.
+    pub fn update_measure(&self, node: NodeId, property: &str, value: &PropertyValue) -> usize {
+        let entries = self.entries.read().unwrap();
+        let mut updated = 0usize;
+        for e in entries.values() {
+            let mut g = e.write().unwrap();
+            if g.spec
+                .measure
+                .as_ref()
+                .is_none_or(|m| m.property != property)
+            {
+                continue;
+            }
+            let rollup = to_rollup_value(value);
+            let applied = match g.index.as_mut() {
+                Some(idx) => idx.update_measure(node, rollup),
+                None => false,
+            };
+            if applied {
+                updated += 1;
+            } else {
+                g.stale = true;
+            }
+        }
+        updated
+    }
+
     /// Mark every hierarchy whose declared measure is `property` stale. Called from node
     /// property writes.
     pub fn mark_stale_for_property(&self, property: &str) {
@@ -768,20 +805,62 @@ mod tests {
     }
 
     #[test]
-    fn store_property_write_invalidates_through_graph_store() {
+    fn a_measure_write_updates_the_index_in_place_instead_of_invalidating_it() {
+        // Only the value changed, not the shape of the poset, so the index absorbs it and
+        // stays usable — and the roll-up must reflect the new number immediately (#351).
         let (mut store, ids) = drug_store();
         let mgr = Arc::clone(&store.hierarchy_index);
         mgr.create(&store, spec_with_measure()).unwrap();
         let et = EdgeType::new("IS_A");
-        store.set_column_property(ids[2], "colour", PropertyValue::Integer(1));
+        let root = ids[0];
+
+        let before = {
+            let e = mgr.get("atc").unwrap();
+            let g = e.read().unwrap();
+            g.index
+                .as_ref()
+                .unwrap()
+                .rollup_id(root, RollupOp::Sum)
+                .unwrap()
+        };
+        assert_eq!(before, RollupValue::Int(45), "units 1..=9");
+
+        // one leaf goes from 9 to 109: the total should rise by exactly 100
+        store.set_column_property(ids[12], "units", PropertyValue::Integer(109));
+
         assert!(
-            store.hierarchy_index.usable_for_edge_type(&et).is_some(),
-            "an unrelated property write must not invalidate"
+            mgr.usable_for_edge_type(&et).is_some(),
+            "a measure write must not take the index out of service"
         );
-        store.set_column_property(ids[2], "units", PropertyValue::Integer(99));
-        assert!(
-            store.hierarchy_index.usable_for_edge_type(&et).is_none(),
-            "writing the declared measure must mark the hierarchy stale"
+        let after = {
+            let e = mgr.get("atc").unwrap();
+            let g = e.read().unwrap();
+            assert!(!g.stale, "the index is still fresh");
+            g.index
+                .as_ref()
+                .unwrap()
+                .rollup_id(root, RollupOp::Sum)
+                .unwrap()
+        };
+        assert_eq!(
+            after,
+            RollupValue::Int(145),
+            "roll-up reflects the write without a rebuild"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_property_write_touches_nothing() {
+        let (mut store, ids) = drug_store();
+        let mgr = Arc::clone(&store.hierarchy_index);
+        mgr.create(&store, spec_with_measure()).unwrap();
+        store.set_column_property(ids[2], "colour", PropertyValue::Integer(1));
+        let e = mgr.get("atc").unwrap();
+        let g = e.read().unwrap();
+        assert!(!g.stale);
+        assert_eq!(
+            g.index.as_ref().unwrap().rollup_id(ids[0], RollupOp::Sum),
+            Some(RollupValue::Int(45))
         );
     }
 

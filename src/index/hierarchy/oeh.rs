@@ -632,6 +632,76 @@ impl OehIndex {
         self.measure = Some(measure);
     }
 
+    /// Point-update the measure at one node, without rebuilding.
+    ///
+    /// The topology has not changed — only a value — so the order embedding stays valid and
+    /// each range structure absorbs the difference in O(log n). Before this, a write to the
+    /// declared measure marked the whole index stale and forced a full rebuild, which on a
+    /// 2.9M-node taxonomy is nine seconds of work to reflect one number (#351).
+    ///
+    /// Returns `false` if the node is not in this hierarchy, so the caller can fall back to
+    /// invalidation rather than silently ignoring the write.
+    pub fn update_measure(&mut self, node: crate::graph::types::NodeId, value: Option<RollupValue>) -> bool {
+        let Some(idx) = self.poset.idx(node) else {
+            return false;
+        };
+        let Some(measure) = self.measure.as_mut() else {
+            return false;
+        };
+        let old = measure[idx as usize];
+        measure[idx as usize] = value;
+
+        let rank = match &self.data {
+            EncodingData::NestedSet { tin, .. } | EncodingData::NearTree { tin, .. } => {
+                Some(tin[idx as usize] as usize)
+            }
+            EncodingData::Chain { .. } => None,
+        };
+
+        for (op, data) in self.rollups.iter_mut() {
+            match data {
+                RollupData::Fenwick(f) => {
+                    // SUM is invertible, so the difference is enough.
+                    let (Some(rank), true) = (rank, op.is_invertible()) else { continue };
+                    let delta = match (value, old) {
+                        (Some(RollupValue::Int(n)), Some(RollupValue::Int(o))) => {
+                            RollupValue::Int(n - o)
+                        }
+                        (Some(RollupValue::Int(n)), None) => RollupValue::Int(n),
+                        (None, Some(RollupValue::Int(o))) => RollupValue::Int(-o),
+                        (a, b) => {
+                            let an = a.and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            let bn = b.and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            RollupValue::Float(an - bn)
+                        }
+                    };
+                    f.add(rank, delta);
+                }
+                RollupData::Sparse(seg) => {
+                    let Some(rank) = rank else { continue };
+                    seg.set(rank, value.unwrap_or(op.identity()));
+                }
+                RollupData::ChainSuffix(suffixes) => {
+                    // Per-chain suffix folds have no inverse: refold this chain's suffix
+                    // from the updated position. O(chain length), still far below a rebuild.
+                    if let EncodingData::Chain { chain_of, chains, .. } = &self.data {
+                        let (cid, pos) = chain_of[idx as usize];
+                        let chain = &chains[cid as usize];
+                        let suf = &mut suffixes[cid as usize];
+                        for i in (0..=pos as usize).rev() {
+                            let v = measure[chain[i] as usize].unwrap_or(op.identity());
+                            suf[i] = op.combine(v, suf[i + 1]);
+                        }
+                    }
+                }
+                // Near-tree folds the descendant set at query time from `measure`, which is
+                // already updated above.
+                RollupData::FoldSet => {}
+            }
+        }
+        true
+    }
+
     /// Whether a roll-up for `op` can be answered from the index right now.
     pub fn has_rollup(&self, op: RollupOp) -> bool {
         op == RollupOp::Count || self.rollups.contains_key(&op)
@@ -1297,6 +1367,65 @@ mod tests {
         let (a, b) = (p.idx(nid(1)).unwrap(), p.idx(nid(3)).unwrap());
         let idx = OehIndex::build(p).unwrap();
         assert!(idx.lowest_common_ancestors(a, b).is_empty());
+    }
+
+    #[test]
+    fn a_measure_update_matches_a_full_rebuild() {
+        // The property that makes #351 safe: point-updating must land in exactly the state
+        // a rebuild would have produced, for every node and every monoid.
+        for p in [balanced_tree(4, 3), layered_dag(5, 4)] {
+            let n = p.n();
+            let oracle_poset = p.clone();
+            let ops = [RollupOp::Sum, RollupOp::Min, RollupOp::Max];
+            let mut measure = ramp_measure(n);
+
+            let mut updated = OehIndex::build(p).unwrap();
+            updated.set_measure(measure.clone(), &ops);
+
+            // change a handful of nodes, including a clear and a set-from-absent
+            let changes: Vec<(u32, Option<RollupValue>)> = vec![
+                (0, Some(RollupValue::Int(1000))),
+                ((n / 3) as u32, None),
+                ((n / 2) as u32, Some(RollupValue::Int(-5))),
+                ((n - 1) as u32, Some(RollupValue::Int(7))),
+            ];
+            for (i, v) in &changes {
+                assert!(updated.update_measure(oracle_poset.node_at(*i), *v));
+                measure[*i as usize] = *v;
+            }
+
+            let mut rebuilt = OehIndex::build(oracle_poset.clone()).unwrap();
+            rebuilt.set_measure(measure.clone(), &ops);
+
+            for op in ops {
+                for y in 0..n as u32 {
+                    assert_eq!(
+                        updated.rollup(y, op),
+                        rebuilt.rollup(y, op),
+                        "{op:?} at {y} after point updates in {:?} mode",
+                        updated.encoding()
+                    );
+                    // and both still match the brute-force oracle
+                    assert_eq!(
+                        updated.rollup(y, op),
+                        Some(oracle::rollup(&oracle_poset, y, &measure, op)),
+                        "{op:?} at {y} vs oracle"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_measure_update_for_an_unknown_node_reports_failure() {
+        let p = balanced_tree(2, 2);
+        let n = p.n();
+        let mut idx = OehIndex::build(p).unwrap();
+        idx.set_measure(unit_measure(n), &[RollupOp::Sum]);
+        assert!(
+            !idx.update_measure(nid(9999), Some(RollupValue::Int(1))),
+            "a node outside the hierarchy must report failure so the caller can invalidate"
+        );
     }
 
     #[test]
