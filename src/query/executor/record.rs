@@ -205,8 +205,15 @@ impl Value {
     }
 
     /// Check if this is null
+    /// Is this value null?
+    ///
+    /// Null has two representations here — the `Value::Null` variant, and a
+    /// `Value::Property(PropertyValue::Null)` produced when a node simply does not carry
+    /// the property being read. They mean the same thing, and treating only the first as
+    /// null is what made `count(x.prop)` count rows rather than non-null values (#358):
+    /// a missing property arrives as the second form and slipped through the check.
     pub fn is_null(&self) -> bool {
-        matches!(self, Value::Null)
+        matches!(self, Value::Null | Value::Property(PropertyValue::Null))
     }
 
     /// Extract NodeId from any node variant (Node or NodeRef)
