@@ -47,6 +47,13 @@ fn main() {
         arg(&args, "--terms").and_then(|v| v.parse().ok()).unwrap_or(5);
     let export = arg(&args, "--export-csv");
     let reps: usize = arg(&args, "--reps").and_then(|v| v.parse().ok()).unwrap_or(5);
+    // Above this corpus size the unindexed fact scan takes minutes per query, so running
+    // it at every scale would cost hours to re-measure something already established. The
+    // indexed query still runs at every scale; the baseline is reported as not run rather
+    // than quietly omitted.
+    let baseline_max: usize = arg(&args, "--baseline-max-articles")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5_000_000);
 
     // ---- load the real MeSH tree ------------------------------------------
     let t0 = Instant::now();
@@ -241,7 +248,13 @@ fn main() {
              RETURN count(a) AS n"
         );
         let (ims, iv) = timed(&engine, &store, &indexed, reps);
-        let (sms, sv) = timed(&engine, &store, &scan, reps);
+        if n_articles > baseline_max {
+            println!("{root:<10} {iv:>11} {ims:>12.4} {:>14} {:>10}", "not run", "-");
+            continue;
+        }
+        // One rep for the baseline: it is minutes per query at this size and its variance
+        // is irrelevant next to the ratio being measured.
+        let (sms, sv) = timed(&engine, &store, &scan, 1);
         if iv != sv { disagreements += 1; }
         println!(
             "{root:<10} {:>11} {ims:>12.4} {sms:>14.4} {:>9.1}x{}",
