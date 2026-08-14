@@ -223,11 +223,15 @@ fn main() {
         );
         let (ims, iv) = timed(&engine, &store, &indexed, reps);
         let (tms, tv) = timed(&engine, &store, &traversal, reps);
-        if iv != tv { disagreements += 1; }
+        let note = match (iv, tv) {
+            (Some(a), Some(b)) if a == b => String::new(),
+            (Some(a), Some(b)) => { disagreements += 1; format!("  <-- DISAGREE {a} vs {b}") }
+            _ => "  <-- QUERY FAILED".to_string(),
+        };
         println!(
-            "{root:<10} {:>9} {ims:>12.4} {tms:>14.4} {:>9.1}x{}",
-            iv, if ims > 0.0 { tms / ims } else { 0.0 },
-            if iv == tv { "" } else { "  <-- DISAGREE" }
+            "{root:<10} {:>9} {ims:>12.4} {tms:>14.4} {:>9.1}x{note}",
+            iv.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+            if ims > 0.0 { tms / ims } else { 0.0 }
         );
     }
 
@@ -248,18 +252,22 @@ fn main() {
              RETURN count(a) AS n"
         );
         let (ims, iv) = timed(&engine, &store, &indexed, reps);
+        let shown = iv.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
         if n_articles > baseline_max {
-            println!("{root:<10} {iv:>11} {ims:>12.4} {:>14} {:>10}", "not run", "-");
+            println!("{root:<10} {shown:>11} {ims:>12.4} {:>14} {:>10}", "not run", "-");
             continue;
         }
         // One rep for the baseline: it is minutes per query at this size and its variance
         // is irrelevant next to the ratio being measured.
         let (sms, sv) = timed(&engine, &store, &scan, 1);
-        if iv != sv { disagreements += 1; }
+        let note = match (iv, sv) {
+            (Some(a), Some(b)) if a == b => String::new(),
+            (Some(a), Some(b)) => { disagreements += 1; format!("  <-- DISAGREE {a} vs {b}") }
+            _ => "  <-- QUERY FAILED".to_string(),
+        };
         println!(
-            "{root:<10} {:>11} {ims:>12.4} {sms:>14.4} {:>9.1}x{}",
-            iv, if ims > 0.0 { sms / ims } else { 0.0 },
-            if iv == sv { "" } else { "  <-- DISAGREE" }
+            "{root:<10} {shown:>11} {ims:>12.4} {sms:>14.4} {:>9.1}x{note}",
+            if ims > 0.0 { sms / ims } else { 0.0 }
         );
     }
     println!("{}", "-".repeat(62));
@@ -269,28 +277,40 @@ fn main() {
     }
 }
 
-fn timed(engine: &QueryEngine, store: &GraphStore, q: &str, reps: usize) -> (f64, i64) {
+/// Median wall time and the scalar result.
+///
+/// The result is `Option` on purpose: a failed query and a query that returned a different
+/// number are different events, and an earlier version of this collapsed both to `-1`,
+/// which reported a timeout as though the two engines disagreed. A benchmark that cannot
+/// tell "wrong" from "did not run" is worse than one that simply crashes.
+fn timed(engine: &QueryEngine, store: &GraphStore, q: &str, reps: usize) -> (f64, Option<i64>) {
     let mut times = Vec::new();
-    let mut val = -1i64;
+    let mut val: Option<i64> = None;
+    let mut failed = false;
     for _ in 0..reps.max(1) {
         let t = Instant::now();
         let r = engine.execute(q, store);
         times.push(t.elapsed().as_secs_f64() * 1000.0);
-        if let Ok(b) = r {
-            if let Some(rec) = b.records.first() {
-                if let Some(v) = rec.bindings().values().next() {
-                    if let samyama::query::executor::record::Value::Property(
-                        PropertyValue::Integer(i),
-                    ) = v
-                    {
-                        val = *i;
-                    }
-                }
+        match r {
+            Ok(b) => {
+                val = b.records.first().and_then(|rec| {
+                    rec.bindings().values().next().and_then(|v| match v {
+                        samyama::query::executor::record::Value::Property(
+                            PropertyValue::Integer(i),
+                        ) => Some(*i),
+                        _ => None,
+                    })
+                });
+            }
+            Err(e) => {
+                eprintln!("[query failed] {e}\n  {q}");
+                failed = true;
+                break;
             }
         }
     }
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    (times[times.len() / 2], val)
+    (times[times.len() / 2], if failed { None } else { val })
 }
 
 fn export_csv(store: &GraphStore, dir: &str, _n: usize, _e: usize) {
