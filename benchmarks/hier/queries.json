@@ -1,0 +1,777 @@
+{
+ "corpus": "HIER \u2014 hierarchy-heavy complex queries",
+ "adr": "ADR-035",
+ "paper": "arXiv:2606.24677",
+ "generated_by": "benchmarks/hier/generate_corpus.py",
+ "classes": {
+  "H1": "order test (is x under y?)",
+  "H2": "single roll-up over a subtree, sizes spanning four orders of magnitude",
+  "H3": "level roll-up (group by hierarchy level)",
+  "H4": "cross-hierarchy conjunction: ontology x time x geography in one query",
+  "H5": "hierarchy predicate composed with graph traversal",
+  "H6": "anti-subsumption and subtree set difference",
+  "H7": "lowest common ancestor",
+  "H8": "top-k over roll-up (roll-up called in a loop)",
+  "H9": "hierarchy-filtered vector search (specified; blocked, see `skip`)",
+  "H10": "temporal roll-up windows"
+ },
+ "queries": [
+  {
+   "id": "H1-01",
+   "class": "H1",
+   "name": "order test: terms under T (subtree 9331)",
+   "cypher": "MATCH (d:Term), (r:Term {code: \"T\"}) WHERE subsumes(d, r) RETURN count(d) AS n",
+   "baseline": "MATCH (d:Term) WHERE d.code STARTS WITH \"T\" RETURN count(d) AS n"
+  },
+  {
+   "id": "H1-02",
+   "class": "H1",
+   "name": "order test: terms under T0 (subtree 1555)",
+   "cypher": "MATCH (d:Term), (r:Term {code: \"T0\"}) WHERE subsumes(d, r) RETURN count(d) AS n",
+   "baseline": "MATCH (d:Term) WHERE d.code STARTS WITH \"T0\" RETURN count(d) AS n"
+  },
+  {
+   "id": "H1-03",
+   "class": "H1",
+   "name": "order test: terms under T05 (subtree 259)",
+   "cypher": "MATCH (d:Term), (r:Term {code: \"T05\"}) WHERE subsumes(d, r) RETURN count(d) AS n",
+   "baseline": "MATCH (d:Term) WHERE d.code STARTS WITH \"T05\" RETURN count(d) AS n"
+  },
+  {
+   "id": "H1-04",
+   "class": "H1",
+   "name": "order test: terms under T053 (subtree 43)",
+   "cypher": "MATCH (d:Term), (r:Term {code: \"T053\"}) WHERE subsumes(d, r) RETURN count(d) AS n",
+   "baseline": "MATCH (d:Term) WHERE d.code STARTS WITH \"T053\" RETURN count(d) AS n"
+  },
+  {
+   "id": "H1-05",
+   "class": "H1",
+   "name": "order test: terms under T0531 (subtree 7)",
+   "cypher": "MATCH (d:Term), (r:Term {code: \"T0531\"}) WHERE subsumes(d, r) RETURN count(d) AS n",
+   "baseline": "MATCH (d:Term) WHERE d.code STARTS WITH \"T0531\" RETURN count(d) AS n"
+  },
+  {
+   "id": "H1-06",
+   "class": "H1",
+   "name": "order test: days under Year Y2019",
+   "cypher": "MATCH (d:Day), (r:Year {code: \"Y2019\"}) WHERE subsumes(d, r) RETURN count(d) AS n",
+   "baseline": "MATCH (d:Day) WHERE d.code STARTS WITH \"Y2019\" RETURN count(d) AS n"
+  },
+  {
+   "id": "H1-07",
+   "class": "H1",
+   "name": "order test: days under Month Y2019M01",
+   "cypher": "MATCH (d:Day), (r:Month {code: \"Y2019M01\"}) WHERE subsumes(d, r) RETURN count(d) AS n",
+   "baseline": "MATCH (d:Day) WHERE d.code STARTS WITH \"Y2019M01\" RETURN count(d) AS n"
+  },
+  {
+   "id": "H1-08",
+   "class": "H1",
+   "name": "order test: days under Quarter Y2019Q1 (code is not a prefix)",
+   "cypher": "MATCH (d:Day), (r:Quarter {code: \"Y2019Q1\"}) WHERE subsumes(d, r) RETURN count(d) AS n",
+   "baseline": "MATCH (d:Day)-[:IN_PERIOD*0..]->(r:Quarter {code: \"Y2019Q1\"}) RETURN count(d) AS n"
+  },
+  {
+   "id": "H1-09",
+   "class": "H1",
+   "name": "order test: zips under Country CO0",
+   "cypher": "MATCH (d:Zip), (r:Country {code: \"CO0\"}) WHERE subsumes(d, r) RETURN count(d) AS n",
+   "baseline": "MATCH (d:Zip) WHERE d.code STARTS WITH \"CO0\" RETURN count(d) AS n"
+  },
+  {
+   "id": "H1-10",
+   "class": "H1",
+   "name": "order test: zips under State CO0S0",
+   "cypher": "MATCH (d:Zip), (r:State {code: \"CO0S0\"}) WHERE subsumes(d, r) RETURN count(d) AS n",
+   "baseline": "MATCH (d:Zip) WHERE d.code STARTS WITH \"CO0S0\" RETURN count(d) AS n"
+  },
+  {
+   "id": "H1-11",
+   "class": "H1",
+   "name": "order test: zips under City CO0S0T0",
+   "cypher": "MATCH (d:Zip), (r:City {code: \"CO0S0T0\"}) WHERE subsumes(d, r) RETURN count(d) AS n",
+   "baseline": "MATCH (d:Zip) WHERE d.code STARTS WITH \"CO0S0T0\" RETURN count(d) AS n"
+  },
+  {
+   "id": "H1-12",
+   "class": "H1",
+   "name": "order test on a multi-parent DAG: techniques under K0_0",
+   "cypher": "MATCH (d:Technique), (r:Technique {code: \"K0_0\"}) WHERE subsumes(d, r) RETURN count(d) AS n",
+   "baseline": "MATCH (r:Technique {code: \"K0_0\"})<-[:MAPS_TO*0..]-(d:Technique) RETURN count(DISTINCT d) AS n"
+  },
+  {
+   "id": "H1-13",
+   "class": "H1",
+   "name": "order test on a multi-parent DAG: techniques under K0_5",
+   "cypher": "MATCH (d:Technique), (r:Technique {code: \"K0_5\"}) WHERE subsumes(d, r) RETURN count(d) AS n",
+   "baseline": "MATCH (r:Technique {code: \"K0_5\"})<-[:MAPS_TO*0..]-(d:Technique) RETURN count(DISTINCT d) AS n"
+  },
+  {
+   "id": "H1-14",
+   "class": "H1",
+   "name": "order test: terms under T1",
+   "cypher": "MATCH (d:Term), (r:Term {code: \"T1\"}) WHERE subsumes(d, r) RETURN count(d) AS n",
+   "baseline": "MATCH (d:Term) WHERE d.code STARTS WITH \"T1\" RETURN count(d) AS n"
+  },
+  {
+   "id": "H1-15",
+   "class": "H1",
+   "name": "order test: terms under T2",
+   "cypher": "MATCH (d:Term), (r:Term {code: \"T2\"}) WHERE subsumes(d, r) RETURN count(d) AS n",
+   "baseline": "MATCH (d:Term) WHERE d.code STARTS WITH \"T2\" RETURN count(d) AS n"
+  },
+  {
+   "id": "H2-01",
+   "class": "H2",
+   "name": "sum over the T subtree (9331 nodes)",
+   "cypher": "MATCH (d)-[:IS_A*0..]->(r:Term {code: \"T\"}) RETURN sum(d.units) AS v"
+  },
+  {
+   "id": "H2-02",
+   "class": "H2",
+   "name": "sum over the T0 subtree (1555 nodes)",
+   "cypher": "MATCH (d)-[:IS_A*0..]->(r:Term {code: \"T0\"}) RETURN sum(d.units) AS v"
+  },
+  {
+   "id": "H2-03",
+   "class": "H2",
+   "name": "sum over the T05 subtree (259 nodes)",
+   "cypher": "MATCH (d)-[:IS_A*0..]->(r:Term {code: \"T05\"}) RETURN sum(d.units) AS v"
+  },
+  {
+   "id": "H2-04",
+   "class": "H2",
+   "name": "sum over the T053 subtree (43 nodes)",
+   "cypher": "MATCH (d)-[:IS_A*0..]->(r:Term {code: \"T053\"}) RETURN sum(d.units) AS v"
+  },
+  {
+   "id": "H2-05",
+   "class": "H2",
+   "name": "sum over the T0531 subtree (7 nodes)",
+   "cypher": "MATCH (d)-[:IS_A*0..]->(r:Term {code: \"T0531\"}) RETURN sum(d.units) AS v"
+  },
+  {
+   "id": "H2-06",
+   "class": "H2",
+   "name": "sum over the T05314 subtree (1 nodes)",
+   "cypher": "MATCH (d)-[:IS_A*0..]->(r:Term {code: \"T05314\"}) RETURN sum(d.units) AS v"
+  },
+  {
+   "id": "H2-07",
+   "class": "H2",
+   "name": "sum over the Year Y2019 subtree (353 nodes)",
+   "cypher": "MATCH (d)-[:IN_PERIOD*0..]->(r:Year {code: \"Y2019\"}) RETURN sum(d.units) AS v"
+  },
+  {
+   "id": "H2-08",
+   "class": "H2",
+   "name": "sum over the Month Y2019M01 subtree (29 nodes)",
+   "cypher": "MATCH (d)-[:IN_PERIOD*0..]->(r:Month {code: \"Y2019M01\"}) RETURN sum(d.units) AS v"
+  },
+  {
+   "id": "H2-09",
+   "class": "H2",
+   "name": "sum over the Quarter Y2019Q1 subtree (88 nodes)",
+   "cypher": "MATCH (d)-[:IN_PERIOD*0..]->(r:Quarter {code: \"Y2019Q1\"}) RETURN sum(d.units) AS v"
+  },
+  {
+   "id": "H2-10",
+   "class": "H2",
+   "name": "sum over the Country CO0 subtree (446 nodes)",
+   "cypher": "MATCH (d)-[:LOCATED_IN*0..]->(r:Country {code: \"CO0\"}) RETURN sum(d.units) AS v"
+  },
+  {
+   "id": "H2-11",
+   "class": "H2",
+   "name": "sum over the State CO0S0 subtree (89 nodes)",
+   "cypher": "MATCH (d)-[:LOCATED_IN*0..]->(r:State {code: \"CO0S0\"}) RETURN sum(d.units) AS v"
+  },
+  {
+   "id": "H2-12",
+   "class": "H2",
+   "name": "sum over the City CO0S0T0 subtree (11 nodes)",
+   "cypher": "MATCH (d)-[:LOCATED_IN*0..]->(r:City {code: \"CO0S0T0\"}) RETURN sum(d.units) AS v"
+  },
+  {
+   "id": "H2-13",
+   "class": "H2",
+   "name": "sum over the multi-parent subtree of K0_0",
+   "cypher": "MATCH (d)-[:MAPS_TO*0..]->(r:Technique {code: \"K0_0\"}) RETURN sum(d.units) AS v"
+  },
+  {
+   "id": "H2-14",
+   "class": "H2",
+   "name": "sum over the multi-parent subtree of K0_5",
+   "cypher": "MATCH (d)-[:MAPS_TO*0..]->(r:Technique {code: \"K0_5\"}) RETURN sum(d.units) AS v"
+  },
+  {
+   "id": "H2-15",
+   "class": "H2",
+   "name": "sum over the multi-parent subtree of K1_0",
+   "cypher": "MATCH (d)-[:MAPS_TO*0..]->(r:Technique {code: \"K1_0\"}) RETURN sum(d.units) AS v"
+  },
+  {
+   "id": "H2-16",
+   "class": "H2",
+   "name": "sum over the multi-parent subtree of K2_3",
+   "cypher": "MATCH (d)-[:MAPS_TO*0..]->(r:Technique {code: \"K2_3\"}) RETURN sum(d.units) AS v"
+  },
+  {
+   "id": "H2-17",
+   "class": "H2",
+   "name": "sum over the T1 subtree",
+   "cypher": "MATCH (d)-[:IS_A*0..]->(r:Term {code: \"T1\"}) RETURN sum(d.units) AS v"
+  },
+  {
+   "id": "H2-18",
+   "class": "H2",
+   "name": "sum over the T2 subtree",
+   "cypher": "MATCH (d)-[:IS_A*0..]->(r:Term {code: \"T2\"}) RETURN sum(d.units) AS v"
+  },
+  {
+   "id": "H2-19",
+   "class": "H2",
+   "name": "sum over the T3 subtree",
+   "cypher": "MATCH (d)-[:IS_A*0..]->(r:Term {code: \"T3\"}) RETURN sum(d.units) AS v"
+  },
+  {
+   "id": "H2-20",
+   "class": "H2",
+   "name": "sum over the T4 subtree",
+   "cypher": "MATCH (d)-[:IS_A*0..]->(r:Term {code: \"T4\"}) RETURN sum(d.units) AS v"
+  },
+  {
+   "id": "H2-21",
+   "class": "H2",
+   "name": "count over the T0 subtree (1555 nodes)",
+   "cypher": "MATCH (d)-[:IS_A*0..]->(r:Term {code: \"T0\"}) RETURN count(d) AS n"
+  },
+  {
+   "id": "H2-22",
+   "class": "H2",
+   "name": "count over the T05 subtree (259 nodes)",
+   "cypher": "MATCH (d)-[:IS_A*0..]->(r:Term {code: \"T05\"}) RETURN count(d) AS n"
+  },
+  {
+   "id": "H2-23",
+   "class": "H2",
+   "name": "count over the T053 subtree (43 nodes)",
+   "cypher": "MATCH (d)-[:IS_A*0..]->(r:Term {code: \"T053\"}) RETURN count(d) AS n"
+  },
+  {
+   "id": "H2-24",
+   "class": "H2",
+   "name": "count over the T0531 subtree (7 nodes)",
+   "cypher": "MATCH (d)-[:IS_A*0..]->(r:Term {code: \"T0531\"}) RETURN count(d) AS n"
+  },
+  {
+   "id": "H3-01",
+   "class": "H3",
+   "name": "roll-up for every ontology node at level 1",
+   "cypher": "MATCH (t:Term) WHERE t.level = 1 RETURN t.code AS code, hierarchy_rollup(t, \"sum\") AS v",
+   "baseline": "MATCH (t:Term)<-[:IS_A*0..]-(d:Term) WHERE t.level = 1 RETURN t.code AS code, sum(d.units) AS v"
+  },
+  {
+   "id": "H3-02",
+   "class": "H3",
+   "name": "roll-up for every ontology node at level 2",
+   "cypher": "MATCH (t:Term) WHERE t.level = 2 RETURN t.code AS code, hierarchy_rollup(t, \"sum\") AS v",
+   "baseline": "MATCH (t:Term)<-[:IS_A*0..]-(d:Term) WHERE t.level = 2 RETURN t.code AS code, sum(d.units) AS v"
+  },
+  {
+   "id": "H3-03",
+   "class": "H3",
+   "name": "roll-up for every ontology node at level 3",
+   "cypher": "MATCH (t:Term) WHERE t.level = 3 RETURN t.code AS code, hierarchy_rollup(t, \"sum\") AS v",
+   "baseline": "MATCH (t:Term)<-[:IS_A*0..]-(d:Term) WHERE t.level = 3 RETURN t.code AS code, sum(d.units) AS v"
+  },
+  {
+   "id": "H3-04",
+   "class": "H3",
+   "name": "roll-up for every ontology node at level 4",
+   "cypher": "MATCH (t:Term) WHERE t.level = 4 RETURN t.code AS code, hierarchy_rollup(t, \"sum\") AS v",
+   "baseline": "MATCH (t:Term)<-[:IS_A*0..]-(d:Term) WHERE t.level = 4 RETURN t.code AS code, sum(d.units) AS v"
+  },
+  {
+   "id": "H3-05",
+   "class": "H3",
+   "name": "roll-up for every Month",
+   "cypher": "MATCH (t:Month) RETURN t.code AS code, hierarchy_rollup(t, \"sum\") AS v",
+   "baseline": "MATCH (t:Month)<-[:IN_PERIOD*0..]-(d) RETURN t.code AS code, sum(d.units) AS v"
+  },
+  {
+   "id": "H3-06",
+   "class": "H3",
+   "name": "roll-up for every Quarter",
+   "cypher": "MATCH (t:Quarter) RETURN t.code AS code, hierarchy_rollup(t, \"sum\") AS v",
+   "baseline": "MATCH (t:Quarter)<-[:IN_PERIOD*0..]-(d) RETURN t.code AS code, sum(d.units) AS v"
+  },
+  {
+   "id": "H3-07",
+   "class": "H3",
+   "name": "roll-up for every Year",
+   "cypher": "MATCH (t:Year) RETURN t.code AS code, hierarchy_rollup(t, \"sum\") AS v",
+   "baseline": "MATCH (t:Year)<-[:IN_PERIOD*0..]-(d) RETURN t.code AS code, sum(d.units) AS v"
+  },
+  {
+   "id": "H3-08",
+   "class": "H3",
+   "name": "roll-up for every State",
+   "cypher": "MATCH (t:State) RETURN t.code AS code, hierarchy_rollup(t, \"sum\") AS v",
+   "baseline": "MATCH (t:State)<-[:LOCATED_IN*0..]-(d) RETURN t.code AS code, sum(d.units) AS v"
+  },
+  {
+   "id": "H3-09",
+   "class": "H3",
+   "name": "roll-up for every City",
+   "cypher": "MATCH (t:City) RETURN t.code AS code, hierarchy_rollup(t, \"sum\") AS v",
+   "baseline": "MATCH (t:City)<-[:LOCATED_IN*0..]-(d) RETURN t.code AS code, sum(d.units) AS v"
+  },
+  {
+   "id": "H4-01",
+   "class": "H4",
+   "name": "events about anything under T0, in any period under Y2019M01",
+   "cypher": "MATCH (e:Event)-[:ABOUT]->(t), (e)-[:ON]->(day), (rt:Term {code: \"T0\"}), (rd:Month {code: \"Y2019M01\"}) WHERE subsumes(t, rt) AND subsumes(day, rd) RETURN count(e) AS n",
+   "baseline": "MATCH (e:Event)-[:ABOUT]->(t)-[:IS_A*0..]->(rt:Term {code: \"T0\"}), (e)-[:ON]->(day)-[:IN_PERIOD*0..]->(rd:Month {code: \"Y2019M01\"}) RETURN count(e) AS n"
+  },
+  {
+   "id": "H4-02",
+   "class": "H4",
+   "name": "events about anything under T0, in any period under Y2019",
+   "cypher": "MATCH (e:Event)-[:ABOUT]->(t), (e)-[:ON]->(day), (rt:Term {code: \"T0\"}), (rd:Year {code: \"Y2019\"}) WHERE subsumes(t, rt) AND subsumes(day, rd) RETURN count(e) AS n",
+   "baseline": "MATCH (e:Event)-[:ABOUT]->(t)-[:IS_A*0..]->(rt:Term {code: \"T0\"}), (e)-[:ON]->(day)-[:IN_PERIOD*0..]->(rd:Year {code: \"Y2019\"}) RETURN count(e) AS n"
+  },
+  {
+   "id": "H4-03",
+   "class": "H4",
+   "name": "events about anything under T05, in any period under Y2019M01",
+   "cypher": "MATCH (e:Event)-[:ABOUT]->(t), (e)-[:ON]->(day), (rt:Term {code: \"T05\"}), (rd:Month {code: \"Y2019M01\"}) WHERE subsumes(t, rt) AND subsumes(day, rd) RETURN count(e) AS n",
+   "baseline": "MATCH (e:Event)-[:ABOUT]->(t)-[:IS_A*0..]->(rt:Term {code: \"T05\"}), (e)-[:ON]->(day)-[:IN_PERIOD*0..]->(rd:Month {code: \"Y2019M01\"}) RETURN count(e) AS n"
+  },
+  {
+   "id": "H4-04",
+   "class": "H4",
+   "name": "events about anything under T, in any period under Y2020M06",
+   "cypher": "MATCH (e:Event)-[:ABOUT]->(t), (e)-[:ON]->(day), (rt:Term {code: \"T\"}), (rd:Month {code: \"Y2020M06\"}) WHERE subsumes(t, rt) AND subsumes(day, rd) RETURN count(e) AS n",
+   "baseline": "MATCH (e:Event)-[:ABOUT]->(t)-[:IS_A*0..]->(rt:Term {code: \"T\"}), (e)-[:ON]->(day)-[:IN_PERIOD*0..]->(rd:Month {code: \"Y2020M06\"}) RETURN count(e) AS n"
+  },
+  {
+   "id": "H4-05",
+   "class": "H4",
+   "name": "events about anything under T1, in any period under Y2021",
+   "cypher": "MATCH (e:Event)-[:ABOUT]->(t), (e)-[:ON]->(day), (rt:Term {code: \"T1\"}), (rd:Year {code: \"Y2021\"}) WHERE subsumes(t, rt) AND subsumes(day, rd) RETURN count(e) AS n",
+   "baseline": "MATCH (e:Event)-[:ABOUT]->(t)-[:IS_A*0..]->(rt:Term {code: \"T1\"}), (e)-[:ON]->(day)-[:IN_PERIOD*0..]->(rd:Year {code: \"Y2021\"}) RETURN count(e) AS n"
+  },
+  {
+   "id": "H4-06",
+   "class": "H4",
+   "name": "events about anything under T05, in any period under Y2019",
+   "cypher": "MATCH (e:Event)-[:ABOUT]->(t), (e)-[:ON]->(day), (rt:Term {code: \"T05\"}), (rd:Year {code: \"Y2019\"}) WHERE subsumes(t, rt) AND subsumes(day, rd) RETURN count(e) AS n",
+   "baseline": "MATCH (e:Event)-[:ABOUT]->(t)-[:IS_A*0..]->(rt:Term {code: \"T05\"}), (e)-[:ON]->(day)-[:IN_PERIOD*0..]->(rd:Year {code: \"Y2019\"}) RETURN count(e) AS n"
+  },
+  {
+   "id": "H4-07",
+   "class": "H4",
+   "name": "ontology x time x geography: events under T0, Y2019, CO0",
+   "cypher": "MATCH (e:Event)-[:ABOUT]->(t), (e)-[:ON]->(day), (e)-[:AT]->(z), (rt:Term {code: \"T0\"}), (rd:Year {code: \"Y2019\"}), (rz:Country {code: \"CO0\"}) WHERE subsumes(t, rt) AND subsumes(day, rd) AND subsumes(z, rz) RETURN count(e) AS n",
+   "baseline": "MATCH (e:Event)-[:ABOUT]->(t)-[:IS_A*0..]->(rt:Term {code: \"T0\"}), (e)-[:ON]->(day)-[:IN_PERIOD*0..]->(rd:Year {code: \"Y2019\"}), (e)-[:AT]->(z)-[:LOCATED_IN*0..]->(rz:Country {code: \"CO0\"}) RETURN count(e) AS n"
+  },
+  {
+   "id": "H4-08",
+   "class": "H4",
+   "name": "ontology x time x geography: events under T0, Y2019, CO0S0",
+   "cypher": "MATCH (e:Event)-[:ABOUT]->(t), (e)-[:ON]->(day), (e)-[:AT]->(z), (rt:Term {code: \"T0\"}), (rd:Year {code: \"Y2019\"}), (rz:State {code: \"CO0S0\"}) WHERE subsumes(t, rt) AND subsumes(day, rd) AND subsumes(z, rz) RETURN count(e) AS n",
+   "baseline": "MATCH (e:Event)-[:ABOUT]->(t)-[:IS_A*0..]->(rt:Term {code: \"T0\"}), (e)-[:ON]->(day)-[:IN_PERIOD*0..]->(rd:Year {code: \"Y2019\"}), (e)-[:AT]->(z)-[:LOCATED_IN*0..]->(rz:State {code: \"CO0S0\"}) RETURN count(e) AS n"
+  },
+  {
+   "id": "H4-09",
+   "class": "H4",
+   "name": "ontology x time x geography: events under T, Y2020, CO1",
+   "cypher": "MATCH (e:Event)-[:ABOUT]->(t), (e)-[:ON]->(day), (e)-[:AT]->(z), (rt:Term {code: \"T\"}), (rd:Year {code: \"Y2020\"}), (rz:Country {code: \"CO1\"}) WHERE subsumes(t, rt) AND subsumes(day, rd) AND subsumes(z, rz) RETURN count(e) AS n",
+   "baseline": "MATCH (e:Event)-[:ABOUT]->(t)-[:IS_A*0..]->(rt:Term {code: \"T\"}), (e)-[:ON]->(day)-[:IN_PERIOD*0..]->(rd:Year {code: \"Y2020\"}), (e)-[:AT]->(z)-[:LOCATED_IN*0..]->(rz:Country {code: \"CO1\"}) RETURN count(e) AS n"
+  },
+  {
+   "id": "H4-10",
+   "class": "H4",
+   "name": "ontology x time x geography: events under T05, Y2019, CO0",
+   "cypher": "MATCH (e:Event)-[:ABOUT]->(t), (e)-[:ON]->(day), (e)-[:AT]->(z), (rt:Term {code: \"T05\"}), (rd:Year {code: \"Y2019\"}), (rz:Country {code: \"CO0\"}) WHERE subsumes(t, rt) AND subsumes(day, rd) AND subsumes(z, rz) RETURN count(e) AS n",
+   "baseline": "MATCH (e:Event)-[:ABOUT]->(t)-[:IS_A*0..]->(rt:Term {code: \"T05\"}), (e)-[:ON]->(day)-[:IN_PERIOD*0..]->(rd:Year {code: \"Y2019\"}), (e)-[:AT]->(z)-[:LOCATED_IN*0..]->(rz:Country {code: \"CO0\"}) RETURN count(e) AS n"
+  },
+  {
+   "id": "H4-11",
+   "class": "H4",
+   "name": "ontology x time x geography: events under T1, Y2021, CO2",
+   "cypher": "MATCH (e:Event)-[:ABOUT]->(t), (e)-[:ON]->(day), (e)-[:AT]->(z), (rt:Term {code: \"T1\"}), (rd:Year {code: \"Y2021\"}), (rz:Country {code: \"CO2\"}) WHERE subsumes(t, rt) AND subsumes(day, rd) AND subsumes(z, rz) RETURN count(e) AS n",
+   "baseline": "MATCH (e:Event)-[:ABOUT]->(t)-[:IS_A*0..]->(rt:Term {code: \"T1\"}), (e)-[:ON]->(day)-[:IN_PERIOD*0..]->(rd:Year {code: \"Y2021\"}), (e)-[:AT]->(z)-[:LOCATED_IN*0..]->(rz:Country {code: \"CO2\"}) RETURN count(e) AS n"
+  },
+  {
+   "id": "H4-12",
+   "class": "H4",
+   "name": "ontology x time x geography: events under T, Y2019, CO0S0T0",
+   "cypher": "MATCH (e:Event)-[:ABOUT]->(t), (e)-[:ON]->(day), (e)-[:AT]->(z), (rt:Term {code: \"T\"}), (rd:Year {code: \"Y2019\"}), (rz:City {code: \"CO0S0T0\"}) WHERE subsumes(t, rt) AND subsumes(day, rd) AND subsumes(z, rz) RETURN count(e) AS n",
+   "baseline": "MATCH (e:Event)-[:ABOUT]->(t)-[:IS_A*0..]->(rt:Term {code: \"T\"}), (e)-[:ON]->(day)-[:IN_PERIOD*0..]->(rd:Year {code: \"Y2019\"}), (e)-[:AT]->(z)-[:LOCATED_IN*0..]->(rz:City {code: \"CO0S0T0\"}) RETURN count(e) AS n"
+  },
+  {
+   "id": "H5-01",
+   "class": "H5",
+   "name": "events using any technique under K0_0 (DAG axis)",
+   "cypher": "MATCH (e:Event)-[:USES]->(k), (rk:Technique {code: \"K0_0\"}) WHERE subsumes(k, rk) RETURN count(e) AS n",
+   "baseline": "MATCH (e:Event)-[:USES]->(k)-[:MAPS_TO*0..]->(rk:Technique {code: \"K0_0\"}) RETURN count(DISTINCT e) AS n"
+  },
+  {
+   "id": "H5-02",
+   "class": "H5",
+   "name": "events using any technique under K0_5 (DAG axis)",
+   "cypher": "MATCH (e:Event)-[:USES]->(k), (rk:Technique {code: \"K0_5\"}) WHERE subsumes(k, rk) RETURN count(e) AS n",
+   "baseline": "MATCH (e:Event)-[:USES]->(k)-[:MAPS_TO*0..]->(rk:Technique {code: \"K0_5\"}) RETURN count(DISTINCT e) AS n"
+  },
+  {
+   "id": "H5-03",
+   "class": "H5",
+   "name": "events using any technique under K1_0 (DAG axis)",
+   "cypher": "MATCH (e:Event)-[:USES]->(k), (rk:Technique {code: \"K1_0\"}) WHERE subsumes(k, rk) RETURN count(e) AS n",
+   "baseline": "MATCH (e:Event)-[:USES]->(k)-[:MAPS_TO*0..]->(rk:Technique {code: \"K1_0\"}) RETURN count(DISTINCT e) AS n"
+  },
+  {
+   "id": "H5-04",
+   "class": "H5",
+   "name": "events using any technique under K2_3 (DAG axis)",
+   "cypher": "MATCH (e:Event)-[:USES]->(k), (rk:Technique {code: \"K2_3\"}) WHERE subsumes(k, rk) RETURN count(e) AS n",
+   "baseline": "MATCH (e:Event)-[:USES]->(k)-[:MAPS_TO*0..]->(rk:Technique {code: \"K2_3\"}) RETURN count(DISTINCT e) AS n"
+  },
+  {
+   "id": "H5-05",
+   "class": "H5",
+   "name": "events about anything under T, summed by measure",
+   "cypher": "MATCH (e:Event)-[:ABOUT]->(t), (rt:Term {code: \"T\"}) WHERE subsumes(t, rt) RETURN sum(e.units) AS v",
+   "baseline": "MATCH (e:Event)-[:ABOUT]->(t)-[:IS_A*0..]->(rt:Term {code: \"T\"}) RETURN sum(e.units) AS v"
+  },
+  {
+   "id": "H5-06",
+   "class": "H5",
+   "name": "events about anything under T0, summed by measure",
+   "cypher": "MATCH (e:Event)-[:ABOUT]->(t), (rt:Term {code: \"T0\"}) WHERE subsumes(t, rt) RETURN sum(e.units) AS v",
+   "baseline": "MATCH (e:Event)-[:ABOUT]->(t)-[:IS_A*0..]->(rt:Term {code: \"T0\"}) RETURN sum(e.units) AS v"
+  },
+  {
+   "id": "H5-07",
+   "class": "H5",
+   "name": "events about anything under T05, summed by measure",
+   "cypher": "MATCH (e:Event)-[:ABOUT]->(t), (rt:Term {code: \"T05\"}) WHERE subsumes(t, rt) RETURN sum(e.units) AS v",
+   "baseline": "MATCH (e:Event)-[:ABOUT]->(t)-[:IS_A*0..]->(rt:Term {code: \"T05\"}) RETURN sum(e.units) AS v"
+  },
+  {
+   "id": "H5-08",
+   "class": "H5",
+   "name": "events about anything under T053, summed by measure",
+   "cypher": "MATCH (e:Event)-[:ABOUT]->(t), (rt:Term {code: \"T053\"}) WHERE subsumes(t, rt) RETURN sum(e.units) AS v",
+   "baseline": "MATCH (e:Event)-[:ABOUT]->(t)-[:IS_A*0..]->(rt:Term {code: \"T053\"}) RETURN sum(e.units) AS v"
+  },
+  {
+   "id": "H5-09",
+   "class": "H5",
+   "name": "events located anywhere under CO0",
+   "cypher": "MATCH (e:Event)-[:AT]->(z), (rz:Country {code: \"CO0\"}) WHERE subsumes(z, rz) RETURN count(e) AS n",
+   "baseline": "MATCH (e:Event)-[:AT]->(z)-[:LOCATED_IN*0..]->(rz:Country {code: \"CO0\"}) RETURN count(e) AS n"
+  },
+  {
+   "id": "H5-10",
+   "class": "H5",
+   "name": "events located anywhere under CO1",
+   "cypher": "MATCH (e:Event)-[:AT]->(z), (rz:Country {code: \"CO1\"}) WHERE subsumes(z, rz) RETURN count(e) AS n",
+   "baseline": "MATCH (e:Event)-[:AT]->(z)-[:LOCATED_IN*0..]->(rz:Country {code: \"CO1\"}) RETURN count(e) AS n"
+  },
+  {
+   "id": "H6-01",
+   "class": "H6",
+   "name": "terms NOT under T",
+   "cypher": "MATCH (d:Term), (r:Term {code: \"T\"}) WHERE NOT subsumes(d, r) RETURN count(d) AS n",
+   "baseline": "MATCH (d:Term) WHERE NOT (d.code STARTS WITH \"T\") RETURN count(d) AS n"
+  },
+  {
+   "id": "H6-02",
+   "class": "H6",
+   "name": "terms NOT under T0",
+   "cypher": "MATCH (d:Term), (r:Term {code: \"T0\"}) WHERE NOT subsumes(d, r) RETURN count(d) AS n",
+   "baseline": "MATCH (d:Term) WHERE NOT (d.code STARTS WITH \"T0\") RETURN count(d) AS n"
+  },
+  {
+   "id": "H6-03",
+   "class": "H6",
+   "name": "terms NOT under T05",
+   "cypher": "MATCH (d:Term), (r:Term {code: \"T05\"}) WHERE NOT subsumes(d, r) RETURN count(d) AS n",
+   "baseline": "MATCH (d:Term) WHERE NOT (d.code STARTS WITH \"T05\") RETURN count(d) AS n"
+  },
+  {
+   "id": "H6-04",
+   "class": "H6",
+   "name": "terms NOT under T053",
+   "cypher": "MATCH (d:Term), (r:Term {code: \"T053\"}) WHERE NOT subsumes(d, r) RETURN count(d) AS n",
+   "baseline": "MATCH (d:Term) WHERE NOT (d.code STARTS WITH \"T053\") RETURN count(d) AS n"
+  },
+  {
+   "id": "H6-05",
+   "class": "H6",
+   "name": "terms NOT under T0531",
+   "cypher": "MATCH (d:Term), (r:Term {code: \"T0531\"}) WHERE NOT subsumes(d, r) RETURN count(d) AS n",
+   "baseline": "MATCH (d:Term) WHERE NOT (d.code STARTS WITH \"T0531\") RETURN count(d) AS n"
+  },
+  {
+   "id": "H6-06",
+   "class": "H6",
+   "name": "set difference: under T0 but not under T01",
+   "cypher": "MATCH (d:Term), (r:Term {code: \"T0\"}), (s:Term {code: \"T01\"}) WHERE subsumes(d, r) AND NOT subsumes(d, s) RETURN count(d) AS n",
+   "baseline": "MATCH (d:Term) WHERE (d.code STARTS WITH \"T0\") AND NOT (d.code STARTS WITH \"T01\") RETURN count(d) AS n"
+  },
+  {
+   "id": "H6-07",
+   "class": "H6",
+   "name": "set difference: under T0 but not under T05",
+   "cypher": "MATCH (d:Term), (r:Term {code: \"T0\"}), (s:Term {code: \"T05\"}) WHERE subsumes(d, r) AND NOT subsumes(d, s) RETURN count(d) AS n",
+   "baseline": "MATCH (d:Term) WHERE (d.code STARTS WITH \"T0\") AND NOT (d.code STARTS WITH \"T05\") RETURN count(d) AS n"
+  },
+  {
+   "id": "H6-08",
+   "class": "H6",
+   "name": "set difference: under T but not under T0",
+   "cypher": "MATCH (d:Term), (r:Term {code: \"T\"}), (s:Term {code: \"T0\"}) WHERE subsumes(d, r) AND NOT subsumes(d, s) RETURN count(d) AS n",
+   "baseline": "MATCH (d:Term) WHERE (d.code STARTS WITH \"T\") AND NOT (d.code STARTS WITH \"T0\") RETURN count(d) AS n"
+  },
+  {
+   "id": "H6-09",
+   "class": "H6",
+   "name": "set difference: under T05 but not under T053",
+   "cypher": "MATCH (d:Term), (r:Term {code: \"T05\"}), (s:Term {code: \"T053\"}) WHERE subsumes(d, r) AND NOT subsumes(d, s) RETURN count(d) AS n",
+   "baseline": "MATCH (d:Term) WHERE (d.code STARTS WITH \"T05\") AND NOT (d.code STARTS WITH \"T053\") RETURN count(d) AS n"
+  },
+  {
+   "id": "H6-10",
+   "class": "H6",
+   "name": "set difference: under T1 but not under T12",
+   "cypher": "MATCH (d:Term), (r:Term {code: \"T1\"}), (s:Term {code: \"T12\"}) WHERE subsumes(d, r) AND NOT subsumes(d, s) RETURN count(d) AS n",
+   "baseline": "MATCH (d:Term) WHERE (d.code STARTS WITH \"T1\") AND NOT (d.code STARTS WITH \"T12\") RETURN count(d) AS n"
+  },
+  {
+   "id": "H7-01",
+   "class": "H7",
+   "name": "lowest common ancestor of T012 and T034",
+   "cypher": "MATCH (a:Term {code: \"T012\"}), (b:Term {code: \"T034\"}), (c:Term) WHERE id(c) IN hierarchy_lca(a, b) RETURN max(c.level) AS lvl",
+   "baseline": "MATCH (a:Term {code: \"T012\"})-[:IS_A*0..]->(c:Term)<-[:IS_A*0..]-(b:Term {code: \"T034\"}) RETURN max(c.level) AS lvl"
+  },
+  {
+   "id": "H7-02",
+   "class": "H7",
+   "name": "lowest common ancestor of T0120 and T0121",
+   "cypher": "MATCH (a:Term {code: \"T0120\"}), (b:Term {code: \"T0121\"}), (c:Term) WHERE id(c) IN hierarchy_lca(a, b) RETURN max(c.level) AS lvl",
+   "baseline": "MATCH (a:Term {code: \"T0120\"})-[:IS_A*0..]->(c:Term)<-[:IS_A*0..]-(b:Term {code: \"T0121\"}) RETURN max(c.level) AS lvl"
+  },
+  {
+   "id": "H7-03",
+   "class": "H7",
+   "name": "lowest common ancestor of T01 and T02",
+   "cypher": "MATCH (a:Term {code: \"T01\"}), (b:Term {code: \"T02\"}), (c:Term) WHERE id(c) IN hierarchy_lca(a, b) RETURN max(c.level) AS lvl",
+   "baseline": "MATCH (a:Term {code: \"T01\"})-[:IS_A*0..]->(c:Term)<-[:IS_A*0..]-(b:Term {code: \"T02\"}) RETURN max(c.level) AS lvl"
+  },
+  {
+   "id": "H7-04",
+   "class": "H7",
+   "name": "lowest common ancestor of T0 and T1",
+   "cypher": "MATCH (a:Term {code: \"T0\"}), (b:Term {code: \"T1\"}), (c:Term) WHERE id(c) IN hierarchy_lca(a, b) RETURN max(c.level) AS lvl",
+   "baseline": "MATCH (a:Term {code: \"T0\"})-[:IS_A*0..]->(c:Term)<-[:IS_A*0..]-(b:Term {code: \"T1\"}) RETURN max(c.level) AS lvl"
+  },
+  {
+   "id": "H7-05",
+   "class": "H7",
+   "name": "lowest common ancestor of T01234 and T01235",
+   "cypher": "MATCH (a:Term {code: \"T01234\"}), (b:Term {code: \"T01235\"}), (c:Term) WHERE id(c) IN hierarchy_lca(a, b) RETURN max(c.level) AS lvl",
+   "baseline": "MATCH (a:Term {code: \"T01234\"})-[:IS_A*0..]->(c:Term)<-[:IS_A*0..]-(b:Term {code: \"T01235\"}) RETURN max(c.level) AS lvl"
+  },
+  {
+   "id": "H7-06",
+   "class": "H7",
+   "name": "lowest common ancestor of T0123 and T0143",
+   "cypher": "MATCH (a:Term {code: \"T0123\"}), (b:Term {code: \"T0143\"}), (c:Term) WHERE id(c) IN hierarchy_lca(a, b) RETURN max(c.level) AS lvl",
+   "baseline": "MATCH (a:Term {code: \"T0123\"})-[:IS_A*0..]->(c:Term)<-[:IS_A*0..]-(b:Term {code: \"T0143\"}) RETURN max(c.level) AS lvl"
+  },
+  {
+   "id": "H7-07",
+   "class": "H7",
+   "name": "lowest common ancestor of T5 and T0",
+   "cypher": "MATCH (a:Term {code: \"T5\"}), (b:Term {code: \"T0\"}), (c:Term) WHERE id(c) IN hierarchy_lca(a, b) RETURN max(c.level) AS lvl",
+   "baseline": "MATCH (a:Term {code: \"T5\"})-[:IS_A*0..]->(c:Term)<-[:IS_A*0..]-(b:Term {code: \"T0\"}) RETURN max(c.level) AS lvl"
+  },
+  {
+   "id": "H7-08",
+   "class": "H7",
+   "name": "lowest common ancestor of T012 and T012",
+   "cypher": "MATCH (a:Term {code: \"T012\"}), (b:Term {code: \"T012\"}), (c:Term) WHERE id(c) IN hierarchy_lca(a, b) RETURN max(c.level) AS lvl",
+   "baseline": "MATCH (a:Term {code: \"T012\"})-[:IS_A*0..]->(c:Term)<-[:IS_A*0..]-(b:Term {code: \"T012\"}) RETURN max(c.level) AS lvl"
+  },
+  {
+   "id": "H7-09",
+   "class": "H7",
+   "name": "lowest common ancestor of T00000 and T55555",
+   "cypher": "MATCH (a:Term {code: \"T00000\"}), (b:Term {code: \"T55555\"}), (c:Term) WHERE id(c) IN hierarchy_lca(a, b) RETURN max(c.level) AS lvl",
+   "baseline": "MATCH (a:Term {code: \"T00000\"})-[:IS_A*0..]->(c:Term)<-[:IS_A*0..]-(b:Term {code: \"T55555\"}) RETURN max(c.level) AS lvl"
+  },
+  {
+   "id": "H7-10",
+   "class": "H7",
+   "name": "lowest common ancestor of T010 and T011",
+   "cypher": "MATCH (a:Term {code: \"T010\"}), (b:Term {code: \"T011\"}), (c:Term) WHERE id(c) IN hierarchy_lca(a, b) RETURN max(c.level) AS lvl",
+   "baseline": "MATCH (a:Term {code: \"T010\"})-[:IS_A*0..]->(c:Term)<-[:IS_A*0..]-(b:Term {code: \"T011\"}) RETURN max(c.level) AS lvl"
+  },
+  {
+   "id": "H8-01",
+   "class": "H8",
+   "name": "rank level-1 ontology subtrees by rolled-up measure",
+   "cypher": "MATCH (t:Term) WHERE t.level = 1 RETURN t.code AS code, hierarchy_rollup(t, \"sum\") AS v ORDER BY hierarchy_rollup(t, \"sum\") DESC",
+   "baseline": "MATCH (t:Term)<-[:IS_A*0..]-(d:Term) WHERE t.level = 1 RETURN t.code AS code, sum(d.units) AS v ORDER BY sum(d.units) DESC"
+  },
+  {
+   "id": "H8-02",
+   "class": "H8",
+   "name": "rank level-2 ontology subtrees by rolled-up measure",
+   "cypher": "MATCH (t:Term) WHERE t.level = 2 RETURN t.code AS code, hierarchy_rollup(t, \"sum\") AS v ORDER BY hierarchy_rollup(t, \"sum\") DESC",
+   "baseline": "MATCH (t:Term)<-[:IS_A*0..]-(d:Term) WHERE t.level = 2 RETURN t.code AS code, sum(d.units) AS v ORDER BY sum(d.units) DESC"
+  },
+  {
+   "id": "H8-03",
+   "class": "H8",
+   "name": "rank level-3 ontology subtrees by rolled-up measure",
+   "cypher": "MATCH (t:Term) WHERE t.level = 3 RETURN t.code AS code, hierarchy_rollup(t, \"sum\") AS v ORDER BY hierarchy_rollup(t, \"sum\") DESC",
+   "baseline": "MATCH (t:Term)<-[:IS_A*0..]-(d:Term) WHERE t.level = 3 RETURN t.code AS code, sum(d.units) AS v ORDER BY sum(d.units) DESC"
+  },
+  {
+   "id": "H8-04",
+   "class": "H8",
+   "name": "rank every Month by rolled-up measure",
+   "cypher": "MATCH (t:Month) RETURN t.code AS code, hierarchy_rollup(t, \"sum\") AS v ORDER BY hierarchy_rollup(t, \"sum\") DESC",
+   "baseline": "MATCH (t:Month)<-[:IN_PERIOD*0..]-(d) RETURN t.code AS code, sum(d.units) AS v ORDER BY sum(d.units) DESC"
+  },
+  {
+   "id": "H8-05",
+   "class": "H8",
+   "name": "rank every Quarter by rolled-up measure",
+   "cypher": "MATCH (t:Quarter) RETURN t.code AS code, hierarchy_rollup(t, \"sum\") AS v ORDER BY hierarchy_rollup(t, \"sum\") DESC",
+   "baseline": "MATCH (t:Quarter)<-[:IN_PERIOD*0..]-(d) RETURN t.code AS code, sum(d.units) AS v ORDER BY sum(d.units) DESC"
+  },
+  {
+   "id": "H8-06",
+   "class": "H8",
+   "name": "rank every Year by rolled-up measure",
+   "cypher": "MATCH (t:Year) RETURN t.code AS code, hierarchy_rollup(t, \"sum\") AS v ORDER BY hierarchy_rollup(t, \"sum\") DESC",
+   "baseline": "MATCH (t:Year)<-[:IN_PERIOD*0..]-(d) RETURN t.code AS code, sum(d.units) AS v ORDER BY sum(d.units) DESC"
+  },
+  {
+   "id": "H8-07",
+   "class": "H8",
+   "name": "rank every State by rolled-up measure",
+   "cypher": "MATCH (t:State) RETURN t.code AS code, hierarchy_rollup(t, \"sum\") AS v ORDER BY hierarchy_rollup(t, \"sum\") DESC",
+   "baseline": "MATCH (t:State)<-[:LOCATED_IN*0..]-(d) RETURN t.code AS code, sum(d.units) AS v ORDER BY sum(d.units) DESC"
+  },
+  {
+   "id": "H8-08",
+   "class": "H8",
+   "name": "rank every City by rolled-up measure",
+   "cypher": "MATCH (t:City) RETURN t.code AS code, hierarchy_rollup(t, \"sum\") AS v ORDER BY hierarchy_rollup(t, \"sum\") DESC",
+   "baseline": "MATCH (t:City)<-[:LOCATED_IN*0..]-(d) RETURN t.code AS code, sum(d.units) AS v ORDER BY sum(d.units) DESC"
+  },
+  {
+   "id": "H9-01",
+   "class": "H9",
+   "name": "200-NN vector search restricted to the T0 subtree",
+   "cypher": "CALL db.index.vector.queryNodes(\"Term\", \"emb\", [0.5, 0.5, 0.5, 0.5], 200) YIELD node, score MATCH (r:Term {code: \"T0\"}) WHERE subsumes(node, r) RETURN count(node) AS n",
+   "skip": "engine gap: CALL db.index.vector.queryNodes(...) YIELD node cannot be composed with a following MATCH or WHERE that references `node`, so an ANN search cannot be restricted to a subtree today. The ANN call and the subsumption predicate each work in isolation; only the composition is missing."
+  },
+  {
+   "id": "H9-02",
+   "class": "H9",
+   "name": "200-NN vector search restricted to the T05 subtree",
+   "cypher": "CALL db.index.vector.queryNodes(\"Term\", \"emb\", [0.5, 0.5, 0.5, 0.5], 200) YIELD node, score MATCH (r:Term {code: \"T05\"}) WHERE subsumes(node, r) RETURN count(node) AS n",
+   "skip": "engine gap: CALL db.index.vector.queryNodes(...) YIELD node cannot be composed with a following MATCH or WHERE that references `node`, so an ANN search cannot be restricted to a subtree today. The ANN call and the subsumption predicate each work in isolation; only the composition is missing."
+  },
+  {
+   "id": "H9-03",
+   "class": "H9",
+   "name": "200-NN vector search restricted to the T1 subtree",
+   "cypher": "CALL db.index.vector.queryNodes(\"Term\", \"emb\", [0.5, 0.5, 0.5, 0.5], 200) YIELD node, score MATCH (r:Term {code: \"T1\"}) WHERE subsumes(node, r) RETURN count(node) AS n",
+   "skip": "engine gap: CALL db.index.vector.queryNodes(...) YIELD node cannot be composed with a following MATCH or WHERE that references `node`, so an ANN search cannot be restricted to a subtree today. The ANN call and the subsumption predicate each work in isolation; only the composition is missing."
+  },
+  {
+   "id": "H9-04",
+   "class": "H9",
+   "name": "200-NN vector search restricted to the T subtree",
+   "cypher": "CALL db.index.vector.queryNodes(\"Term\", \"emb\", [0.5, 0.5, 0.5, 0.5], 200) YIELD node, score MATCH (r:Term {code: \"T\"}) WHERE subsumes(node, r) RETURN count(node) AS n",
+   "skip": "engine gap: CALL db.index.vector.queryNodes(...) YIELD node cannot be composed with a following MATCH or WHERE that references `node`, so an ANN search cannot be restricted to a subtree today. The ANN call and the subsumption predicate each work in isolation; only the composition is missing."
+  },
+  {
+   "id": "H10-01",
+   "class": "H10",
+   "name": "monthly roll-up window across 2019",
+   "cypher": "MATCH (m:Month) WHERE m.y = 2019 RETURN m.code AS code, hierarchy_rollup(m, \"sum\") AS v",
+   "baseline": "MATCH (m:Month)<-[:IN_PERIOD*0..]-(d) WHERE m.y = 2019 RETURN m.code AS code, sum(d.units) AS v"
+  },
+  {
+   "id": "H10-02",
+   "class": "H10",
+   "name": "monthly roll-up window across 2020",
+   "cypher": "MATCH (m:Month) WHERE m.y = 2020 RETURN m.code AS code, hierarchy_rollup(m, \"sum\") AS v",
+   "baseline": "MATCH (m:Month)<-[:IN_PERIOD*0..]-(d) WHERE m.y = 2020 RETURN m.code AS code, sum(d.units) AS v"
+  },
+  {
+   "id": "H10-03",
+   "class": "H10",
+   "name": "monthly roll-up window across 2021",
+   "cypher": "MATCH (m:Month) WHERE m.y = 2021 RETURN m.code AS code, hierarchy_rollup(m, \"sum\") AS v",
+   "baseline": "MATCH (m:Month)<-[:IN_PERIOD*0..]-(d) WHERE m.y = 2021 RETURN m.code AS code, sum(d.units) AS v"
+  },
+  {
+   "id": "H10-04",
+   "class": "H10",
+   "name": "monthly roll-up window across 2022",
+   "cypher": "MATCH (m:Month) WHERE m.y = 2022 RETURN m.code AS code, hierarchy_rollup(m, \"sum\") AS v",
+   "baseline": "MATCH (m:Month)<-[:IN_PERIOD*0..]-(d) WHERE m.y = 2022 RETURN m.code AS code, sum(d.units) AS v"
+  },
+  {
+   "id": "H10-05",
+   "class": "H10",
+   "name": "quarterly roll-up window across 2019",
+   "cypher": "MATCH (q:Quarter) WHERE q.y = 2019 RETURN q.code AS code, hierarchy_rollup(q, \"sum\") AS v",
+   "baseline": "MATCH (q:Quarter)<-[:IN_PERIOD*0..]-(d) WHERE q.y = 2019 RETURN q.code AS code, sum(d.units) AS v"
+  },
+  {
+   "id": "H10-06",
+   "class": "H10",
+   "name": "quarterly roll-up window across 2020",
+   "cypher": "MATCH (q:Quarter) WHERE q.y = 2020 RETURN q.code AS code, hierarchy_rollup(q, \"sum\") AS v",
+   "baseline": "MATCH (q:Quarter)<-[:IN_PERIOD*0..]-(d) WHERE q.y = 2020 RETURN q.code AS code, sum(d.units) AS v"
+  },
+  {
+   "id": "H10-07",
+   "class": "H10",
+   "name": "quarterly roll-up window across 2021",
+   "cypher": "MATCH (q:Quarter) WHERE q.y = 2021 RETURN q.code AS code, hierarchy_rollup(q, \"sum\") AS v",
+   "baseline": "MATCH (q:Quarter)<-[:IN_PERIOD*0..]-(d) WHERE q.y = 2021 RETURN q.code AS code, sum(d.units) AS v"
+  },
+  {
+   "id": "H10-08",
+   "class": "H10",
+   "name": "whole-year roll-up for 2019",
+   "cypher": "MATCH (d)-[:IN_PERIOD*0..]->(r:Year {code: \"Y2019\"}) RETURN sum(d.units) AS v"
+  },
+  {
+   "id": "H10-09",
+   "class": "H10",
+   "name": "whole-year roll-up for 2020",
+   "cypher": "MATCH (d)-[:IN_PERIOD*0..]->(r:Year {code: \"Y2020\"}) RETURN sum(d.units) AS v"
+  },
+  {
+   "id": "H10-10",
+   "class": "H10",
+   "name": "whole-year roll-up for 2021",
+   "cypher": "MATCH (d)-[:IN_PERIOD*0..]->(r:Year {code: \"Y2021\"}) RETURN sum(d.units) AS v"
+  }
+ ]
+}

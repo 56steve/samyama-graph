@@ -153,6 +153,24 @@ fn parse_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) -> Pars
             Rule::show_indexes_stmt => {
                 query.show_indexes = true;
             }
+            Rule::show_hierarchy_indexes_stmt => {
+                query.show_hierarchy_indexes = true;
+            }
+            Rule::create_hierarchy_index_stmt => {
+                parse_create_hierarchy_index_statement(inner, query)?;
+            }
+            Rule::drop_hierarchy_index_stmt => {
+                query.drop_hierarchy_index = inner
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::variable)
+                    .map(|p| p.as_str().to_string());
+            }
+            Rule::rebuild_hierarchy_index_stmt => {
+                query.rebuild_hierarchy_index = inner
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::variable)
+                    .map(|p| p.as_str().to_string());
+            }
             Rule::show_constraints_stmt => {
                 query.show_constraints = true;
             }
@@ -264,6 +282,75 @@ fn parse_create_index_statement(pair: pest::iterators::Pair<Rule>, query: &mut Q
         label: label.ok_or_else(|| ParseError::SemanticError("Missing label".to_string()))?,
         property: first_property,
         additional_properties,
+    });
+    Ok(())
+}
+
+/// `CREATE HIERARCHY INDEX <name> ON ()-[:T|T2]->() [MEASURE [Label.]prop] [AGGREGATE ops]`
+///
+/// The relationship pattern carries the orientation: `()-[:IS_A]->()` reads the stored
+/// edge as `child -> parent`, `()<-[:HAS_CHILD]-()` as `parent -> child`. Everything else
+/// about the declaration is optional — COUNT roll-up needs no measure at all.
+fn parse_create_hierarchy_index_statement(
+    pair: pest::iterators::Pair<Rule>,
+    query: &mut Query,
+) -> ParseResult<()> {
+    let mut name: Option<String> = None;
+    let mut edge_types: Vec<String> = Vec::new();
+    let mut reverse = false;
+    let mut measure_label: Option<String> = None;
+    let mut measure_property: Option<String> = None;
+    let mut aggregates: Vec<String> = Vec::new();
+
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::variable => name = Some(inner.as_str().to_string()),
+            Rule::hier_relationship => {
+                for rel in inner.into_inner() {
+                    reverse = rel.as_rule() == Rule::hier_rel_reverse;
+                    for t in rel.into_inner() {
+                        if t.as_rule() == Rule::hier_types {
+                            for l in t.into_inner() {
+                                edge_types.push(l.as_str().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            Rule::hier_measure => {
+                // `MEASURE Trial.enrollment` yields (label, property); `MEASURE enrollment`
+                // yields the property alone.
+                let parts: Vec<_> = inner.into_inner().collect();
+                for part in &parts {
+                    match part.as_rule() {
+                        Rule::label => measure_label = Some(part.as_str().to_string()),
+                        Rule::property_key => measure_property = Some(part.as_str().to_string()),
+                        _ => {}
+                    }
+                }
+            }
+            Rule::hier_aggregates => {
+                for op in inner.into_inner() {
+                    aggregates.push(op.as_str().to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if edge_types.is_empty() {
+        return Err(ParseError::SemanticError(
+            "CREATE HIERARCHY INDEX requires at least one relationship type".to_string(),
+        ));
+    }
+
+    query.create_hierarchy_index_clause = Some(CreateHierarchyIndexClause {
+        name: name.ok_or_else(|| ParseError::SemanticError("Missing index name".to_string()))?,
+        edge_types,
+        reverse,
+        measure_label,
+        measure_property,
+        aggregates,
     });
     Ok(())
 }

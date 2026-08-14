@@ -20,7 +20,10 @@ use flate2::Compression;
 use crate::graph::property::PropertyValue;
 use crate::graph::store::GraphStore;
 use crate::graph::types::NodeId;
-use format::{ExportStats, ImportStats, SnapshotEdge, SnapshotHeader, SnapshotNode, SNAPSHOT_VERSION};
+use format::{
+    ExportStats, ImportStats, SnapshotEdge, SnapshotHeader, SnapshotHierarchyIndex, SnapshotNode,
+    SNAPSHOT_VERSION,
+};
 
 /// Export all nodes and edges from the store into a gzip-compressed .sgsnap stream.
 ///
@@ -105,6 +108,25 @@ pub fn export_tenant(
     let header_json = serde_json::to_string(&header)?;
     gz.write_all(header_json.as_bytes())?;
     gz.write_all(b"\n")?;
+
+    // Write hierarchy index declarations (ADR-035). Declarations only — the structures
+    // rebuild on import. Declined hierarchies are exported too: the probe is a property of
+    // the data, so a hierarchy that declines here may be in regime after the import that
+    // reshapes it, and dropping the declaration would silently lose the user's intent.
+    for info in store.hierarchy_index.list() {
+        let record = SnapshotHierarchyIndex {
+            t: "h".to_string(),
+            name: info.name.clone(),
+            edge_types: info.edge_types.clone(),
+            reverse: false,
+            measure_label: None,
+            measure_property: info.measure.clone(),
+            ops: info.ops.iter().map(|o| o.to_string()).collect(),
+        };
+        let json = serde_json::to_string(&record)?;
+        gz.write_all(json.as_bytes())?;
+        gz.write_all(b"\n")?;
+    }
 
     // Write nodes (with ColumnStore properties merged)
     for node in &nodes {
@@ -268,6 +290,7 @@ pub fn import_tenant_with_dedup(
     let mut merged_node_count: u64 = 0;
     let mut imported_labels: HashSet<String> = HashSet::new();
     let mut imported_edge_types: HashSet<String> = HashSet::new();
+    let mut hierarchy_decls: Vec<SnapshotHierarchyIndex> = Vec::new();
 
     // Normalize dedup values: lowercase + trim for case-insensitive matching
     let normalize_dedup = |s: &str| -> String { s.trim().to_lowercase() };
@@ -452,6 +475,12 @@ pub fn import_tenant_with_dedup(
             }
 
             imported_node_count += 1;
+        } else if line.contains("\"t\":\"h\"") {
+            // Hierarchy index declaration (ADR-035). Deferred until nodes and edges are
+            // in, because building the poset reads the covering relation we are still
+            // importing.
+            let decl: SnapshotHierarchyIndex = serde_json::from_str(&line)?;
+            hierarchy_decls.push(decl);
         } else if line.contains("\"t\":\"e\"") {
             // Parse as edge
             let snap_edge: SnapshotEdge = serde_json::from_str(&line)?;
@@ -526,12 +555,58 @@ pub fn import_tenant_with_dedup(
     let mut edge_types: Vec<String> = imported_edge_types.into_iter().collect();
     edge_types.sort();
 
+    // Rebuild hierarchy indexes from their declarations, now that the covering relation
+    // exists. A hierarchy that declines on the imported data is registered with its
+    // diagnostic rather than dropped; a hierarchy over a cycle is skipped with a warning,
+    // because refusing the whole import over one bad declaration would be the wrong
+    // trade — the graph itself is fine.
+    let mut hierarchy_count: u64 = 0;
+    if !hierarchy_decls.is_empty() {
+        let mgr = std::sync::Arc::clone(&store.hierarchy_index);
+        for decl in hierarchy_decls {
+            let mut spec = crate::index::hierarchy::HierarchySpec::new(
+                decl.name.clone(),
+                decl.edge_types
+                    .iter()
+                    .map(|t| crate::graph::types::EdgeType::new(t.as_str()))
+                    .collect(),
+            );
+            spec.reverse = decl.reverse;
+            if let Some(prop) = &decl.measure_property {
+                let ops: Vec<crate::index::hierarchy::RollupOp> = decl
+                    .ops
+                    .iter()
+                    .filter_map(|o| crate::index::hierarchy::RollupOp::parse(o))
+                    .collect();
+                spec = spec.with_measure(
+                    decl.measure_label
+                        .as_ref()
+                        .map(|l| crate::graph::types::Label::new(l.as_str())),
+                    prop.clone(),
+                    if ops.is_empty() {
+                        vec![crate::index::hierarchy::RollupOp::Sum]
+                    } else {
+                        ops
+                    },
+                );
+            }
+            match mgr.create(store, spec) {
+                Ok(_) => hierarchy_count += 1,
+                Err(e) => eprintln!(
+                    "[hierarchy] skipped index '{}' from snapshot: {}",
+                    decl.name, e
+                ),
+            }
+        }
+    }
+
     Ok(ImportStats {
         node_count: imported_node_count,
         edge_count: imported_edge_count,
         merged_count: merged_node_count,
         labels,
         edge_types,
+        hierarchy_count,
     })
 }
 
@@ -652,6 +727,72 @@ fn json_to_property(val: &serde_json::Value) -> PropertyValue {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// A hierarchy that survives a snapshot round-trip, measure and all.
+    ///
+    /// This is the test that defends the columnar-read rule in ADR-035 §5: an imported
+    /// graph has nothing in the sparse property map, so a roll-up that read
+    /// `node.properties` would come back zero here while every other assertion still
+    /// passed. Asserting the *value* after import — not merely the index's existence — is
+    /// what makes that failure mode visible.
+    #[test]
+    fn hierarchy_declaration_survives_round_trip_and_rolls_up_after_import() {
+        use crate::graph::types::EdgeType;
+        use crate::index::hierarchy::{HierarchySpec, RollupOp, RollupValue};
+
+        let mut store = GraphStore::new();
+        let root = store.create_node("Class");
+        for i in 1..=4i64 {
+            let leaf = store.create_node("Drug");
+            store.create_edge(leaf, root, "IS_A").unwrap();
+            store
+                .get_node_mut(leaf)
+                .unwrap()
+                .set_property("units", PropertyValue::Integer(i));
+        }
+        let mgr = std::sync::Arc::clone(&store.hierarchy_index);
+        mgr.create(
+            &store,
+            HierarchySpec::new("atc", vec![EdgeType::new("IS_A")]).with_measure(
+                None,
+                "units",
+                vec![RollupOp::Sum, RollupOp::Count],
+            ),
+        )
+        .unwrap();
+
+        let mut buf = Vec::new();
+        export_tenant(&store, &mut buf).unwrap();
+
+        let mut restored = GraphStore::new();
+        let stats = import_tenant(&mut restored, Cursor::new(buf)).unwrap();
+        assert_eq!(stats.hierarchy_count, 1, "declaration must survive the round trip");
+
+        let entry = restored.hierarchy_index.get("atc").expect("index rebuilt on import");
+        let guard = entry.read().unwrap();
+        assert!(guard.usable(), "a freshly rebuilt index is not stale");
+        let idx = guard.index.as_ref().unwrap();
+
+        // Node ids are remapped on import, so find the root by its subtree size.
+        let root_idx = (0..idx.poset().n() as u32)
+            .find(|&i| idx.descendant_count(i) == 5)
+            .expect("the root subsumes all five nodes");
+        assert_eq!(idx.rollup(root_idx, RollupOp::Sum), Some(RollupValue::Int(10)));
+        assert_eq!(idx.rollup(root_idx, RollupOp::Count), Some(RollupValue::Int(5)));
+    }
+
+    #[test]
+    fn snapshot_without_hierarchies_reports_none() {
+        let mut store = GraphStore::new();
+        let a = store.create_node("Person");
+        let b = store.create_node("Person");
+        store.create_edge(a, b, "KNOWS").unwrap();
+        let mut buf = Vec::new();
+        export_tenant(&store, &mut buf).unwrap();
+        let mut restored = GraphStore::new();
+        let stats = import_tenant(&mut restored, Cursor::new(buf)).unwrap();
+        assert_eq!(stats.hierarchy_count, 0);
+    }
 
     #[test]
     fn test_round_trip_basic() {

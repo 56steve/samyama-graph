@@ -282,6 +282,55 @@ impl QueryPlanner {
         &self.config
     }
 
+    /// Build the physical plan for a detected hierarchy rewrite (ADR-035 §8).
+    ///
+    /// Both shapes cost far less than the expansion they replace, so the cost recorded
+    /// here is the index cost rather than a placeholder: a roll-up is O(log n) in
+    /// nested-set mode, and a descendant scan is one output row per descendant with no
+    /// per-edge work and no visited-set.
+    fn plan_hierarchy_rewrite(
+        &self,
+        rewrite: super::hierarchy_detector::HierarchyRewrite,
+    ) -> ExecutionPlan {
+        use super::hierarchy_detector::HierarchyRewrite;
+        match rewrite {
+            HierarchyRewrite::Rollup {
+                index_name,
+                root,
+                op,
+                alias,
+            } => ExecutionPlan {
+                root: Box::new(super::hierarchy_ops::HierarchyRollupOperator::new(
+                    index_name,
+                    root,
+                    op,
+                    alias.clone(),
+                )),
+                output_columns: vec![alias],
+                is_write: false,
+                candidates_evaluated: 1,
+                chosen_plan_cost: super::cost_model::HIERARCHY_ROLLUP_COST,
+                candidate_costs: Vec::new(),
+            },
+            HierarchyRewrite::DescendantScan {
+                index_name,
+                root,
+                var,
+            } => ExecutionPlan {
+                root: Box::new(super::hierarchy_ops::HierarchyDescendantScanOperator::new(
+                    index_name,
+                    root,
+                    var.clone(),
+                )),
+                output_columns: vec![var],
+                is_write: false,
+                candidates_evaluated: 1,
+                chosen_plan_cost: super::cost_model::HIERARCHY_DESCENDANT_SCAN_COST,
+                candidate_costs: Vec::new(),
+            },
+        }
+    }
+
     /// Invalidate the plan cache (e.g., after CREATE INDEX or schema change)
     pub fn invalidate_cache(&self) {
         self.cache_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -296,6 +345,79 @@ impl QueryPlanner {
                 root: Box::new(ShowIndexesOperator::new()),
                 output_columns: vec!["label".to_string(), "property".to_string(), "type".to_string()],
                 is_write: false, candidates_evaluated: 0, chosen_plan_cost: 0.0, candidate_costs: Vec::new(),
+            });
+        }
+
+        // Handle SHOW HIERARCHY INDEXES (ADR-035)
+        if query.show_hierarchy_indexes {
+            return Ok(ExecutionPlan {
+                root: Box::new(super::hierarchy_ops::ShowHierarchyIndexesOperator::new()),
+                output_columns: super::hierarchy_ops::hierarchy_info_columns(),
+                is_write: false, candidates_evaluated: 0, chosen_plan_cost: 0.0, candidate_costs: Vec::new(),
+            });
+        }
+
+        // Handle CREATE HIERARCHY INDEX (ADR-035)
+        if let Some(clause) = &query.create_hierarchy_index_clause {
+            let mut spec = crate::index::hierarchy::HierarchySpec::new(
+                clause.name.clone(),
+                clause
+                    .edge_types
+                    .iter()
+                    .map(|t| crate::graph::types::EdgeType::new(t.as_str()))
+                    .collect(),
+            );
+            spec.reverse = clause.reverse;
+            if let Some(prop) = &clause.measure_property {
+                // An unrecognized aggregate name is rejected here rather than silently
+                // dropped: a user who asks for `AGGREGATE avg` should learn that the index
+                // does not support it, not get an index that quietly lacks it.
+                let mut ops = Vec::new();
+                for name in &clause.aggregates {
+                    match crate::index::hierarchy::RollupOp::parse(name) {
+                        Some(op) => ops.push(op),
+                        None => {
+                            return Err(ExecutionError::RuntimeError(format!(
+                                "unsupported hierarchy aggregate '{}': expected sum, count, min or max",
+                                name
+                            )))
+                        }
+                    }
+                }
+                if ops.is_empty() {
+                    ops.push(crate::index::hierarchy::RollupOp::Sum);
+                }
+                spec = spec.with_measure(
+                    clause
+                        .measure_label
+                        .as_ref()
+                        .map(|l| crate::graph::types::Label::new(l.as_str())),
+                    prop.clone(),
+                    ops,
+                );
+            }
+            return Ok(ExecutionPlan {
+                root: Box::new(super::hierarchy_ops::CreateHierarchyIndexOperator::new(spec)),
+                output_columns: super::hierarchy_ops::hierarchy_info_columns(),
+                is_write: true, candidates_evaluated: 0, chosen_plan_cost: 0.0, candidate_costs: Vec::new(),
+            });
+        }
+
+        // Handle DROP HIERARCHY INDEX
+        if let Some(name) = &query.drop_hierarchy_index {
+            return Ok(ExecutionPlan {
+                root: Box::new(super::hierarchy_ops::DropHierarchyIndexOperator::new(name.clone())),
+                output_columns: vec![],
+                is_write: true, candidates_evaluated: 0, chosen_plan_cost: 0.0, candidate_costs: Vec::new(),
+            });
+        }
+
+        // Handle REBUILD HIERARCHY INDEX
+        if let Some(name) = &query.rebuild_hierarchy_index {
+            return Ok(ExecutionPlan {
+                root: Box::new(super::hierarchy_ops::RebuildHierarchyIndexOperator::new(name.clone())),
+                output_columns: super::hierarchy_ops::hierarchy_info_columns(),
+                is_write: true, candidates_evaluated: 0, chosen_plan_cost: 0.0, candidate_costs: Vec::new(),
             });
         }
 
@@ -374,6 +496,13 @@ impl QueryPlanner {
                     is_write: true, candidates_evaluated: 0, chosen_plan_cost: 0.0, candidate_costs: Vec::new(),
                 });
             }
+        }
+
+        // ADR-035: answer a reflexive subtree aggregate or enumeration from the OEH
+        // hierarchy index. The detector is conservative — when it returns Some, the
+        // rewrite is answer-preserving and only the cost changes.
+        if let Some(rewrite) = super::hierarchy_detector::detect(query, store) {
+            return Ok(self.plan_hierarchy_rewrite(rewrite));
         }
 
         // ADR-017 Phase 1: recognize the adjacency-count-aggregate shape before
@@ -3450,6 +3579,10 @@ mod tests {
             create_index_clause: None,
             drop_index_clause: None,
             create_constraint_clause: None,
+            create_hierarchy_index_clause: None,
+            drop_hierarchy_index: None,
+            rebuild_hierarchy_index: None,
+            show_hierarchy_indexes: false,
             show_indexes: false,
             show_constraints: false,
             profile: false,

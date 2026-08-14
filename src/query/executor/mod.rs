@@ -78,6 +78,8 @@
 
 pub mod adjacency_agg_detector;
 pub mod cost_model;
+pub mod hierarchy_detector;
+pub mod hierarchy_ops;
 pub mod semi_join_detector;
 pub mod leapfrog;
 pub mod logical_optimizer;
