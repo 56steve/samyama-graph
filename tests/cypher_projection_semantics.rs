@@ -406,7 +406,6 @@ fn count_of_a_node_counts_rows() {
 }
 
 #[test]
-#[ignore = "blocked on #358: count(expr) counts rows instead of non-null values"]
 fn count_of_a_property_skips_nulls() {
     let s = fixture();
     assert_eq!(

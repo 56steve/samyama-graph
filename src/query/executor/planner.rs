@@ -1413,6 +1413,13 @@ impl QueryPlanner {
                 && group_by.is_empty()
                 && matches!(aggregates[0].func, AggregateType::Count)
                 && !aggregates[0].distinct
+                // O(1) label count answers "how many rows", which is `count(*)` or
+                // `count(var)`. `count(x.prop)` counts non-null *values*, and returning the
+                // label count for it reported every node as having the property (#358).
+                && matches!(
+                    aggregates[0].expr,
+                    Expression::Literal(_) | Expression::Variable(_)
+                )
                 && query.where_clause.is_none()
                 && query.with_clause.is_none()
                 && query.match_clauses.len() == 1

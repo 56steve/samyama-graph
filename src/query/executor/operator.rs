@@ -3741,12 +3741,16 @@ impl AggregatorState {
                 }
             }
             AggregatorState::Collect(items) => {
+                // collect() drops nulls, like every other aggregate (#358) — otherwise the
+                // list carries holes that every consumer has to filter again.
                 if let Some(prop) = value.as_property() {
-                    items.push(prop.clone());
+                    if !matches!(prop, PropertyValue::Null) {
+                        items.push(prop.clone());
+                    }
                 }
             }
             AggregatorState::CollectDistinct(set) => {
-                if let Some(prop) = value.as_property() {
+                if let Some(prop) = value.as_property().filter(|p| !matches!(p, PropertyValue::Null)) {
                     if !prop.is_null() {
                         set.insert(prop.clone());
                     }
@@ -4022,7 +4026,15 @@ impl AggregateOperator {
         let group_expr = &self.group_by[0].0;
 
         // Check if all aggregates are simple count (non-distinct) — can skip aggregate expression evaluation
-        let all_simple_count = self.aggregates.iter().all(|a| matches!(a.func, AggregateType::Count) && !a.distinct);
+        // Fast path: count rows without evaluating the argument. Valid only when the
+        // argument cannot be null per row — `count(*)` (a literal) or `count(var)` for a
+        // bound node or edge. `count(x.prop)` counts *non-null values*, so skipping the
+        // evaluation there counted rows instead and reported every row as a value (#358).
+        let all_simple_count = self.aggregates.iter().all(|a| {
+            matches!(a.func, AggregateType::Count)
+                && !a.distinct
+                && matches!(a.expr, Expression::Literal(_) | Expression::Variable(_))
+        });
 
         let batch_size = 65536;
         let mut batch_count = 0u64;
@@ -4074,7 +4086,15 @@ impl AggregateOperator {
             .map(|agg| AggregatorState::new(&agg.func, agg.distinct))
             .collect();
 
-        let all_simple_count = self.aggregates.iter().all(|a| matches!(a.func, AggregateType::Count) && !a.distinct);
+        // Fast path: count rows without evaluating the argument. Valid only when the
+        // argument cannot be null per row — `count(*)` (a literal) or `count(var)` for a
+        // bound node or edge. `count(x.prop)` counts *non-null values*, so skipping the
+        // evaluation there counted rows instead and reported every row as a value (#358).
+        let all_simple_count = self.aggregates.iter().all(|a| {
+            matches!(a.func, AggregateType::Count)
+                && !a.distinct
+                && matches!(a.expr, Expression::Literal(_) | Expression::Variable(_))
+        });
 
         let batch_size = 65536;
         let mut batch_count = 0u64;
