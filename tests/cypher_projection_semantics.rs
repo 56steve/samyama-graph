@@ -678,3 +678,55 @@ fn null_ordering_follows_opencypher() {
     );
     assert_eq!(desc[0], "n=Frank v=NULL", "nulls first on DESC: {desc:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Multi-clause joins (#360)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_second_match_joins_on_every_shared_variable() {
+    // Two MATCH clauses sharing *two* variables. Joining on only one of them leaves the
+    // other uncorrelated and yields a cartesian product across it — and because the join
+    // key came from a HashSet intersection, which one was enforced varied between runs of
+    // the same query on the same data.
+    let mut s = GraphStore::new();
+    let mut mk = |s: &mut GraphStore, label: &str, id: &str| {
+        let n = s.create_node(label);
+        s.set_column_property(n, "id", PropertyValue::String(id.into()));
+        n
+    };
+    let board = mk(&mut s, "Board", "B1");
+    let ma = mk(&mut s, "Model", "MA");
+    let mb = mk(&mut s, "Model", "MB");
+    for (vid, precision, model) in [
+        ("MA32", "fp32", ma),
+        ("MA8", "int8", ma),
+        ("MB32", "fp32", mb),
+        ("MB8", "int8", mb),
+    ] {
+        let v = mk(&mut s, "Variant", vid);
+        s.set_column_property(v, "precision", PropertyValue::String(precision.into()));
+        s.create_edge(v, model, "VARIANT_OF").unwrap();
+        let d = s.create_node("Deploy");
+        s.create_edge(d, v, "OF").unwrap();
+        s.create_edge(d, board, "ON").unwrap();
+    }
+
+    // Each model's fp32 variant paired with *its own* int8 variant: 2 rows, not 4.
+    let r = bag(
+        &s,
+        "MATCH (b:Board)<-[:ON]-(d1:Deploy)-[:OF]->(v1:Variant)-[:VARIANT_OF]->(m:Model) \
+         WHERE v1.precision = \"fp32\" \
+         MATCH (b)<-[:ON]-(d2:Deploy)-[:OF]->(v2:Variant)-[:VARIANT_OF]->(m) \
+         WHERE v2.precision = \"int8\" \
+         RETURN m.id AS model, v1.id AS fp32, v2.id AS int8",
+    );
+    assert_eq!(
+        r,
+        vec![
+            "fp32=MA32 int8=MA8 model=MA",
+            "fp32=MB32 int8=MB8 model=MB",
+        ],
+        "a variant must pair only with its own model's other variant: {r:?}"
+    );
+}
