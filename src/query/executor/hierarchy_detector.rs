@@ -58,6 +58,26 @@ pub enum HierarchyRewrite {
         /// What the query asks for once the rows are filtered.
         output: OrderTestOutput,
     },
+    /// Drive from a subtree into the fact table, instead of scanning facts and testing
+    /// each one against the hierarchy.
+    HierarchyDriven {
+        /// Index that answers it.
+        index_name: String,
+        /// Pinned subtree root.
+        root: NodeId,
+        /// Variable bound to each hierarchy member.
+        hier_var: String,
+        /// Variable bound to the fact node.
+        fact_var: String,
+        /// Labels on the fact node, if the pattern gave any.
+        fact_labels: Vec<Label>,
+        /// Relationship joining fact to hierarchy member.
+        edge_type: String,
+        /// Direction to walk *from the hierarchy member back to the fact*.
+        to_fact: Direction,
+        /// What the query asks for.
+        output: DrivenOutput,
+    },
     /// Enumerate the reflexive descendant set from the index.
     DescendantScan {
         /// Index that answers it.
@@ -67,6 +87,15 @@ pub enum HierarchyRewrite {
         /// Variable each descendant binds to.
         var: String,
     },
+}
+
+/// What a hierarchy-driven query projects.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DrivenOutput {
+    /// `RETURN count(e)` — with `distinct` when the query said `count(DISTINCT e)`.
+    Count { alias: String, distinct: bool },
+    /// `RETURN sum(e.prop)`.
+    Sum { alias: String, property: String },
 }
 
 /// What an order-test query projects.
@@ -94,6 +123,9 @@ pub fn detect(query: &Query, store: &GraphStore) -> Option<HierarchyRewrite> {
         return None;
     }
     if let Some(rewrite) = detect_order_test(query, store) {
+        return Some(rewrite);
+    }
+    if let Some(rewrite) = detect_hierarchy_driven(query, store) {
         return Some(rewrite);
     }
 
@@ -179,6 +211,156 @@ pub fn detect(query: &Query, store: &GraphStore) -> Option<HierarchyRewrite> {
     }
 
     None
+}
+
+/// Recognize `MATCH (e:F)-[:REL]->(x), (r:L {pin}) WHERE subsumes(x, r) RETURN count(e) | sum(e.p)`
+/// and turn it inside out.
+///
+/// The default plan scans the whole fact table and tests each row against the hierarchy.
+/// That is backwards when the subtree is the selective side: the index can enumerate
+/// `{r} ∪ descendants(r)` directly, and the facts are then reachable by walking the
+/// relationship *backwards* from those nodes. Facts outside the subtree are never touched.
+///
+/// Row multiplicity is preserved exactly, which is what makes this answer-preserving: the
+/// original enumerates every `(e, x)` pair where `x ⊑ r`, and so does the driven plan —
+/// the same pairs, discovered from the other end.
+///
+/// This is the plan HIER class H5 needed. Measured against Neo4j it was the one class where
+/// a hierarchy query lost outright, because Neo4j drives from the pinned root while we
+/// scanned 5,000 facts to keep a few hundred.
+fn detect_hierarchy_driven(query: &Query, store: &GraphStore) -> Option<HierarchyRewrite> {
+    if query.match_clauses.len() != 1
+        || query.with_clause.is_some()
+        || query.create_clause.is_some()
+        || query.delete_clause.is_some()
+        || query.call_clause.is_some()
+        || query.call_subquery.is_some()
+        || query.unwind_clause.is_some()
+        || query.merge_clause.is_some()
+        || query.foreach_clause.is_some()
+        || !query.set_clauses.is_empty()
+        || !query.remove_clauses.is_empty()
+        || !query.union_queries.is_empty()
+        || query.order_by.is_some()
+        || query.limit.is_some()
+        || query.skip.is_some()
+    {
+        return None;
+    }
+    let clause = &query.match_clauses[0];
+    if clause.optional || clause.pattern.paths.len() != 2 {
+        return None;
+    }
+
+    // Exactly one path carries an edge (fact -> hierarchy member); the other pins the root.
+    let (fact_path, root_path) = {
+        let a = &clause.pattern.paths[0];
+        let b = &clause.pattern.paths[1];
+        match (a.segments.len(), b.segments.len()) {
+            (1, 0) => (a, b),
+            (0, 1) => (b, a),
+            _ => return None,
+        }
+    };
+    if fact_path.path_variable.is_some() || root_path.path_variable.is_some() {
+        return None;
+    }
+    let segment = &fact_path.segments[0];
+    if segment.edge.types.len() != 1
+        || segment.edge.length.is_some()
+        || segment.edge.variable.is_some()
+    {
+        return None;
+    }
+    let fact_var = fact_path.start.variable.clone()?;
+    let hier_var = segment.node.variable.clone()?;
+    if segment.node.properties.is_some() || !segment.node.labels.is_empty() {
+        // A constraint on the hierarchy side would filter the subtree the scan enumerates.
+        return None;
+    }
+    if fact_path.start.properties.is_some() {
+        return None;
+    }
+    // Walking back from the hierarchy member to the fact reverses the pattern's direction.
+    let to_fact = match segment.edge.direction {
+        Direction::Outgoing => Direction::Incoming,
+        Direction::Incoming => Direction::Outgoing,
+        Direction::Both => return None,
+    };
+
+    // WHERE must be exactly `subsumes(hier_var, root_var)` — no negation: the complement of
+    // a subtree is not something the descendant scan can enumerate.
+    let predicate = &query.where_clause.as_ref()?.predicate;
+    let (child, root_var) = match predicate {
+        Expression::Function {
+            name,
+            args,
+            distinct: false,
+        } if name.eq_ignore_ascii_case("subsumes") && args.len() == 2 => {
+            match (&args[0], &args[1]) {
+                (Expression::Variable(a), Expression::Variable(b)) => (a.clone(), b.clone()),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    if child != hier_var || root_path.start.variable.as_deref() != Some(root_var.as_str()) {
+        return None;
+    }
+
+    let root = resolve_pinned_node(store, &root_path.start)?;
+    let entry = store.hierarchy_index.usable_containing(&[root])?;
+    let index_name = entry.read().unwrap().spec.name.clone();
+
+    let ret = query.return_clause.as_ref()?;
+    if ret.items.len() != 1 || ret.distinct {
+        return None;
+    }
+    let item = &ret.items[0];
+    let output = match &item.expression {
+        Expression::Function {
+            name,
+            args,
+            distinct,
+        } if name.eq_ignore_ascii_case("count") => match args.as_slice() {
+            [Expression::Variable(v)] if *v == fact_var => DrivenOutput::Count {
+                alias: item
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| format!("count({fact_var})")),
+                distinct: *distinct,
+            },
+            _ => return None,
+        },
+        Expression::Function {
+            name,
+            args,
+            distinct: false,
+        } if name.eq_ignore_ascii_case("sum") => match args.as_slice() {
+            [Expression::Property { variable, property }] if *variable == fact_var => {
+                DrivenOutput::Sum {
+                    alias: item
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| format!("sum({fact_var}.{property})")),
+                    property: property.clone(),
+                }
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+
+    Some(HierarchyRewrite::HierarchyDriven {
+        index_name,
+        root,
+        hier_var,
+        fact_var,
+        fact_labels: fact_path.start.labels.clone(),
+        edge_type: segment.edge.types[0].as_str().to_string(),
+        to_fact,
+        output,
+    })
 }
 
 /// Recognize `MATCH (d:L), (r:L2 {pin}) WHERE subsumes(d, r) RETURN count(d) | d`.

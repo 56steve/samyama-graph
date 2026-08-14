@@ -346,8 +346,70 @@ impl QueryPlanner {
         &self,
         rewrite: super::hierarchy_detector::HierarchyRewrite,
     ) -> ExecutionPlan {
-        use super::hierarchy_detector::{HierarchyRewrite, OrderTestOutput};
+        use super::hierarchy_detector::{DrivenOutput, HierarchyRewrite, OrderTestOutput};
         match rewrite {
+            HierarchyRewrite::HierarchyDriven {
+                index_name,
+                root,
+                hier_var,
+                fact_var,
+                fact_labels,
+                edge_type,
+                to_fact,
+                output,
+            } => {
+                // Enumerate the subtree from the index, then walk the relationship
+                // backwards into the fact table. Facts outside the subtree are never
+                // visited, where the default plan scans all of them and discards most.
+                let scan: OperatorBox =
+                    Box::new(super::hierarchy_ops::HierarchyDescendantScanOperator::new(
+                        index_name,
+                        root,
+                        hier_var.clone(),
+                    ));
+                let expand: OperatorBox = Box::new(
+                    ExpandOperator::new(
+                        scan,
+                        hier_var,
+                        fact_var.clone(),
+                        None,
+                        vec![edge_type],
+                        to_fact,
+                    )
+                    .with_target_labels(fact_labels),
+                );
+                let (agg, alias) = match output {
+                    DrivenOutput::Count { alias, distinct } => (
+                        AggregateFunction {
+                            func: AggregateType::Count,
+                            expr: Expression::Variable(fact_var),
+                            alias: alias.clone(),
+                            distinct,
+                        },
+                        alias,
+                    ),
+                    DrivenOutput::Sum { alias, property } => (
+                        AggregateFunction {
+                            func: AggregateType::Sum,
+                            expr: Expression::Property {
+                                variable: fact_var,
+                                property,
+                            },
+                            alias: alias.clone(),
+                            distinct: false,
+                        },
+                        alias,
+                    ),
+                };
+                ExecutionPlan {
+                    root: Box::new(AggregateOperator::new(expand, Vec::new(), vec![agg])),
+                    output_columns: vec![alias],
+                    is_write: false,
+                    candidates_evaluated: 1,
+                    chosen_plan_cost: super::cost_model::HIERARCHY_DESCENDANT_SCAN_COST,
+                    candidate_costs: Vec::new(),
+                }
+            }
             HierarchyRewrite::OrderTest {
                 index_name,
                 root,

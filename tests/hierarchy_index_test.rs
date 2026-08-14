@@ -689,3 +689,155 @@ fn a_stale_index_does_not_get_the_order_test_rewrite() {
         "a stale index must not answer: {plan}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Hierarchy-driven plan (#350)
+// ---------------------------------------------------------------------------
+
+/// Facts hanging off an ATC-shaped hierarchy: 3 drugs under C0, 3 under C1, 3 under C2.
+/// `Order` nodes point at drugs via `FOR`.
+fn order_store() -> (GraphStore, Vec<NodeId>) {
+    let mut store = atc_store_with_index();
+    let drugs = store.node_ids_by_label(&samyama::graph::Label::new("Drug"), None);
+    let mut orders = Vec::new();
+    for (i, &d) in drugs.iter().enumerate() {
+        let o = store.create_node("Order");
+        store.set_column_property(o, "qty", PropertyValue::Integer((i + 1) as i64));
+        store.create_edge(o, d, "FOR").unwrap();
+        orders.push(o);
+    }
+    (store, orders)
+}
+
+#[test]
+fn a_fact_joined_to_a_subtree_plans_as_a_hierarchy_driven_scan() {
+    let (store, _) = order_store();
+    let plan = plan_description(
+        "MATCH (o:Order)-[:FOR]->(d), (r:Class {code: \"C0\"}) WHERE subsumes(d, r) RETURN count(o) AS n",
+        &store,
+    );
+    assert!(
+        plan.contains("HierarchyDescendantScan"),
+        "the subtree should drive the plan, not the fact table: {plan}"
+    );
+    assert!(
+        plan.contains("Expand"),
+        "and it should walk back into the facts: {plan}"
+    );
+    assert!(
+        !plan.contains("NodeScan (var=o"),
+        "the fact table must not be scanned: {plan}"
+    );
+}
+
+#[test]
+fn the_driven_plan_returns_the_same_answer_as_the_fact_scan() {
+    let (store, _) = order_store();
+    let engine = QueryEngine::new();
+    // 3 drugs under C0, one order each.
+    let driven = engine
+        .execute(
+            "MATCH (o:Order)-[:FOR]->(d), (r:Class {code: \"C0\"}) WHERE subsumes(d, r) RETURN count(o) AS n",
+            &store,
+        )
+        .unwrap();
+    assert_eq!(cell_int(&driven, 0, "n"), 3);
+
+    // The whole hierarchy: every order.
+    let all = engine
+        .execute(
+            "MATCH (o:Order)-[:FOR]->(d), (r:Class {code: \"ROOT\"}) WHERE subsumes(d, r) RETURN count(o) AS n",
+            &store,
+        )
+        .unwrap();
+    assert_eq!(cell_int(&all, 0, "n"), 9);
+}
+
+#[test]
+fn the_driven_plan_preserves_row_multiplicity() {
+    // The sharp case for turning the join around: one fact linked to *two* members of the
+    // same subtree. The original plan yields one row per (fact, member) pair; the driven
+    // plan discovers the same pairs from the other end and must yield the same count —
+    // 2, not 1. Getting this wrong would silently under-count every many-to-many join.
+    let (mut store, _) = order_store();
+    let c0_drugs: Vec<NodeId> = {
+        let engine = QueryEngine::new();
+        let r = engine
+            .execute(
+                "MATCH (d:Drug)-[:IS_A]->(c:Class {code: \"C0\"}) RETURN d",
+                &store,
+            )
+            .unwrap();
+        r.records
+            .iter()
+            .filter_map(|rec| match rec.get("d") {
+                Some(samyama::query::executor::record::Value::Node(id, _)) => Some(*id),
+                Some(samyama::query::executor::record::Value::NodeRef(id)) => Some(*id),
+                _ => None,
+            })
+            .collect()
+    };
+    assert!(c0_drugs.len() >= 2);
+    let multi = store.create_node("Order");
+    store.set_column_property(multi, "qty", PropertyValue::Integer(100));
+    store.create_edge(multi, c0_drugs[0], "FOR").unwrap();
+    store.create_edge(multi, c0_drugs[1], "FOR").unwrap();
+    // Rebuild: the covering relation did not change, but be explicit rather than lucky.
+    let engine = QueryEngine::new();
+    engine
+        .execute_mut("REBUILD HIERARCHY INDEX atc", &mut store, "default")
+        .unwrap();
+
+    let counted = engine
+        .execute(
+            "MATCH (o:Order)-[:FOR]->(d), (r:Class {code: \"C0\"}) WHERE subsumes(d, r) RETURN count(o) AS n",
+            &store,
+        )
+        .unwrap();
+    assert_eq!(
+        cell_int(&counted, 0, "n"),
+        5,
+        "3 single-drug orders + the multi-drug order counted once per matching drug"
+    );
+
+    let distinct = engine
+        .execute(
+            "MATCH (o:Order)-[:FOR]->(d), (r:Class {code: \"C0\"}) WHERE subsumes(d, r) RETURN count(DISTINCT o) AS n",
+            &store,
+        )
+        .unwrap();
+    assert_eq!(
+        cell_int(&distinct, 0, "n"),
+        4,
+        "DISTINCT collapses the multi-drug order"
+    );
+}
+
+#[test]
+fn the_driven_plan_handles_sum_over_a_fact_property() {
+    let (store, _) = order_store();
+    let engine = QueryEngine::new();
+    let plan = plan_description(
+        "MATCH (o:Order)-[:FOR]->(d), (r:Class {code: \"ROOT\"}) WHERE subsumes(d, r) RETURN sum(o.qty) AS v",
+        &store,
+    );
+    assert!(plan.contains("HierarchyDescendantScan"), "{plan}");
+    let result = engine
+        .execute(
+            "MATCH (o:Order)-[:FOR]->(d), (r:Class {code: \"ROOT\"}) WHERE subsumes(d, r) RETURN sum(o.qty) AS v",
+            &store,
+        )
+        .unwrap();
+    assert_eq!(cell_int(&result, 0, "v"), 45, "quantities 1..=9");
+}
+
+#[test]
+fn the_driven_plan_declines_a_negated_predicate() {
+    // The complement of a subtree is not something a descendant scan can enumerate.
+    let (store, _) = order_store();
+    let plan = plan_description(
+        "MATCH (o:Order)-[:FOR]->(d), (r:Class {code: \"C0\"}) WHERE NOT subsumes(d, r) RETURN count(o) AS n",
+        &store,
+    );
+    assert!(!plan.contains("HierarchyDescendantScan"), "{plan}");
+}
