@@ -162,6 +162,35 @@ fn main() {
                 }
             }
         }
+        Err(samyama::index::hierarchy::HierarchyError::NotAcyclic {
+            ordered,
+            total,
+            example_cycle,
+        }) => {
+            // Translate the internal node ids back into the identifiers the user supplied,
+            // otherwise the diagnostic names nodes they have no way to look up.
+            let code_of = |id: NodeId| -> String {
+                match store.node_columns.get_property(id.as_u64() as usize, "code") {
+                    PropertyValue::String(s) => s,
+                    _ => format!("node:{}", id.as_u64()),
+                }
+            };
+            eprintln!(
+                "[ontology] index build failed: covering relation has a cycle — {} of {total} \
+                 nodes could not be ordered",
+                total - ordered
+            );
+            if !example_cycle.is_empty() {
+                let path: Vec<String> = example_cycle.iter().map(|&i| code_of(i)).collect();
+                eprintln!("[ontology] example cycle: {}", path.join(" -> "));
+                eprintln!(
+                    "[ontology] a cycle in a subsumption relation is a data defect: it would \
+                     make every roll-up over it wrong, so the build refuses rather than \
+                     condensing it. Exclude these terms or report them upstream."
+                );
+            }
+            std::process::exit(1);
+        }
         Err(e) => {
             eprintln!("[ontology] index build failed: {e}");
             std::process::exit(1);
