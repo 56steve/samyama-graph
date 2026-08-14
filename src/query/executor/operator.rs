@@ -453,7 +453,19 @@ fn exists_node_matches(
         return false;
     }
     if let Some(props) = &pat.properties {
-        if !props.iter().all(|(k, v)| node.properties.get(k).map_or(false, |pv| pv == v)) {
+        // Columnar store first, sparse map as fallback. Reading only `node.properties`
+        // made every inline constraint inside EXISTS { } fail on a columnar graph — and
+        // after a snapshot import that map is *always* empty (ADR-021), so EXISTS matched
+        // nothing at all on imported data while the equivalent WHERE inside the subquery
+        // worked (#346).
+        let idx = id.as_u64() as usize;
+        let matches_all = props.iter().all(|(k, v)| {
+            match store.node_columns.get_property(idx, k) {
+                PropertyValue::Null => node.properties.get(k).is_some_and(|pv| pv == v),
+                col => &col == v,
+            }
+        });
+        if !matches_all {
             return false;
         }
     }

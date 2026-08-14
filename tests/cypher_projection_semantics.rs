@@ -543,7 +543,6 @@ fn order_by_a_repeated_aggregate_expression_sorts_like_its_alias() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "blocked on #346: inline property maps inside EXISTS { } never match"]
 fn exists_subquery_applies_inline_property_constraints() {
     let s = fixture();
     assert_eq!(
