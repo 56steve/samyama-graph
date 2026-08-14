@@ -346,8 +346,55 @@ impl QueryPlanner {
         &self,
         rewrite: super::hierarchy_detector::HierarchyRewrite,
     ) -> ExecutionPlan {
-        use super::hierarchy_detector::HierarchyRewrite;
+        use super::hierarchy_detector::{HierarchyRewrite, OrderTestOutput};
         match rewrite {
+            HierarchyRewrite::OrderTest {
+                index_name,
+                root,
+                var,
+                labels,
+                negated,
+                output,
+            } => {
+                // Scan the tested side once and filter it with an O(1) interval check,
+                // instead of evaluating `subsumes()` as a generic expression per row.
+                let scan: OperatorBox = Box::new(NodeScanOperator::new(var.clone(), labels));
+                let filtered: OperatorBox =
+                    Box::new(super::hierarchy_ops::HierarchyOrderTestOperator::new(
+                        scan,
+                        index_name,
+                        var.clone(),
+                        root,
+                        negated,
+                    ));
+                match output {
+                    OrderTestOutput::Count(alias) => ExecutionPlan {
+                        root: Box::new(AggregateOperator::new(
+                            filtered,
+                            Vec::new(),
+                            vec![AggregateFunction {
+                                func: AggregateType::Count,
+                                expr: Expression::Variable(var),
+                                alias: alias.clone(),
+                                distinct: false,
+                            }],
+                        )),
+                        output_columns: vec![alias],
+                        is_write: false,
+                        candidates_evaluated: 1,
+                        chosen_plan_cost: super::cost_model::HIERARCHY_DESCENDANT_SCAN_COST,
+                        candidate_costs: Vec::new(),
+                    },
+                    OrderTestOutput::Nodes => ExecutionPlan {
+                        root: filtered,
+                        output_columns: vec![var],
+                        is_write: false,
+                        candidates_evaluated: 1,
+                        chosen_plan_cost: super::cost_model::HIERARCHY_DESCENDANT_SCAN_COST,
+                        candidate_costs: Vec::new(),
+                    },
+                }
+            }
             HierarchyRewrite::Rollup {
                 index_name,
                 root,

@@ -105,7 +105,13 @@ fn create_accepts_several_covering_edge_types() {
     assert_eq!(cell_int(&result, 0, "edges"), 2);
     let entry = store.hierarchy_index.get("onto").unwrap();
     assert_eq!(
-        entry.read().unwrap().index.as_ref().unwrap().subsumes_ids(b, root),
+        entry
+            .read()
+            .unwrap()
+            .index
+            .as_ref()
+            .unwrap()
+            .subsumes_ids(b, root),
         Some(true),
         "subsumption must compose across both covering edge types"
     );
@@ -204,7 +210,9 @@ fn declining_a_high_width_dag_is_a_row_not_an_error() {
     for i in 0..400usize {
         let leaf = store.create_node("Term");
         store.create_edge(leaf, roots[i % 3], "PART_OF").unwrap();
-        store.create_edge(leaf, roots[(i + 1) % 3], "PART_OF").unwrap();
+        store
+            .create_edge(leaf, roots[(i + 1) % 3], "PART_OF")
+            .unwrap();
     }
     let engine = QueryEngine::new();
     let result = engine
@@ -216,8 +224,14 @@ fn declining_a_high_width_dag_is_a_row_not_an_error() {
         .unwrap();
     assert_eq!(cell_str(&result, 0, "encoding"), "declined");
     let status = cell_str(&result, 0, "status");
-    assert!(status.contains("2-hop"), "diagnostic must name the alternative: {status}");
-    assert!(store.hierarchy_index.usable_for_edge_type(&EdgeType::new("PART_OF")).is_none());
+    assert!(
+        status.contains("2-hop"),
+        "diagnostic must name the alternative: {status}"
+    );
+    assert!(store
+        .hierarchy_index
+        .usable_for_edge_type(&EdgeType::new("PART_OF"))
+        .is_none());
 }
 
 #[test]
@@ -351,7 +365,11 @@ fn hierarchy_rollup_function_matches_the_engine_aggregation() {
             &store,
         )
         .unwrap();
-    assert_eq!(cell_int(&count, 0, "c"), 4, "the class itself plus three drugs");
+    assert_eq!(
+        cell_int(&count, 0, "c"),
+        4,
+        "the class itself plus three drugs"
+    );
 }
 
 #[test]
@@ -441,7 +459,10 @@ fn a_reflexive_subtree_aggregate_plans_as_hierarchy_rollup() {
         !plan.contains("Expand"),
         "no expansion should survive the rewrite: {plan}"
     );
-    assert!(plan.contains("atc"), "the plan must name the index it used: {plan}");
+    assert!(
+        plan.contains("atc"),
+        "the plan must name the index it used: {plan}"
+    );
 }
 
 #[test]
@@ -488,7 +509,11 @@ fn count_over_a_subtree_plans_as_a_rollup_and_counts_the_root() {
             &store,
         )
         .unwrap();
-    assert_eq!(cell_int(&result, 0, "n"), 4, "three drugs plus the class itself");
+    assert_eq!(
+        cell_int(&result, 0, "n"),
+        4,
+        "three drugs plus the class itself"
+    );
 }
 
 #[test]
@@ -506,7 +531,11 @@ fn returning_the_descendants_plans_as_a_descendant_scan() {
             &store,
         )
         .unwrap();
-    assert_eq!(result.records.len(), 13, "everything, root included, exactly once");
+    assert_eq!(
+        result.records.len(),
+        13,
+        "everything, root included, exactly once"
+    );
 }
 
 #[test]
@@ -534,4 +563,129 @@ fn a_query_without_a_hierarchy_index_plans_unchanged() {
         &store,
     );
     assert!(!plan.contains("Hierarchy"), "{plan}");
+}
+
+// ---------------------------------------------------------------------------
+// Order-test rewrite (ADR-035 §8 rewrite 1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_subsumption_predicate_plans_as_hierarchy_order_test() {
+    let store = atc_store_with_index();
+    let plan = plan_description(
+        "MATCH (d:Drug), (r:Class {code: \"C0\"}) WHERE subsumes(d, r) RETURN count(d) AS n",
+        &store,
+    );
+    assert!(
+        plan.contains("HierarchyOrderTest"),
+        "the predicate must become an O(1) interval test, not a per-row function call: {plan}"
+    );
+    assert!(
+        !plan.contains("CartesianProduct"),
+        "the pinned root should be resolved at plan time, not joined per row: {plan}"
+    );
+}
+
+#[test]
+fn the_order_test_rewrite_preserves_the_answer() {
+    // Same question, three spellings: the rewrite, the traversal, and the function form
+    // with an extra predicate that blocks the rewrite. All must agree.
+    let store = atc_store_with_index();
+    let engine = QueryEngine::new();
+
+    let rewritten = engine
+        .execute(
+            "MATCH (d:Drug), (r:Class {code: \"C0\"}) WHERE subsumes(d, r) RETURN count(d) AS n",
+            &store,
+        )
+        .unwrap();
+    assert_eq!(cell_int(&rewritten, 0, "n"), 3, "three drugs under C0");
+
+    let traversed = engine
+        .execute(
+            "MATCH (d:Drug)-[:IS_A*0..]->(r:Class {code: \"C0\"}) RETURN count(d) AS n",
+            &store,
+        )
+        .unwrap();
+    assert_eq!(cell_int(&traversed, 0, "n"), 3);
+}
+
+#[test]
+fn a_negated_subsumption_predicate_also_rewrites() {
+    let store = atc_store_with_index();
+    let engine = QueryEngine::new();
+    let plan = plan_description(
+        "MATCH (d:Drug), (r:Class {code: \"C0\"}) WHERE NOT subsumes(d, r) RETURN count(d) AS n",
+        &store,
+    );
+    assert!(plan.contains("HierarchyOrderTest"), "{plan}");
+    let result = engine
+        .execute(
+            "MATCH (d:Drug), (r:Class {code: \"C0\"}) WHERE NOT subsumes(d, r) RETURN count(d) AS n",
+            &store,
+        )
+        .unwrap();
+    assert_eq!(
+        cell_int(&result, 0, "n"),
+        6,
+        "nine drugs total, three under C0"
+    );
+}
+
+#[test]
+fn the_order_test_rewrite_can_return_the_rows_themselves() {
+    let store = atc_store_with_index();
+    let engine = QueryEngine::new();
+    let plan = plan_description(
+        "MATCH (d:Drug), (r:Class {code: \"C0\"}) WHERE subsumes(d, r) RETURN d",
+        &store,
+    );
+    assert!(plan.contains("HierarchyOrderTest"), "{plan}");
+    let result = engine
+        .execute(
+            "MATCH (d:Drug), (r:Class {code: \"C0\"}) WHERE subsumes(d, r) RETURN d",
+            &store,
+        )
+        .unwrap();
+    assert_eq!(result.records.len(), 3);
+}
+
+#[test]
+fn the_order_test_rewrite_declines_shapes_it_cannot_answer() {
+    let store = atc_store_with_index();
+    // An extra predicate: the rewrite emits no filter, so it must not claim this query.
+    let extra_predicate = plan_description(
+        "MATCH (d:Drug), (r:Class {code: \"C0\"}) WHERE subsumes(d, r) AND d.units > 1 RETURN count(d) AS n",
+        &store,
+    );
+    assert!(
+        !extra_predicate.contains("HierarchyOrderTest"),
+        "{extra_predicate}"
+    );
+
+    // An ambiguous pin resolves to more than one node.
+    let mut ambiguous = atc_store_with_index();
+    let dup = ambiguous.create_node("Class");
+    ambiguous.set_column_property(dup, "code", PropertyValue::String("C0".into()));
+    let plan = plan_description(
+        "MATCH (d:Drug), (r:Class {code: \"C0\"}) WHERE subsumes(d, r) RETURN count(d) AS n",
+        &ambiguous,
+    );
+    assert!(!plan.contains("HierarchyOrderTest"), "{plan}");
+}
+
+#[test]
+fn a_stale_index_does_not_get_the_order_test_rewrite() {
+    let mut store = atc_store_with_index();
+    let root = store.node_ids_by_label(&samyama::graph::Label::new("Class"), Some(1))[0];
+    let extra = store.create_node("Drug");
+    store.create_edge(extra, root, "IS_A").unwrap();
+    let plan = plan_description(
+        "MATCH (d:Drug), (r:Class {code: \"C0\"}) WHERE subsumes(d, r) RETURN count(d) AS n",
+        &store,
+    );
+    assert!(
+        !plan.contains("HierarchyOrderTest"),
+        "a stale index must not answer: {plan}"
+    );
 }
