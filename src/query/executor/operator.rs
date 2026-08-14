@@ -5693,6 +5693,82 @@ impl PhysicalOperator for DropIndexOperator {
     }
 }
 
+/// `RETURN DISTINCT` — deduplicate whole result rows.
+///
+/// Sits above the projection, so it sees exactly the columns the user asked for and
+/// deduplicates on the tuple of those values. Deduplicating anywhere lower would be wrong:
+/// two rows that differ only in a column that is not projected are the *same* row as far
+/// as `DISTINCT` is concerned.
+///
+/// Streaming rather than materializing: a row is emitted the first time its key is seen
+/// and dropped thereafter, so `DISTINCT ... LIMIT k` stops as soon as `k` distinct rows
+/// exist instead of building the whole result first.
+///
+/// Null is a value here. openCypher deduplicates `NULL` against `NULL` even though
+/// `NULL = NULL` is unknown in a predicate — `DISTINCT` uses equivalence, not equality —
+/// and [`Value`]'s `Eq`/`Hash` already implement that, along with comparing nodes and
+/// edges by identity so a materialized `Node` and a lazy `NodeRef` for the same node
+/// deduplicate against each other.
+pub struct DistinctOperator {
+    input: OperatorBox,
+    seen: HashSet<Vec<(String, Value)>>,
+}
+
+impl DistinctOperator {
+    /// Wrap `input`, emitting each distinct row once.
+    pub fn new(input: OperatorBox) -> Self {
+        Self {
+            input,
+            seen: HashSet::new(),
+        }
+    }
+
+    /// The deduplication key: every binding, ordered by column name so that two records
+    /// that bound the same columns in a different order still collide.
+    fn key(record: &Record) -> Vec<(String, Value)> {
+        let mut key: Vec<(String, Value)> = record
+            .bindings()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        key.sort_by(|a, b| a.0.cmp(&b.0));
+        key
+    }
+}
+
+impl PhysicalOperator for DistinctOperator {
+    fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
+        while let Some(record) = self.input.next(store)? {
+            if self.seen.insert(Self::key(&record)) {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
+    fn next_mut(&mut self, store: &mut GraphStore, tenant_id: &str) -> ExecutionResult<Option<Record>> {
+        while let Some(record) = self.input.next_mut(store, tenant_id)? {
+            if self.seen.insert(Self::key(&record)) {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
+    fn reset(&mut self) {
+        self.seen.clear();
+        self.input.reset();
+    }
+
+    fn describe(&self) -> OperatorDescription {
+        OperatorDescription {
+            name: "Distinct".to_string(),
+            details: String::new(),
+            children: vec![self.input.describe()],
+        }
+    }
+}
+
 /// Show indexes operator: SHOW INDEXES
 pub struct ShowIndexesOperator {
     results: Option<std::vec::IntoIter<Record>>,
