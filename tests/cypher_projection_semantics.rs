@@ -439,7 +439,6 @@ fn sum_and_max_ignore_nulls() {
 }
 
 #[test]
-#[ignore = "blocked on #357: min() returns NULL when any row is null"]
 fn min_ignores_nulls() {
     let s = fixture();
     assert_eq!(
@@ -481,7 +480,9 @@ fn order_by_a_property_expression_sorts() {
         &s,
         "MATCH (p:Person) RETURN p.name AS n, p.salary AS v ORDER BY p.salary DESC",
     );
-    assert_eq!(r[0], "n=Carol v=300", "highest salary first: {r:?}");
+    // openCypher orders NULL as the greatest value, so DESC leads with it (#369).
+    assert_eq!(r[0], "n=Frank v=NULL", "nulls first on DESC: {r:?}");
+    assert_eq!(r[1], "n=Carol v=300", "then the highest salary: {r:?}");
 }
 
 #[test]
@@ -491,12 +492,9 @@ fn order_by_a_projected_alias_sorts() {
         &s,
         "MATCH (p:Person) RETURN p.name AS n, p.salary AS v ORDER BY v DESC",
     );
-    assert_eq!(r[0], "n=Carol v=300", "highest salary first: {r:?}");
-    assert_eq!(
-        r[r.len() - 1],
-        "n=Frank v=NULL",
-        "nulls sort last on DESC: {r:?}"
-    );
+    assert_eq!(r[0], "n=Frank v=NULL", "nulls first on DESC (#369): {r:?}");
+    assert_eq!(r[1], "n=Carol v=300", "then the highest salary: {r:?}");
+    assert_eq!(r[r.len() - 1], "n=Alice v=100", "lowest last: {r:?}");
 }
 
 #[test]
@@ -512,12 +510,19 @@ fn order_by_an_aggregate_alias_sorts_groups() {
 #[test]
 fn order_by_with_limit_returns_the_true_top_k() {
     let s = fixture();
-    // salaries: Carol 300, Eve 250, Bob 200, Dave 150, Alice 100, Frank NULL
+    // DESC order is NULL, 300, 250, 200, 150, 100 — null is the greatest value (#369),
+    // so the true top 2 includes it. Surprising, but it is what openCypher specifies.
     let r = rows(
         &s,
         "MATCH (p:Person) RETURN p.name AS n, p.salary AS v ORDER BY v DESC LIMIT 2",
     );
-    assert_eq!(r, vec!["n=Carol v=300", "n=Eve v=250"], "{r:?}");
+    assert_eq!(r, vec!["n=Frank v=NULL", "n=Carol v=300"], "{r:?}");
+    // ASC has no such wrinkle: the smallest real value leads.
+    let asc = rows(
+        &s,
+        "MATCH (p:Person) RETURN p.name AS n, p.salary AS v ORDER BY v ASC LIMIT 2",
+    );
+    assert_eq!(asc, vec!["n=Alice v=100", "n=Dave v=150"], "{asc:?}");
 }
 
 #[test]
@@ -657,7 +662,6 @@ fn order_by_with_limit_on_a_grouped_aggregate_returns_the_true_top_k() {
 }
 
 #[test]
-#[ignore = "blocked on #369: NULL sorts as the smallest value, openCypher treats it as the largest"]
 fn null_ordering_follows_opencypher() {
     // openCypher orders NULL as greater than every value, so it lands last on ASC and
     // first on DESC. The engine currently does the opposite.

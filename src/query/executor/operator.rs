@@ -3715,8 +3715,16 @@ impl AggregatorState {
                     else if let Some(i) = prop.as_integer() { *sum += i as f64; *count += 1; }
                 }
             }
+            // Aggregates ignore nulls — Cypher's rule, and the reason min/max must SKIP a
+            // null input rather than compare it. Comparing is what broke both, in opposite
+            // directions: while null sorted smallest it won every min(), and once ordering
+            // was corrected so null sorts greatest (#369) it would have won every max().
+            // Neither is a comparator problem; the accumulator simply must not see nulls.
             AggregatorState::Min(curr) => {
                 if let Some(prop) = value.as_property() {
+                    if matches!(prop, PropertyValue::Null) {
+                        return;
+                    }
                     if curr.is_none() || prop < curr.as_ref().unwrap() {
                         *curr = Some(prop.clone());
                     }
@@ -3724,6 +3732,9 @@ impl AggregatorState {
             }
             AggregatorState::Max(curr) => {
                 if let Some(prop) = value.as_property() {
+                    if matches!(prop, PropertyValue::Null) {
+                        return;
+                    }
                     if curr.is_none() || prop > curr.as_ref().unwrap() {
                         *curr = Some(prop.clone());
                     }
