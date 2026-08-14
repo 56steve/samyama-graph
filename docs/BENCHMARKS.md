@@ -22,15 +22,19 @@ composition gap.
 
 | Class | n | Speedup | Class | n | Speedup |
 |---|---:|---:|---|---:|---:|
-| H1 order test | 15 | 0.2× | H6 anti-subsumption | 10 | 0.2× |
-| H2 single roll-up | 24 | **7990×** | H7 lowest common ancestor | 10 | 1.6× |
-| H3 level roll-up | 9 | 3.7× | H8 top-k over roll-up | 8 | 4.5× |
-| H4 cross-hierarchy | 12 | 1.1× | H10 temporal windows | 10 | 94.5× |
-| H5 hierarchy × traversal | 10 | 3.1× | **All** | **108** | **2.1×** |
+| H1 order test | 15 | 1.1× | H6 anti-subsumption | 10 | 0.3× |
+| H2 single roll-up | 24 | **8596×** | H7 lowest common ancestor | 10 | 1.7× |
+| H3 level roll-up | 9 | 5.9× | H8 top-k over roll-up | 8 | 5.3× |
+| H4 cross-hierarchy | 12 | 1.1× | H10 temporal windows | 10 | 108.5× |
+| H5 hierarchy × traversal | 10 | **27.4×** | **All** | **108** | **3.0×** |
+
+Against **Neo4j** on an identical graph: H2 **1124×**, H10 144×, H3 88×, H1 9.1×, H5 8.2× —
+**94× across the 58 queries expressible on both engines**, with no class losing. Without the
+index Samyama is 1.6× *slower* than Neo4j on the same set, so the index is the
+differentiator rather than the engine.
 
 Roll-up latency is flat in subtree size — 16.0 ns at 1 node, 16.6 ns at 137,257 — which is
-what makes H2 and H10 win by orders of magnitude. H1 and H6 are *slower* because the
-order-test planner rewrite is not yet implemented; see
+what makes H2 and H10 win by orders of magnitude. See
 [`benchmarks/hier/README.md`](../benchmarks/hier/README.md) for the full accounting,
 including the engine gaps the corpus surfaced.
 

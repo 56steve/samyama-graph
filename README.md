@@ -379,8 +379,10 @@ optimization, and micro/MVCC suites are self-contained; LDBC needs a data downlo
 hierarchical roll-up over time, geography and ontology — the workload the LDBC and FinBench
 suites do not contain. Every query is checked against an unindexed run of the same
 question, so a speedup is only reported alongside an identical answer. Latest: **108/108
-agree**; roll-up is flat at 15–20 ns from a 1-node subtree to a 137,257-node one, and the
-write-up records the two classes that are *slower* and why.
+agree**; roll-up is flat at 15–20 ns from a 1-node subtree to a 137,257-node one. Against
+Neo4j on an identical graph it is **94× faster across the 58 queries expressible on both**,
+with no class losing — though without the index Samyama is 1.6× *slower* than Neo4j, so the
+index is the differentiator rather than the engine.
 
 ### Scale: 74M Nodes, 1 Billion Edges
 

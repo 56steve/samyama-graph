@@ -57,16 +57,20 @@ Where the baseline is not simply the same query with the index off, it is one of
 
 | Class | n | Agree | Indexed (ms) | Baseline (ms) | Speedup |
 |---|---:|---:|---:|---:|---:|
-| H1 order test | 15 | 15/15 | 4.347 | 1.004 | **0.2×** |
-| H2 single roll-up | 24 | 24/24 | 0.003 | 25.025 | **7990×** |
-| H3 level roll-up | 9 | 9/9 | 1.146 | 4.253 | 3.7× |
-| H4 cross-hierarchy conjunction | 12 | 12/12 | 21.264 | 22.934 | 1.1× |
-| H5 hierarchy × traversal | 10 | 10/10 | 5.679 | 17.395 | 3.1× |
-| H6 anti-subsumption | 10 | 10/10 | 15.359 | 2.960 | **0.2×** |
-| H7 lowest common ancestor | 10 | 10/10 | 7.488 | 11.892 | 1.6× |
-| H8 top-k over roll-up | 8 | 8/8 | 0.843 | 3.762 | 4.5× |
-| H10 temporal roll-up windows | 10 | 10/10 | 0.025 | 2.363 | 94.5× |
-| **All** | **108** | **108/108** | 5.769 | 12.086 | 2.1× |
+| H1 order test | 15 | 15/15 | 0.759 | 0.868 | 1.1× |
+| H2 single roll-up | 24 | 24/24 | 0.003 | 22.132 | **8596×** |
+| H3 level roll-up | 9 | 9/9 | 0.670 | 3.974 | 5.9× |
+| H4 cross-hierarchy conjunction | 12 | 12/12 | 19.406 | 22.166 | 1.1× |
+| H5 hierarchy × traversal | 10 | 10/10 | 0.562 | 15.390 | **27.4×** |
+| H6 anti-subsumption | 10 | 10/10 | 6.664 | 1.896 | 0.3× |
+| H7 lowest common ancestor | 10 | 10/10 | 5.079 | 8.425 | 1.7× |
+| H8 top-k over roll-up | 8 | 8/8 | 0.630 | 3.330 | 5.3× |
+| H10 temporal roll-up windows | 10 | 10/10 | 0.017 | 1.873 | 108.5× |
+| **All** | **108** | **108/108** | 3.506 | 10.634 | 3.0× |
+
+**Against Neo4j** on an identical graph (`samyama-graph-competitor-benchmarks/benchmarks/hier/`):
+H2 **1124×**, H10 **144×**, H3 **88×**, H1 **9.1×**, H5 **8.2×** — 94× across the 58 queries
+expressible on both engines. No class loses.
 
 Index sizes and build cost:
 
@@ -96,21 +100,21 @@ magnitude while the engine aggregation pays O(subtree) every time.
 
 Reporting only H2 would be dishonest. Two classes are **slower** with the index:
 
-**H1 (order test) and H6 (anti-subsumption), 0.2×.** Two causes, both real (tracked in #349):
+**H6 (anti-subsumption), 0.3×.** Two causes, both real:
 
-1. The planner rewrite that turns a subsumption test into a `HierarchyOrderTest` over a
-   scan — rewrite 1 in ADR-035 §8 — **is specified but not implemented**. Only the
+1. Half of H6 is a set difference — `subsumes(d, r) AND NOT subsumes(d, s)` — which needs
+   two predicates and so takes the standard plan. The single-predicate half was fixed by
+   #375 and H6 improved from 15.4 ms to 6.7 ms, but the class average is still dragged by
+   the difference queries. Only the
    roll-up and descendant-scan rewrites ship. So these queries run the `subsumes()`
    function form, which binds the root with a cartesian product and then pays a
    per-row index lookup: ~500 ns/row against ~120 ns/row for a native predicate.
 2. The prefix baseline is unusually strong *because of how this dataset is built*. Real
    ontologies do not encode ancestry in the identifier, so "code starts with X" is not
-   available on GeneOntology or GeoNames — it is available here only because the generator
-   makes codes paths. Treat H1/H6 as a comparison against an artificially good baseline,
-   and the traversal-baseline rows as the fair ones: `H1-08` (calendar quarter, code is not
-   a prefix) is **1.6×** and `H1-12` (DAG axis) is **1.03×**.
+   available on Gene Ontology or GeoNames — it is available here only because the generator
+   makes codes paths. Against Neo4j, which has no such shortcut, H1 is **9.1×**.
 
-**H4 (cross-hierarchy conjunction), 1.1×.** At this scale the 5,000-row fact scan dominates
+**H4 (cross-hierarchy conjunction), 1.1×** — the remaining half of #350. At this scale the 5,000-row fact scan dominates
 both plans, so a three-axis conjunction costs about the same either way. The result worth
 reporting for H4 is not speed but *expressibility*: one query ranges over ontology, time
 and geography with three O(1) predicates, which no per-silo hierarchy index answers at all.
