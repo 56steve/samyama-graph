@@ -187,13 +187,22 @@ fn main() {
     );
 
     // ---- the workload ------------------------------------------------------
-    // Real MeSH roots: A anatomy, C diseases, D chemicals, E techniques, G phenomena.
-    // Subtree sizes span three orders of magnitude, which is the point.
+    // Two questions, deliberately different in what they touch.
+    //
+    // TERM-LEVEL is a pure roll-up over the ontology: "how many MeSH terms sit under C?".
+    // It is answered from the index and never reads the fact table, so its cost is
+    // independent of how many articles exist — that is the property being demonstrated.
+    //
+    // ARTICLE-LEVEL is the question a literature search actually asks: "how many articles
+    // are annotated with anything under Cardiovascular Diseases?". It has to reach the fact
+    // table, so it is the one that scales with corpus size, and it is what the mega-
+    // federation cannot ask today because its MeSHTerm nodes are flat.
     let roots = ["C", "C14", "C04", "C01", "D", "A", "E01", "C14.280", "G", "B"];
     println!();
+    println!("TERM-LEVEL roll-up (index-resident; independent of corpus size)");
     println!("{:<10} {:>9} {:>12} {:>14} {:>10}", "subtree", "terms", "indexed ms", "traversal ms", "speedup");
     println!("{}", "-".repeat(60));
-    let mut rows = Vec::new();
+    let mut disagreements = 0usize;
     for root in roots {
         let indexed = format!(
             "MATCH (t:MeshTree {{code: \"{root}\"}}) RETURN hierarchy_rollup(t, \"count\") AS n"
@@ -207,22 +216,41 @@ fn main() {
         );
         let (ims, iv) = timed(&engine, &store, &indexed, reps);
         let (tms, tv) = timed(&engine, &store, &traversal, reps);
-        let agree = iv == tv;
+        if iv != tv { disagreements += 1; }
         println!(
             "{root:<10} {:>9} {ims:>12.4} {tms:>14.4} {:>9.1}x{}",
-            iv,
-            if ims > 0.0 { tms / ims } else { 0.0 },
-            if agree { "" } else { "  <-- DISAGREE" }
+            iv, if ims > 0.0 { tms / ims } else { 0.0 },
+            if iv == tv { "" } else { "  <-- DISAGREE" }
         );
-        rows.push((root.to_string(), iv, ims, tms, agree));
     }
-    let disagreements = rows.iter().filter(|r| !r.4).count();
-    println!("{}", "-".repeat(60));
-    println!(
-        "{} subtrees, {} disagreements",
-        rows.len(),
-        disagreements
-    );
+
+    println!();
+    println!("ARTICLE-LEVEL count (reaches the fact table; scales with corpus size)");
+    println!("{:<10} {:>11} {:>12} {:>14} {:>10}", "subtree", "articles", "indexed ms", "fact-scan ms", "speedup");
+    println!("{}", "-".repeat(62));
+    for root in ["C", "C14", "C01", "D", "C14.280"] {
+        // Driven plan: enumerate the subtree from the index, walk ANNOTATED_WITH backwards.
+        let indexed = format!(
+            "MATCH (a:Article)-[:ANNOTATED_WITH]->(t), (r:MeshTree {{code: \"{root}\"}}) \
+             WHERE subsumes(t, r) RETURN count(a) AS n"
+        );
+        // What the same question costs without a hierarchy index: expand every article's
+        // annotation up the tree until it either reaches the root or runs out.
+        let scan = format!(
+            "MATCH (a:Article)-[:ANNOTATED_WITH]->(t:MeshTree)-[:IS_A*0..]->(r:MeshTree {{code: \"{root}\"}}) \
+             RETURN count(a) AS n"
+        );
+        let (ims, iv) = timed(&engine, &store, &indexed, reps);
+        let (sms, sv) = timed(&engine, &store, &scan, reps);
+        if iv != sv { disagreements += 1; }
+        println!(
+            "{root:<10} {:>11} {ims:>12.4} {sms:>14.4} {:>9.1}x{}",
+            iv, if ims > 0.0 { sms / ims } else { 0.0 },
+            if iv == sv { "" } else { "  <-- DISAGREE" }
+        );
+    }
+    println!("{}", "-".repeat(62));
+    println!("{} disagreements", disagreements);
     if disagreements > 0 {
         std::process::exit(1);
     }
