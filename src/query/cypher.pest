@@ -122,7 +122,11 @@ order_item = { expression ~ order_direction? }
 order_direction = { ^"ASC" | ^"DESC" }
 
 // Expressions
-expression = { term ~ (binary_op ~ term)* }
+// `NOT` is an expression-level prefix, not part of `term`. Inside `term` it bound to a
+// single primary, so `NOT a STARTS WITH b` parsed as `(NOT a) STARTS WITH b` — tighter than
+// any comparison, which is the opposite of openCypher. Emitting it here lets the Pratt
+// parser give it a precedence between AND and the comparison operators.
+expression = { not_op* ~ term ~ (binary_op ~ not_op* ~ term)* }
 term = { unary_op* ~ primary ~ postfix_op? ~ index_op? }
 postfix_op = { ^"IS" ~ ^"NOT" ~ ^"NULL" | ^"IS" ~ ^"NULL" }
 index_op = { "[" ~ (slice_op | expression) ~ "]" }
@@ -187,7 +191,8 @@ or_op = @{ ^"OR" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 binary_op = _{ mul_div_mod_op | add_sub_op | comparison_op | in_op | and_op | or_op }
 
-unary_op = { ^"NOT" | "-" }
+unary_op = { "-" }
+not_op = @{ ^"NOT" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 // Values
 value = {

@@ -74,6 +74,9 @@ static PRATT_PARSER: LazyLock<PrattParser<Rule>> = LazyLock::new(|| {
     PrattParser::new()
         .op(Op::infix(Rule::or_op, Assoc::Left))
         .op(Op::infix(Rule::and_op, Assoc::Left))
+        // NOT sits between AND and the comparisons: `NOT a STARTS WITH b` negates the
+        // comparison, while `NOT a AND b` still groups as `(NOT a) AND b`.
+        .op(Op::prefix(Rule::not_op))
         .op(Op::infix(Rule::in_op, Assoc::Left) | Op::infix(Rule::comparison_op, Assoc::Left))
         .op(Op::infix(Rule::add_sub_op, Assoc::Left))
         .op(Op::infix(Rule::mul_div_mod_op, Assoc::Left))
@@ -1367,6 +1370,15 @@ fn parse_order_item(pair: pest::iterators::Pair<Rule>) -> ParseResult<OrderByIte
 fn parse_expression(pair: pest::iterators::Pair<Rule>) -> ParseResult<Expression> {
     PRATT_PARSER
         .map_primary(|primary| parse_term(primary))
+        .map_prefix(|op, rhs| match op.as_rule() {
+            Rule::not_op => Ok(Expression::Unary {
+                op: UnaryOp::Not,
+                expr: Box::new(rhs?),
+            }),
+            other => Err(ParseError::SemanticError(format!(
+                "Unexpected prefix operator: {other:?}"
+            ))),
+        })
         .map_infix(|left, op, right| {
             let left = left?;
             let right = right?;
