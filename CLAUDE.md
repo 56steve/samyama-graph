@@ -30,6 +30,7 @@ cargo bench --bench graph_optimization_benchmark # Metaheuristic optimization so
 cargo bench --bench ldbc_benchmark             # LDBC SNB Interactive queries (needs data)
 cargo bench --bench ldbc_bi_benchmark          # LDBC SNB BI queries (needs data)
 cargo bench --bench finbench_benchmark         # LDBC FinBench queries (synthetic data)
+cargo bench --bench hierarchy_benchmark        # OEH index: build, order test, roll-up vs subtree size
 
 # Run examples
 cargo run --example banking_demo              # Banking fraud detection + NLQ
@@ -47,6 +48,8 @@ cargo run --release --example cricket_loader  # Load 21K Cricsheet matches
 cargo run --release --example aact_loader     # Load AACT clinical trials dataset
 cargo run --release --example imdb_loader     # Load IMDB movies/persons KG (needs --data-dir)
 cargo run --release --example football_loader # Load Football KG (needs --data-dir)
+cargo run --release --example hier_benchmark   # HIER corpus: 112 hierarchy queries, index on vs off
+cargo run --release --example ontology_loader -- --format taxdump --path nodes.dmp  # real ontologies
 
 # Start RESP server
 cargo run                      # RESP on 127.0.0.1:6379, HTTP on :8080

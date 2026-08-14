@@ -834,9 +834,136 @@ pub fn eval_predicate_standalone(predicate: &Expression, record: &Record, store:
     evaluator.evaluate_predicate(record, store)
 }
 
+/// Extract a node id from an evaluated value, whether it arrived materialized or as a
+/// late-materialization reference (ADR-012).
+fn value_node_id(v: &Value) -> Option<NodeId> {
+    match v {
+        Value::Node(id, _) => Some(*id),
+        Value::NodeRef(id) => Some(*id),
+        _ => None,
+    }
+}
+
 /// Shared function evaluation for scalar functions (not aggregates)
 pub fn eval_function(name: &str, args: &[Value], store: Option<&GraphStore>) -> ExecutionResult<Value> {
     match name.to_lowercase().as_str() {
+        // Hierarchy functions (ADR-035) — the direct surface for what the planner
+        // rewrites cannot reach: an order test inside an arbitrary predicate, or a
+        // roll-up in the middle of a larger projection.
+        //
+        //   subsumes(x, y)                  -- is x under y?
+        //   subsumes(x, y, 'idx')           -- ...using a named hierarchy
+        //   hierarchy_rollup(root, 'sum')   -- index-resident fold under root
+        //   hierarchy_rollup(root, 'sum', 'idx')
+        "subsumes" => {
+            let store = store.ok_or_else(|| ExecutionError::RuntimeError(
+                "subsumes() requires graph context".to_string()))?;
+            if args.len() < 2 {
+                return Err(ExecutionError::RuntimeError(
+                    "subsumes(child, ancestor[, index]) takes 2 or 3 arguments".to_string()));
+            }
+            let x = value_node_id(&args[0]).ok_or_else(|| ExecutionError::RuntimeError(
+                "subsumes(): first argument must be a node".to_string()))?;
+            let y = value_node_id(&args[1]).ok_or_else(|| ExecutionError::RuntimeError(
+                "subsumes(): second argument must be a node".to_string()))?;
+            let entry = match args.get(2) {
+                Some(v) => {
+                    let n = extract_string(v)?;
+                    store.hierarchy_index.usable_named(&n).ok_or_else(|| {
+                        ExecutionError::RuntimeError(format!(
+                            "subsumes(): no usable hierarchy index named '{n}'                              (it may be stale — REBUILD it — or declined)"))
+                    })?
+                }
+                None => match store.hierarchy_index.usable_containing(&[x, y]) {
+                    Some(e) => e,
+                    // Both nodes outside every hierarchy: they are not in a subsumption
+                    // relation anyone declared, which is FALSE rather than an error.
+                    None => return Ok(Value::Property(PropertyValue::Boolean(false))),
+                },
+            };
+            let guard = entry.read().unwrap();
+            let answer = guard
+                .index
+                .as_ref()
+                .and_then(|i| i.subsumes_ids(x, y))
+                .unwrap_or(false);
+            Ok(Value::Property(PropertyValue::Boolean(answer)))
+        }
+        "hierarchy_rollup" => {
+            let store = store.ok_or_else(|| ExecutionError::RuntimeError(
+                "hierarchy_rollup() requires graph context".to_string()))?;
+            if args.len() < 2 {
+                return Err(ExecutionError::RuntimeError(
+                    "hierarchy_rollup(root, op[, index]) takes 2 or 3 arguments".to_string()));
+            }
+            let root = value_node_id(&args[0]).ok_or_else(|| ExecutionError::RuntimeError(
+                "hierarchy_rollup(): first argument must be a node".to_string()))?;
+            let op_name = extract_string(&args[1])?;
+            let op = crate::index::hierarchy::RollupOp::parse(&op_name).ok_or_else(|| {
+                ExecutionError::RuntimeError(format!(
+                    "hierarchy_rollup(): unsupported aggregate '{op_name}': expected sum, count, min or max"))
+            })?;
+            let entry = match args.get(2) {
+                Some(v) => {
+                    let n = extract_string(v)?;
+                    store.hierarchy_index.usable_named(&n).ok_or_else(|| {
+                        ExecutionError::RuntimeError(format!(
+                            "hierarchy_rollup(): no usable hierarchy index named '{n}'"))
+                    })?
+                }
+                None => match store.hierarchy_index.usable_containing(&[root]) {
+                    Some(e) => e,
+                    None => return Ok(Value::Property(PropertyValue::Null)),
+                },
+            };
+            let guard = entry.read().unwrap();
+            let value = guard
+                .index
+                .as_ref()
+                .and_then(|i| i.rollup_id(root, op))
+                .unwrap_or(crate::index::hierarchy::RollupValue::Null);
+            Ok(Value::Property(
+                crate::query::executor::hierarchy_ops::rollup_to_property(value),
+            ))
+        }
+        "hierarchy_lca" => {
+            let store = store.ok_or_else(|| ExecutionError::RuntimeError(
+                "hierarchy_lca() requires graph context".to_string()))?;
+            if args.len() < 2 {
+                return Err(ExecutionError::RuntimeError(
+                    "hierarchy_lca(a, b[, index]) takes 2 or 3 arguments".to_string()));
+            }
+            let a = value_node_id(&args[0]).ok_or_else(|| ExecutionError::RuntimeError(
+                "hierarchy_lca(): first argument must be a node".to_string()))?;
+            let b = value_node_id(&args[1]).ok_or_else(|| ExecutionError::RuntimeError(
+                "hierarchy_lca(): second argument must be a node".to_string()))?;
+            let entry = match args.get(2) {
+                Some(v) => {
+                    let n = extract_string(v)?;
+                    store.hierarchy_index.usable_named(&n).ok_or_else(|| {
+                        ExecutionError::RuntimeError(format!(
+                            "hierarchy_lca(): no usable hierarchy index named '{n}'"))
+                    })?
+                }
+                None => match store.hierarchy_index.usable_containing(&[a, b]) {
+                    Some(e) => e,
+                    None => return Ok(Value::Property(PropertyValue::Array(Vec::new()))),
+                },
+            };
+            let guard = entry.read().unwrap();
+            // A DAG can have several incomparable lowest common ancestors, so this is a
+            // list even when a tree would always yield exactly one.
+            let ids = guard
+                .index
+                .as_ref()
+                .and_then(|i| i.lowest_common_ancestors_ids(a, b))
+                .unwrap_or_default();
+            Ok(Value::Property(PropertyValue::Array(
+                ids.into_iter()
+                    .map(|id| PropertyValue::Integer(id.as_u64() as i64))
+                    .collect(),
+            )))
+        }
         // String functions
         "toupper" | "touppercase" => {
             let s = extract_string(&args[0])?;

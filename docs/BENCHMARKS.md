@@ -1,4 +1,40 @@
-# Samyama Graph — LDBC SNB Interactive Benchmark
+# Samyama Graph — Benchmarks
+
+Two suites are documented here: the LDBC SNB Interactive results below, and **HIER**, the
+hierarchy category introduced with ADR-035.
+
+## HIER — hierarchy-heavy complex queries
+
+Subsumption (`is x under y?`) and hierarchical roll-up over time, geography and ontology —
+the workload of [arXiv:2606.24677](https://arxiv.org/abs/2606.24677), which the LDBC and
+FinBench suites do not exercise. 112 queries across ten classes over a generated,
+self-contained 18,975-node / 33,974-edge dataset with four hierarchy axes.
+
+```bash
+cargo run --release --example hier_benchmark   # corpus, index on vs off
+cargo bench --bench hierarchy_benchmark        # index micro-benchmarks
+```
+
+Every query is answered twice — once with the hierarchy indexes declared, once without —
+and the unindexed run is the ground truth. **108/108 agree**; 4 (class H9,
+hierarchy-filtered vector search) are specified but blocked by a `CALL … YIELD`
+composition gap.
+
+| Class | n | Speedup | Class | n | Speedup |
+|---|---:|---:|---|---:|---:|
+| H1 order test | 15 | 0.2× | H6 anti-subsumption | 10 | 0.2× |
+| H2 single roll-up | 24 | **7990×** | H7 lowest common ancestor | 10 | 1.6× |
+| H3 level roll-up | 9 | 3.7× | H8 top-k over roll-up | 8 | 4.5× |
+| H4 cross-hierarchy | 12 | 1.1× | H10 temporal windows | 10 | 94.5× |
+| H5 hierarchy × traversal | 10 | 3.1× | **All** | **108** | **2.1×** |
+
+Roll-up latency is flat in subtree size — 16.0 ns at 1 node, 16.6 ns at 137,257 — which is
+what makes H2 and H10 win by orders of magnitude. H1 and H6 are *slower* because the
+order-test planner rewrite is not yet implemented; see
+[`benchmarks/hier/README.md`](../benchmarks/hier/README.md) for the full accounting,
+including the engine gaps the corpus surfaced.
+
+## LDBC SNB Interactive
 
 Samyama Graph's own results on the [LDBC Social Network Benchmark (SNB) Interactive](https://ldbcouncil.org/benchmarks/snb/) read workload (IS1–IS7 short reads, IC1–IC14 complex reads), at two scale factors. In-process (embedded) timing, 1 warm-up + 3 timed runs, median latency. Provenance: commit `31a7e77`, id-indexes built on all anchor labels.
 

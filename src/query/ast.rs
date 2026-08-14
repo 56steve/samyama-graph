@@ -101,6 +101,14 @@ pub struct Query {
     pub drop_index_clause: Option<DropIndexClause>,
     /// CREATE CONSTRAINT clause (optional)
     pub create_constraint_clause: Option<CreateConstraintClause>,
+    /// CREATE HIERARCHY INDEX clause (optional) — ADR-035
+    pub create_hierarchy_index_clause: Option<CreateHierarchyIndexClause>,
+    /// DROP HIERARCHY INDEX name (optional)
+    pub drop_hierarchy_index: Option<String>,
+    /// REBUILD HIERARCHY INDEX name (optional)
+    pub rebuild_hierarchy_index: Option<String>,
+    /// SHOW HIERARCHY INDEXES flag
+    pub show_hierarchy_indexes: bool,
     /// SHOW INDEXES flag
     pub show_indexes: bool,
     /// SHOW CONSTRAINTS flag
@@ -146,6 +154,29 @@ pub struct CreateIndexClause {
     pub property: String,
     /// Additional properties for composite indexes
     pub additional_properties: Vec<String>,
+}
+
+/// CREATE HIERARCHY INDEX clause (ADR-035).
+///
+/// `CREATE HIERARCHY INDEX atc ON ()-[:IS_A]->() MEASURE d.units AGGREGATE sum, max`
+///
+/// The relationship pattern names the **covering relation**, oriented `child -> parent`.
+/// A reversed arrow (`()<-[:HAS_CHILD]-()`) declares the same hierarchy stored the other
+/// way round.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateHierarchyIndexClause {
+    /// Index name.
+    pub name: String,
+    /// Edge types forming the covering relation.
+    pub edge_types: Vec<String>,
+    /// True when the stored edges point parent -> child.
+    pub reverse: bool,
+    /// Optional label qualifier on the measure.
+    pub measure_label: Option<String>,
+    /// Optional measure property.
+    pub measure_property: Option<String>,
+    /// Requested roll-up monoids (`sum`, `count`, `min`, `max`).
+    pub aggregates: Vec<String>,
 }
 
 /// DROP INDEX clause
@@ -610,6 +641,10 @@ impl Query {
             create_index_clause: None,
             drop_index_clause: None,
             create_constraint_clause: None,
+            create_hierarchy_index_clause: None,
+            drop_hierarchy_index: None,
+            rebuild_hierarchy_index: None,
+            show_hierarchy_indexes: false,
             show_indexes: false,
             show_constraints: false,
             profile: false,

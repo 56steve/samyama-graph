@@ -372,6 +372,15 @@ optimization, and micro/MVCC suites are self-contained; LDBC needs a data downlo
 | LDBC SNB Interactive | `cargo bench --bench ldbc_benchmark` | 21 IS/IC queries + 8 updates | needs SF1 download |
 | LDBC SNB BI | `cargo bench --bench ldbc_bi_benchmark` | 20 analytical (BI-1…20) | needs SF1 download |
 | LDBC FinBench | `cargo bench --bench finbench_benchmark` | 40+ CR/SR/RW/W on financial networks | synthetic / download |
+| Hierarchy (OEH) | `cargo bench --bench hierarchy_benchmark` | build, order test, roll-up vs subtree size | self-contained |
+| **HIER corpus** | `cargo run --release --example hier_benchmark` | 112 hierarchy-heavy queries, index on vs off | self-contained |
+
+**HIER** ([`benchmarks/hier/`](benchmarks/hier)) is a category for subsumption and
+hierarchical roll-up over time, geography and ontology — the workload the LDBC and FinBench
+suites do not contain. Every query is checked against an unindexed run of the same
+question, so a speedup is only reported alongside an identical answer. Latest: **108/108
+agree**; roll-up is flat at 15–20 ns from a 1-node subtree to a 137,257-node one, and the
+write-up records the two classes that are *slower* and why.
 
 ### Scale: 74M Nodes, 1 Billion Edges
 

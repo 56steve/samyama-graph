@@ -84,6 +84,7 @@ use super::property::{PropertyMap, PropertyValue};
 use super::types::{EdgeId, EdgeType, Label, NodeId};
 use crate::vector::{VectorIndexManager, DistanceMetric, VectorResult};
 use crate::index::IndexManager;
+use crate::index::hierarchy::HierarchyIndexManager;
 use crate::graph::storage::ColumnStore;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use std::collections::{HashMap, HashSet};
@@ -567,6 +568,9 @@ pub struct GraphStore {
     /// Property indices manager
     pub property_index: Arc<IndexManager>,
 
+    /// Hierarchy (OEH) index registry — subsumption + index-resident roll-up (ADR-035)
+    pub hierarchy_index: Arc<HierarchyIndexManager>,
+
     /// Columnar storage for node properties
     pub node_columns: ColumnStore,
 
@@ -617,6 +621,7 @@ impl GraphStore {
             edge_type_index: HashMap::new(),
             vector_index: Arc::new(VectorIndexManager::new()),
             property_index: Arc::new(IndexManager::new()),
+            hierarchy_index: Arc::new(HierarchyIndexManager::new()),
             node_columns: ColumnStore::new(),
             edge_columns: ColumnStore::new(),
             index_sender: None,
@@ -1036,6 +1041,7 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
     pub fn set_column_property(&mut self, node_id: NodeId, key: &str, value: PropertyValue) {
         let idx = node_id.as_u64() as usize;
         self.node_columns.set_property(idx, key, value);
+        self.invalidate_hierarchies_for_property(key);
     }
 
     /// Intern an edge type string → u16 index. Returns existing index if already interned.
@@ -1081,6 +1087,7 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
 
         // Update columnar storage (always latest)
         self.node_columns.set_property(idx, &key_str, val.clone());
+        self.invalidate_hierarchies_for_property(&key_str);
 
         // Get access to versions
         let versions = self.nodes.get_mut(idx).ok_or(GraphError::NodeNotFound(node_id))?;
@@ -1295,6 +1302,7 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
         let edge_id = EdgeId::new(edge_id_u64);
         let idx = edge_id_u64 as usize;
         let edge_type = edge_type.into();
+        self.invalidate_hierarchies_for_edge_type(&edge_type);
 
         // Unsorted append — O(1) per edge. Sorted at compact_adjacency().
         // Saves ~50% of edge phase time vs sorted insert (no binary search + shift).
@@ -1343,6 +1351,7 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
         let idx = edge_id_u64 as usize;
 
         let edge_type = edge_type.into();
+        self.invalidate_hierarchies_for_edge_type(&edge_type);
         let mut edge = Edge::new(edge_id, source, target, edge_type.clone());
         edge.version = self.current_version;
 
@@ -1418,6 +1427,7 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
         }
 
         let edge_type = edge_type.into();
+        self.invalidate_hierarchies_for_edge_type(&edge_type);
         let mut edge = Edge::new_with_properties(edge_id, source, target, edge_type.clone(), properties);
         edge.version = self.current_version;
 
@@ -1580,6 +1590,7 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
 
         // Reconstruct edge from DS-07c before deletion
         let edge = self.get_edge(id).ok_or(GraphError::EdgeNotFound(id))?;
+        self.invalidate_hierarchies_for_edge_type(&edge.edge_type);
 
         // Collect catalog info
         let src_labels: Vec<Label> = self.get_node(edge.source).map(|n| n.labels.iter().cloned().collect()).unwrap_or_default();
@@ -1992,6 +2003,28 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
     }
 
     /// Invalidate the cached statistics. Called from every mutation path.
+    /// Mark every hierarchy index built on `edge_type` stale (ADR-035 §6).
+    ///
+    /// OEH is a static index: a write to the covering relation invalidates it. The stale
+    /// index is then invisible to the planner, so the query falls back to variable-length
+    /// expansion and stays correct — a wrong-but-fast answer is the one outcome that is
+    /// never acceptable here. The `is_empty` guard keeps this off the hot write path for
+    /// the overwhelmingly common case of a store with no hierarchy declared.
+    #[inline]
+    pub fn invalidate_hierarchies_for_edge_type(&self, edge_type: &EdgeType) {
+        if !self.hierarchy_index.is_empty() {
+            self.hierarchy_index.mark_stale_for_edge_type(edge_type);
+        }
+    }
+
+    /// Mark every hierarchy whose declared measure is `property` stale.
+    #[inline]
+    pub fn invalidate_hierarchies_for_property(&self, property: &str) {
+        if !self.hierarchy_index.is_empty() {
+            self.hierarchy_index.mark_stale_for_property(property);
+        }
+    }
+
     pub fn invalidate_statistics_cache(&self) {
         *self.statistics_cache.write().unwrap() = None;
     }
@@ -2550,6 +2583,7 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
         self.edge_type_index.clear();
         self.vector_index = Arc::new(VectorIndexManager::new());
         self.property_index = Arc::new(IndexManager::new());
+        self.hierarchy_index = Arc::new(HierarchyIndexManager::new());
         self.node_columns = ColumnStore::new();
         self.edge_columns = ColumnStore::new();
         self.next_node_id = 1;

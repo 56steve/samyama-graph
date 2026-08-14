@@ -56,6 +56,32 @@ pub struct ExportStats {
     pub bytes_written: u64,
 }
 
+/// A hierarchy index **declaration** in the snapshot (ADR-035 §6).
+///
+/// Only the declaration travels, not the built structure. Interval arrays and Fenwick
+/// trees serialize to many times their in-memory size as JSON, and rebuilding on import is
+/// a single O(n + m) pass — a rounding error next to importing the graph those nodes and
+/// edges came from. What must survive a round-trip is the *intent*: which edge types form
+/// a hierarchy, which property is its measure, and which monoids were asked for.
+///
+/// This is an additive line type. Readers built before ADR-035 dispatch on `"t":"n"` and
+/// `"t":"e"` and ignore everything else, so a snapshot carrying these records still loads
+/// on an older build — which is why the format version does not move.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SnapshotHierarchyIndex {
+    pub t: String,                        // Always "h"
+    pub name: String,
+    pub edge_types: Vec<String>,
+    #[serde(default)]
+    pub reverse: bool,
+    #[serde(default)]
+    pub measure_label: Option<String>,
+    #[serde(default)]
+    pub measure_property: Option<String>,
+    #[serde(default)]
+    pub ops: Vec<String>,
+}
+
 /// Stats returned from import
 #[derive(Debug)]
 pub struct ImportStats {
@@ -64,4 +90,6 @@ pub struct ImportStats {
     pub merged_count: u64,
     pub labels: Vec<String>,
     pub edge_types: Vec<String>,
+    /// Hierarchy indexes rebuilt from declarations in the snapshot.
+    pub hierarchy_count: u64,
 }
