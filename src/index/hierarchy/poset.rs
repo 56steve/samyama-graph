@@ -346,6 +346,16 @@ impl Poset {
         self.topo_up.iter().rev().copied().collect()
     }
 
+    /// How many parent edges exceed one per node — the size of the exception list a
+    /// near-tree encoding would have to carry.
+    ///
+    /// Zero exactly when the poset is a tree, so this is the continuous version of
+    /// [`Self::is_tree`] and the number the probe uses to decide whether a poset is close
+    /// enough to a tree to be worth treating as one.
+    pub fn extra_parent_count(&self) -> usize {
+        self.parents.iter().map(|p| p.len().saturating_sub(1)).sum()
+    }
+
     /// The structural probe's first question: does every node have at most one parent?
     ///
     /// A tree (or forest) admits the nested-set encoding, which is both smaller and

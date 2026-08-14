@@ -33,6 +33,9 @@ pub enum Encoding {
     NestedSet,
     /// Jagadish chain decomposition — low-width DAGs.
     Chain,
+    /// Nested-set over a spanning forest, with the residual multi-parent edges kept as an
+    /// exception list — for posets that are *nearly* trees.
+    NearTree,
 }
 
 impl Encoding {
@@ -41,6 +44,7 @@ impl Encoding {
         match self {
             Encoding::NestedSet => "nested-set",
             Encoding::Chain => "chain",
+            Encoding::NearTree => "near-tree",
         }
     }
 }
@@ -50,6 +54,9 @@ impl Encoding {
 pub enum Probe {
     /// Every node has at most one parent.
     Tree,
+    /// Multi-parent, but few enough extra parents to carry as exceptions over a spanning
+    /// forest. Cheaper and far smaller than chain decomposition when it applies.
+    NearTree { exceptions: usize },
     /// Multi-parent, but chain width is within the cap.
     LowWidthDag { width: usize },
     /// Chain width exceeds the cap — defer to a 2-hop index.
@@ -59,6 +66,31 @@ pub enum Probe {
 /// The width cap: chain-mode space is O(n·width), so capping width at ~8·√n keeps the
 /// index at ~O(n^1.5). Small posets get a floor of 64 so that toy hierarchies and unit
 /// tests are never declined for being small.
+/// How many extra parent edges may be carried as exceptions over a spanning forest.
+///
+/// The test that matters is a **ratio**, not an absolute count. What distinguishes a
+/// near-tree from a genuine poly-hierarchy is what fraction of the poset breaks the tree
+/// property, and the two populations separate cleanly on real data:
+///
+/// | Poset | nodes | extra parents | share |
+/// |---|---:|---:|---:|
+/// | GeoNames (administrative) | 544,093 | 6,540 | **1.2%** |
+/// | Gene Ontology | 38,092 | 24,135 | 63% |
+/// | HPO | 19,836 | 13,979 | 70% |
+///
+/// So 5% admits real geography with an order of magnitude to spare while excluding
+/// ontologies that are poly-hierarchical by design — those belong on chain decomposition
+/// or a 2-hop index, and pretending otherwise would trade a correct decline for a slow
+/// index.
+///
+/// An absolute ceiling caps the worst-case scan on a subsumption miss regardless of how
+/// large the poset gets. An earlier version of this used `max(4096, √n)`, which had the
+/// floor doing all the work and quietly swallowed Gene Ontology — the ratio is the part
+/// that carries the meaning.
+pub fn exception_cap_for(n: usize) -> usize {
+    std::cmp::min(n / 20, 100_000)
+}
+
 pub fn width_cap_for(n: usize) -> usize {
     std::cmp::max(64, (8.0 * (n as f64).sqrt()) as usize)
 }
@@ -72,6 +104,15 @@ enum EncodingData {
         tout: Vec<u32>,
         /// `inv[rank]` = dense node index at that rank.
         inv: Vec<u32>,
+    },
+    NearTree {
+        /// Nested-set labels over the spanning forest.
+        tin: Vec<u32>,
+        tout: Vec<u32>,
+        inv: Vec<u32>,
+        /// Residual `(child, parent)` edges not in the spanning forest, sorted by
+        /// `tin[child]` so the stabbing scan is cache-friendly.
+        exceptions: Vec<(u32, u32)>,
     },
     Chain {
         /// `chain_of[i]` = `(chain id, position on that chain)`.
@@ -92,6 +133,8 @@ enum RollupData {
     Sparse(SparseTable),
     /// Per-chain suffix folds.
     ChainSuffix(Vec<Vec<RollupValue>>),
+    /// No range structure — fold the materialized descendant set (near-tree).
+    FoldSet,
 }
 
 /// The OEH index over one subsumption poset.
@@ -119,6 +162,15 @@ impl OehIndex {
         if poset.is_tree() {
             return Probe::Tree;
         }
+        // A poset that is a tree apart from a handful of extra parent edges belongs on
+        // nested-set with those edges carried aside, not on chain decomposition — whose
+        // width on such a shape approaches the leaf count and is unaffordable. This is the
+        // GeoNames case: 98.7% single-parent, yet declined outright before this branch
+        // existed (#371).
+        let extra = poset.extra_parent_count();
+        if extra <= exception_cap_for(poset.n()) {
+            return Probe::NearTree { exceptions: extra };
+        }
         let chains = Self::decompose_chains(poset);
         let width = chains.len();
         let cap = width_cap_for(poset.n());
@@ -137,6 +189,7 @@ impl OehIndex {
     pub fn build(poset: Poset) -> HierarchyResult<Self> {
         match Self::probe(&poset) {
             Probe::Tree => Self::build_nested_set(poset),
+            Probe::NearTree { .. } => Self::build_near_tree(poset),
             Probe::LowWidthDag { .. } => Self::build_chain(poset),
             Probe::HighWidthDag { width, cap } => Err(HierarchyError::WidthTooHigh {
                 width,
@@ -155,6 +208,7 @@ impl OehIndex {
         match encoding {
             Encoding::NestedSet if !poset.is_tree() => Err(HierarchyError::NotATree),
             Encoding::NestedSet => Self::build_nested_set(poset),
+            Encoding::NearTree => Self::build_near_tree(poset),
             Encoding::Chain => Self::build_chain(poset),
         }
     }
@@ -196,6 +250,71 @@ impl OehIndex {
             poset,
             encoding: Encoding::NestedSet,
             data: EncodingData::NestedSet { tin, tout, inv },
+            measure: None,
+            rollups: HashMap::new(),
+            width: None,
+        })
+    }
+
+    // ---- near-tree: spanning forest + exceptions ---------------------------
+
+    /// Nested-set over a spanning forest, with every parent edge the forest did not take
+    /// kept as an explicit exception.
+    ///
+    /// Each node keeps its **first** parent as its forest parent; the rest become
+    /// exceptions. Subsumption is then the interval test *or* a path through an exception,
+    /// which keeps the common case at two integer comparisons and pays only on a miss.
+    fn build_near_tree(poset: Poset) -> HierarchyResult<Self> {
+        let n = poset.n();
+        let mut exceptions: Vec<(u32, u32)> = Vec::new();
+        // children restricted to the spanning forest, so the DFS below walks a tree
+        let mut forest_children: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for c in 0..n as u32 {
+            let parents = poset.parents(c);
+            if let Some(&first) = parents.first() {
+                forest_children[first as usize].push(c);
+                for &p in &parents[1..] {
+                    exceptions.push((c, p));
+                }
+            }
+        }
+
+        let mut tin = vec![0u32; n];
+        let mut tout = vec![0u32; n];
+        let mut inv = vec![0u32; n];
+        let mut counter: u32 = 0;
+        for root in (0..n as u32).filter(|&i| poset.parents(i).is_empty()) {
+            tin[root as usize] = counter;
+            inv[counter as usize] = root;
+            counter += 1;
+            let mut stack: Vec<(u32, usize)> = vec![(root, 0)];
+            while let Some(&mut (node, ref mut next_child)) = stack.last_mut() {
+                let kids = &forest_children[node as usize];
+                if *next_child < kids.len() {
+                    let c = kids[*next_child];
+                    *next_child += 1;
+                    tin[c as usize] = counter;
+                    inv[counter as usize] = c;
+                    counter += 1;
+                    stack.push((c, 0));
+                } else {
+                    tout[node as usize] = counter - 1;
+                    stack.pop();
+                }
+            }
+        }
+        debug_assert_eq!(counter as usize, n, "the spanning forest must cover every node");
+
+        exceptions.sort_unstable_by_key(|&(c, _)| tin[c as usize]);
+        Ok(OehIndex {
+            poset,
+            encoding: Encoding::NearTree,
+            data: EncodingData::NearTree {
+                tin,
+                tout,
+                inv,
+                exceptions,
+            },
             measure: None,
             rollups: HashMap::new(),
             width: None,
@@ -312,6 +431,53 @@ impl OehIndex {
             EncodingData::NestedSet { tin, tout, .. } => {
                 tin[y as usize] <= tin[x as usize] && tout[x as usize] <= tout[y as usize]
             }
+            EncodingData::NearTree {
+                tin,
+                tout,
+                exceptions,
+                ..
+            } => {
+                // Fast path: the spanning forest already answers it.
+                if tin[y as usize] <= tin[x as usize] && tout[x as usize] <= tout[y as usize] {
+                    return true;
+                }
+                // Otherwise the path must leave the forest through at least one exception
+                // edge (c, p): x reaches c inside the forest, and p reaches y — possibly
+                // through further exceptions, hence the recursion. `seen` bounds it, since
+                // the poset is acyclic but the search can revisit an exception parent.
+                fn via_exception(
+                    tin: &[u32],
+                    tout: &[u32],
+                    exceptions: &[(u32, u32)],
+                    x: u32,
+                    y: u32,
+                    seen: &mut Vec<u32>,
+                ) -> bool {
+                    for &(c, p) in exceptions {
+                        // x ⊑ c in the forest?
+                        if !(tin[c as usize] <= tin[x as usize]
+                            && tout[x as usize] <= tout[c as usize])
+                        {
+                            continue;
+                        }
+                        if tin[y as usize] <= tin[p as usize]
+                            && tout[p as usize] <= tout[y as usize]
+                        {
+                            return true;
+                        }
+                        if seen.contains(&p) {
+                            continue;
+                        }
+                        seen.push(p);
+                        if via_exception(tin, tout, exceptions, p, y, seen) {
+                            return true;
+                        }
+                    }
+                    false
+                }
+                let mut seen = Vec::new();
+                via_exception(tin, tout, exceptions, x, y, &mut seen)
+            }
             EncodingData::Chain {
                 chain_of, reach, ..
             } => {
@@ -349,6 +515,33 @@ impl OehIndex {
                 let (lo, hi) = (tin[y as usize] as usize, tout[y as usize] as usize);
                 inv[lo..=hi].to_vec()
             }
+            EncodingData::NearTree { tin, tout, inv, exceptions } => {
+                // The forest subtree, plus the subtree of every exception child whose
+                // parent is reachable from y. Collected through a set because the two can
+                // overlap — a node may sit under y both in the forest and through an
+                // exception, and counting it twice is the failure mode this whole design
+                // guards against.
+                let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+                let mut frontier = vec![y];
+                while let Some(cur) = frontier.pop() {
+                    let (lo, hi) = (tin[cur as usize] as usize, tout[cur as usize] as usize);
+                    for &d in &inv[lo..=hi] {
+                        seen.insert(d);
+                    }
+                    for &(c, p) in exceptions {
+                        // p under cur in the forest ⇒ everything under c is under y too
+                        if tin[cur as usize] <= tin[p as usize]
+                            && tout[p as usize] <= tout[cur as usize]
+                            && !seen.contains(&c)
+                        {
+                            frontier.push(c);
+                        }
+                    }
+                }
+                let mut out: Vec<u32> = seen.into_iter().collect();
+                out.sort_unstable();
+                out
+            }
             EncodingData::Chain { chains, reach, .. } => {
                 let mut out = Vec::new();
                 for &(cid, mp) in &reach[y as usize] {
@@ -368,6 +561,9 @@ impl OehIndex {
             EncodingData::NestedSet { tin, tout, .. } => {
                 (tout[y as usize] - tin[y as usize]) as usize + 1
             }
+            // No closed form once exceptions can overlap the forest subtree: the set has to
+            // be materialized to be counted correctly.
+            EncodingData::NearTree { .. } => self.descendants(y).len(),
             EncodingData::Chain { chains, reach, .. } => reach[y as usize]
                 .iter()
                 .map(|&(cid, mp)| chains[cid as usize].len() - mp as usize)
@@ -409,6 +605,13 @@ impl OehIndex {
                         RollupData::Sparse(SparseTable::build(&by_rank, op))
                     }
                 }
+                // Near-tree has no contiguous range to fold: an exception can pull in a
+                // subtree from anywhere in the rank order, so there is no interval whose
+                // sum is the answer. Roll-up therefore folds the materialized descendant
+                // set — correct, and still far cheaper than the traversal it replaces, but
+                // *not* index-resident. That limitation is the price of admitting these
+                // posets at all, and it is recorded in ADR-035 rather than glossed.
+                EncodingData::NearTree { .. } => RollupData::FoldSet,
                 EncodingData::Chain { chains, .. } => {
                     // Per-chain suffix folds are correct for any commutative monoid; no
                     // inverse is needed because we never subtract a prefix.
@@ -451,6 +654,16 @@ impl OehIndex {
                 let (lo, hi) = (tin[y as usize] as usize, tout[y as usize] as usize);
                 Some(st.range(lo, hi))
             }
+            (RollupData::FoldSet, EncodingData::NearTree { .. }) => {
+                let measure = self.measure.as_ref()?;
+                let mut acc = op.identity();
+                for d in self.descendants(y) {
+                    if let Some(v) = measure.get(d as usize).and_then(|m| m.as_ref()) {
+                        acc = op.combine(acc, *v);
+                    }
+                }
+                Some(acc)
+            }
             (RollupData::ChainSuffix(suffixes), EncodingData::Chain { reach, .. }) => {
                 let mut acc = op.identity();
                 for &(cid, mp) in &reach[y as usize] {
@@ -492,7 +705,10 @@ impl OehIndex {
                     }
                 }
             }
-            EncodingData::Chain { .. } => {
+            // Near-tree and chain both admit multiple parents, so the single-walk shortcut
+            // the pure tree uses does not apply — a node can have incomparable minimal
+            // common ancestors.
+            EncodingData::NearTree { .. } | EncodingData::Chain { .. } => {
                 let common: Vec<u32> = (0..self.poset.n() as u32)
                     .filter(|&c| self.subsumes(x, c) && self.subsumes(y, c))
                     .collect();
@@ -535,6 +751,15 @@ impl OehIndex {
             EncodingData::NestedSet { tin, tout, inv } => {
                 (tin.len() + tout.len() + inv.len()) * std::mem::size_of::<u32>()
             }
+            EncodingData::NearTree {
+                tin,
+                tout,
+                inv,
+                exceptions,
+            } => {
+                (tin.len() + tout.len() + inv.len()) * std::mem::size_of::<u32>()
+                    + exceptions.len() * std::mem::size_of::<(u32, u32)>()
+            }
             EncodingData::Chain {
                 chain_of,
                 chains,
@@ -562,40 +787,21 @@ impl OehIndex {
                 RollupData::ChainSuffix(s) => {
                     s.iter().map(|c| c.len()).sum::<usize>() * std::mem::size_of::<RollupValue>()
                 }
+                // The measure vector is counted with the index, not here: FoldSet adds no
+                // range structure of its own.
+                RollupData::FoldSet => 0,
             })
             .sum()
     }
 
     /// Approximate resident size in bytes, for `SHOW HIERARCHY INDEXES` and the benchmark
     /// space column.
+    ///
+    /// Delegates rather than re-deriving: the two halves are reported separately so a
+    /// like-for-like comparison against a 2-hop index can use the order embedding alone,
+    /// and duplicating the arms here is how they drift apart.
     pub fn size_bytes(&self) -> usize {
-        let structural = match &self.data {
-            EncodingData::NestedSet { tin, tout, inv } => {
-                (tin.len() + tout.len() + inv.len()) * std::mem::size_of::<u32>()
-            }
-            EncodingData::Chain {
-                chain_of,
-                chains,
-                reach,
-            } => {
-                chain_of.len() * std::mem::size_of::<(u32, u32)>()
-                    + chains.iter().map(|c| c.len()).sum::<usize>() * std::mem::size_of::<u32>()
-                    + reach.iter().map(|r| r.len()).sum::<usize>()
-                        * std::mem::size_of::<(u32, u32)>()
-            }
-        };
-        let rollups: usize = self
-            .rollups
-            .values()
-            .map(|r| match r {
-                RollupData::Fenwick(f) => f.size_bytes(),
-                RollupData::Sparse(s) => s.size_bytes(),
-                RollupData::ChainSuffix(s) => {
-                    s.iter().map(|c| c.len()).sum::<usize>() * std::mem::size_of::<RollupValue>()
-                }
-            })
-            .sum();
-        structural + rollups
+        self.structural_bytes() + self.rollup_bytes()
     }
 
     /// Bytes per node — the space column the paper compares against 2-hop labeling.
@@ -696,6 +902,113 @@ mod tests {
         }
         let err = OehIndex::build(p).unwrap_err();
         assert!(matches!(err, HierarchyError::WidthTooHigh { .. }));
+    }
+
+    /// A near-tree: a balanced tree with `extra` additional parent edges grafted on,
+    /// keeping the poset acyclic by always pointing a deeper node at a shallower one.
+    fn near_tree(depth: usize, fanout: usize, extra: usize) -> Poset {
+        let mut edges = Vec::new();
+        let mut frontier = vec![0u64];
+        let mut next = 1u64;
+        let mut levels: Vec<Vec<u64>> = vec![vec![0]];
+        for _ in 0..depth {
+            let mut new_frontier = Vec::new();
+            for &p in &frontier {
+                for _ in 0..fanout {
+                    edges.push((nid(next), nid(p)));
+                    new_frontier.push(next);
+                    next += 1;
+                }
+            }
+            levels.push(new_frontier.clone());
+            frontier = new_frontier;
+        }
+        // graft: a deepest-level node gains a second parent one level up, from a different
+        // branch, which is exactly the shape that breaks is_tree() without changing much.
+        let deep = &levels[depth];
+        let mid = &levels[depth - 1];
+        for i in 0..extra.min(deep.len()) {
+            let child = deep[i];
+            let alt_parent = mid[(i * 7 + 3) % mid.len()];
+            if alt_parent != child {
+                edges.push((nid(child), nid(alt_parent)));
+            }
+        }
+        Poset::from_edges(edges, std::iter::empty()).unwrap()
+    }
+
+    #[test]
+    fn probe_selects_near_tree_for_a_mostly_tree_poset() {
+        // 5% of nodes carry a second parent — the GeoNames shape, where the old probe
+        // handed the whole poset to chain decomposition and then declined it (#371).
+        let p = near_tree(5, 4, 40);
+        assert!(!p.is_tree(), "the fixture must not be a plain tree");
+        match OehIndex::probe(&p) {
+            Probe::NearTree { exceptions } => assert!(exceptions > 0),
+            other => panic!("expected NearTree, got {other:?}"),
+        }
+        let idx = OehIndex::build(p).unwrap();
+        assert_eq!(idx.encoding(), Encoding::NearTree);
+    }
+
+    #[test]
+    fn exception_cap_is_a_ratio_not_a_floor() {
+        // The real populations this separates: GeoNames at 1.2%, Gene Ontology at 63%.
+        assert!(6_540 <= exception_cap_for(544_093), "GeoNames must fit");
+        assert!(24_135 > exception_cap_for(38_092), "Gene Ontology must not");
+        assert!(13_979 > exception_cap_for(19_836), "HPO must not");
+    }
+
+    #[test]
+    fn near_tree_subsumption_equals_oracle_on_all_pairs() {
+        // exception counts kept inside the 5% cap: n=364 admits 18, n=1365 admits 68
+        assert_subsumption_matches_oracle(near_tree(5, 3, 15), None);
+        assert_subsumption_matches_oracle(near_tree(5, 4, 60), None);
+    }
+
+    #[test]
+    fn near_tree_descendants_and_rollup_equal_oracle() {
+        let p = near_tree(5, 3, 15);
+        let n = p.n();
+        assert_eq!(
+            OehIndex::probe(&p),
+            Probe::NearTree {
+                exceptions: p.extra_parent_count()
+            }
+        );
+        assert_rollup_matches_oracle(p, ramp_measure(n));
+    }
+
+    #[test]
+    fn near_tree_descendants_are_duplicate_free() {
+        // An exception can pull in a subtree that already sits under the forest subtree.
+        // Counting it twice is the failure this design has to avoid.
+        let p = near_tree(5, 3, 15);
+        let oracle_poset = p.clone();
+        let idx = OehIndex::build(p).unwrap();
+        assert_eq!(idx.encoding(), Encoding::NearTree);
+        for y in 0..oracle_poset.n() as u32 {
+            let d = idx.descendants(y);
+            let uniq: std::collections::HashSet<u32> = d.iter().copied().collect();
+            assert_eq!(d.len(), uniq.len(), "descendants({y}) had duplicates");
+            let mut want: Vec<u32> =
+                oracle::descendants(&oracle_poset, y, true).into_iter().collect();
+            want.sort_unstable();
+            assert_eq!(d, want, "descendants({y})");
+        }
+    }
+
+    #[test]
+    fn near_tree_costs_little_more_than_a_plain_tree() {
+        // 12 B/node for the embedding plus 8 bytes per exception — the whole point is that
+        // the exceptions are few, so the index stays close to nested-set size rather than
+        // blowing out to chain decomposition's O(n·width).
+        let idx = OehIndex::build(near_tree(5, 3, 15)).unwrap();
+        assert!(
+            idx.bytes_per_node() < 14.0,
+            "near-tree should stay near 12 B/node, got {}",
+            idx.bytes_per_node()
+        );
     }
 
     #[test]
