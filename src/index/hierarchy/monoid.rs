@@ -231,36 +231,41 @@ impl Fenwick {
     }
 }
 
-/// Sparse table over a non-invertible monoid (MIN / MAX).
+/// Segment tree over a non-invertible monoid (MIN / MAX).
 ///
-/// `table[k][i]` folds the block `[i, i + 2^k)`. A range fold is the combination of two
-/// overlapping blocks, which is correct precisely because MIN and MAX are idempotent —
-/// double-covering the overlap changes nothing.
+/// A range fold is the combination of O(log n) disjoint canonical nodes. The alternative —
+/// a sparse table of overlapping power-of-two blocks — answers in O(1) but costs
+/// **O(n log n)** space, and that space dominated the index: on a 9,331-node ontology the
+/// MIN and MAX tables came to 7.46 MB against 112 KB for the order embedding itself
+/// (#352). A segment tree is O(n) — `2n` cells — trading O(1) for O(log n) on a query that
+/// was already measured in tens of nanoseconds.
+///
+/// It also supports point update in O(log n), which a sparse table does not. Incremental
+/// maintenance (#351) will need exactly that, so this is the structure that can grow into
+/// it rather than being replaced again.
+///
+/// Disjointness is why this works for *any* commutative monoid, not just idempotent ones:
+/// no element is folded twice, so MIN/MAX and (were it ever wanted) SUM are equally safe.
 #[derive(Debug, Clone)]
-pub struct SparseTable {
-    levels: Vec<Vec<RollupValue>>,
+pub struct SegmentTree {
+    /// `tree[1]` is the root; leaves live at `[size, size + n)`.
+    tree: Vec<RollupValue>,
     op: RollupOp,
+    size: usize,
     n: usize,
 }
 
-impl SparseTable {
+impl SegmentTree {
     /// Build for `op` over per-position measures.
-    pub fn build(values: &[RollupValue], op: RollupOp) -> SparseTable {
+    pub fn build(values: &[RollupValue], op: RollupOp) -> SegmentTree {
         let n = values.len();
-        let mut levels: Vec<Vec<RollupValue>> = vec![values.to_vec()];
-        let mut k = 1usize;
-        while (1usize << k) <= n {
-            let span = 1usize << k;
-            let half = span >> 1;
-            let prev = &levels[k - 1];
-            let mut cur = Vec::with_capacity(n.saturating_sub(span) + 1);
-            for i in 0..=n.saturating_sub(span) {
-                cur.push(op.combine(prev[i], prev[i + half]));
-            }
-            levels.push(cur);
-            k += 1;
+        let size = n.max(1).next_power_of_two();
+        let mut tree = vec![op.identity(); 2 * size];
+        tree[size..size + n].clone_from_slice(values);
+        for i in (1..size).rev() {
+            tree[i] = op.combine(tree[2 * i], tree[2 * i + 1]);
         }
-        SparseTable { levels, op, n }
+        SegmentTree { tree, op, size, n }
     }
 
     /// Fold the inclusive position range `[lo, hi]`.
@@ -268,20 +273,43 @@ impl SparseTable {
         if hi < lo || lo >= self.n {
             return self.op.identity();
         }
-        let hi = hi.min(self.n - 1);
-        let span = hi - lo + 1;
-        let k = usize::BITS as usize - 1 - (span.leading_zeros() as usize); // floor(log2)
-        let level = &self.levels[k];
-        let right = hi + 1 - (1usize << k);
-        self.op.combine(level[lo], level[right])
+        let mut acc = self.op.identity();
+        let mut l = lo + self.size;
+        let mut r = hi.min(self.n - 1) + self.size + 1;
+        while l < r {
+            if l & 1 == 1 {
+                acc = self.op.combine(acc, self.tree[l]);
+                l += 1;
+            }
+            if r & 1 == 1 {
+                r -= 1;
+                acc = self.op.combine(acc, self.tree[r]);
+            }
+            l >>= 1;
+            r >>= 1;
+        }
+        acc
+    }
+
+    /// Set the value at `pos` and refold the path to the root, in O(log n).
+    ///
+    /// Unused by the static index today; present because it is what incremental
+    /// maintenance (#351) needs and it costs nothing to expose.
+    pub fn set(&mut self, pos: usize, value: RollupValue) {
+        if pos >= self.n {
+            return;
+        }
+        let mut i = pos + self.size;
+        self.tree[i] = value;
+        while i > 1 {
+            i >>= 1;
+            self.tree[i] = self.op.combine(self.tree[2 * i], self.tree[2 * i + 1]);
+        }
     }
 
     /// Approximate heap size in bytes.
     pub fn size_bytes(&self) -> usize {
-        self.levels
-            .iter()
-            .map(|l| l.len() * std::mem::size_of::<RollupValue>())
-            .sum()
+        self.tree.len() * std::mem::size_of::<RollupValue>()
     }
 }
 
@@ -348,10 +376,10 @@ mod tests {
     }
 
     #[test]
-    fn sparse_table_matches_naive_min_and_max() {
+    fn segment_tree_matches_naive_min_and_max() {
         let vals = ints(&[3, 1, 4, 1, 5, 9, 2, 6]);
         for op in [RollupOp::Min, RollupOp::Max] {
-            let st = SparseTable::build(&vals, op);
+            let st = SegmentTree::build(&vals, op);
             for lo in 0..vals.len() {
                 for hi in lo..vals.len() {
                     let mut naive = op.identity();
@@ -367,7 +395,7 @@ mod tests {
     #[test]
     fn empty_range_returns_identity() {
         let vals = ints(&[1, 2, 3]);
-        let st = SparseTable::build(&vals, RollupOp::Min);
+        let st = SegmentTree::build(&vals, RollupOp::Min);
         assert_eq!(st.range(2, 1), RollupValue::Null);
         let f = Fenwick::build(&vals);
         assert_eq!(f.range(2, 1), RollupValue::Int(0));
@@ -388,7 +416,56 @@ mod tests {
     #[test]
     fn single_element_table() {
         let vals = ints(&[42]);
-        let st = SparseTable::build(&vals, RollupOp::Max);
+        let st = SegmentTree::build(&vals, RollupOp::Max);
         assert_eq!(st.range(0, 0), RollupValue::Int(42));
+    }
+
+    #[test]
+    fn segment_tree_matches_naive_on_a_non_power_of_two_length() {
+        // The padding to a power of two must not leak identity elements into a range.
+        let vals = ints(&[5, 3, 9, 1, 7]);
+        for op in [RollupOp::Min, RollupOp::Max] {
+            let st = SegmentTree::build(&vals, op);
+            for lo in 0..vals.len() {
+                for hi in lo..vals.len() {
+                    let mut naive = op.identity();
+                    for v in &vals[lo..=hi] {
+                        naive = op.combine(naive, *v);
+                    }
+                    assert_eq!(st.range(lo, hi), naive, "{op:?} over {lo}..={hi}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn segment_tree_point_update_refolds_the_path() {
+        let vals = ints(&[5, 3, 9, 1, 7]);
+        let mut st = SegmentTree::build(&vals, RollupOp::Min);
+        assert_eq!(st.range(0, 4), RollupValue::Int(1));
+        st.set(3, RollupValue::Int(100));
+        assert_eq!(
+            st.range(0, 4),
+            RollupValue::Int(3),
+            "the old minimum is gone"
+        );
+        st.set(0, RollupValue::Int(-2));
+        assert_eq!(st.range(0, 4), RollupValue::Int(-2));
+        assert_eq!(
+            st.range(1, 2),
+            RollupValue::Int(3),
+            "untouched ranges are unaffected"
+        );
+    }
+
+    #[test]
+    fn segment_tree_is_linear_where_a_sparse_table_was_n_log_n() {
+        // The point of #352: 2*next_power_of_two(n) cells rather than n*log2(n).
+        let vals = ints(&vec![1i128; 4096]);
+        let st = SegmentTree::build(&vals, RollupOp::Max);
+        let cells = st.size_bytes() / std::mem::size_of::<RollupValue>();
+        assert_eq!(cells, 8192, "2n for a power-of-two length");
+        // a sparse table over the same input would hold ~n*log2(n) = 4096*13 = 53,248
+        assert!(cells * 6 < 4096 * 13, "at least 6x smaller: {cells}");
     }
 }

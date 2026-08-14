@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use super::monoid::{Fenwick, RollupOp, RollupValue, SparseTable};
+use super::monoid::{Fenwick, RollupOp, RollupValue, SegmentTree};
 use super::poset::{HierarchyError, HierarchyResult, Poset};
 
 /// Which encoding the structural probe selected.
@@ -130,7 +130,7 @@ enum RollupData {
     /// Range structure over nested-set ranks.
     Fenwick(Fenwick),
     /// Range structure over nested-set ranks for a non-invertible monoid.
-    Sparse(SparseTable),
+    Sparse(SegmentTree),
     /// Per-chain suffix folds.
     ChainSuffix(Vec<Vec<RollupValue>>),
     /// No range structure — fold the materialized descendant set (near-tree).
@@ -602,7 +602,7 @@ impl OehIndex {
                     if op.is_invertible() {
                         RollupData::Fenwick(Fenwick::build(&by_rank))
                     } else {
-                        RollupData::Sparse(SparseTable::build(&by_rank, op))
+                        RollupData::Sparse(SegmentTree::build(&by_rank, op))
                     }
                 }
                 // Near-tree has no contiguous range to fold: an exception can pull in a
@@ -1333,9 +1333,10 @@ mod tests {
     }
 
     #[test]
-    fn min_max_cost_far_more_space_than_sum_and_the_split_shows_it() {
-        // The space-for-time trade made explicit: a Fenwick tree is O(n), a sparse table
-        // is O(n log n). Reporting one total would hide which monoid you are paying for.
+    fn min_max_now_costs_the_same_order_as_sum() {
+        // Before #352 the MIN/MAX structure was a sparse table at O(n log n) and dwarfed
+        // the Fenwick tree by more than 4x on this fixture. A segment tree is O(n), so the
+        // two are now within a small constant of each other — that ratio is the fix.
         let p = balanced_tree(5, 3);
         let n = p.n();
         let mut sum_only = OehIndex::build(p).unwrap();
@@ -1346,11 +1347,13 @@ mod tests {
         with_max.set_measure(unit_measure(n), &[RollupOp::Sum, RollupOp::Max]);
 
         assert_eq!(sum_only.structural_bytes(), with_max.structural_bytes());
+        let max_only = with_max.rollup_bytes() - sum_only.rollup_bytes();
         assert!(
-            with_max.rollup_bytes() > 4 * sum_only.rollup_bytes(),
-            "sparse table {} should dwarf the Fenwick tree {}",
-            with_max.rollup_bytes(),
+            max_only < 6 * sum_only.rollup_bytes(),
+            "MIN/MAX ({max_only} B) should now be the same order as SUM ({} B), not O(n log n)",
             sum_only.rollup_bytes()
         );
+        // and the split is still reported separately, which is what makes it checkable
+        assert!(with_max.rollup_bytes() > sum_only.rollup_bytes());
     }
 }
