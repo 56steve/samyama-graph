@@ -15,7 +15,7 @@
 //! with a diagnostic and no index, so `SHOW HIERARCHY INDEXES` can explain why the planner
 //! is not using it (see the honest-scope section of ADR-035).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use crate::graph::types::{EdgeType, Label, NodeId};
@@ -160,14 +160,21 @@ pub struct HierarchyInfo {
 /// Registry of hierarchy indexes for one store.
 #[derive(Debug, Default)]
 pub struct HierarchyIndexManager {
-    entries: RwLock<HashMap<String, Arc<RwLock<HierarchyEntry>>>>,
+    /// Name-keyed registry.
+    ///
+    /// A `BTreeMap` rather than a `HashMap` because iteration order matters: when several
+    /// hierarchies could answer the same question the choice must be reproducible, not
+    /// dependent on hash seeding. Getting that from the container is also what makes the
+    /// hot path cheap — `usable_containing` runs once per row inside `subsumes()`, and it
+    /// previously collected every key into a `Vec` and sorted it on each call.
+    entries: RwLock<BTreeMap<String, Arc<RwLock<HierarchyEntry>>>>,
 }
 
 impl HierarchyIndexManager {
     /// Empty registry.
     pub fn new() -> Self {
         HierarchyIndexManager {
-            entries: RwLock::new(HashMap::new()),
+            entries: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -279,26 +286,25 @@ impl HierarchyIndexManager {
         &self,
         edge_type: &EdgeType,
     ) -> Option<Arc<RwLock<HierarchyEntry>>> {
+        // Iteration is name-ordered, so the choice among several covering hierarchies is
+        // deterministic without a sort.
         let entries = self.entries.read().unwrap();
-        let mut candidates: Vec<(&String, &Arc<RwLock<HierarchyEntry>>)> = entries
-            .iter()
-            .filter(|(_, e)| {
+        entries
+            .values()
+            .find(|e| {
                 let g = e.read().unwrap();
                 g.usable() && g.spec.edge_types.iter().any(|t| t == edge_type)
             })
-            .collect();
-        // Deterministic choice when several hierarchies cover the same edge type.
-        candidates.sort_by(|a, b| a.0.cmp(b.0));
-        candidates.first().map(|(_, e)| Arc::clone(e))
+            .map(Arc::clone)
     }
 
     /// Any entry covering `edge_type`, usable or not — for `EXPLAIN` to report why a
     /// rewrite did not fire.
     pub fn any_for_edge_type(&self, edge_type: &EdgeType) -> Option<Arc<RwLock<HierarchyEntry>>> {
         let entries = self.entries.read().unwrap();
-        let mut candidates: Vec<(&String, &Arc<RwLock<HierarchyEntry>>)> = entries
-            .iter()
-            .filter(|(_, e)| {
+        entries
+            .values()
+            .find(|e| {
                 e.read()
                     .unwrap()
                     .spec
@@ -306,9 +312,7 @@ impl HierarchyIndexManager {
                     .iter()
                     .any(|t| t == edge_type)
             })
-            .collect();
-        candidates.sort_by(|a, b| a.0.cmp(b.0));
-        candidates.first().map(|(_, e)| Arc::clone(e))
+            .map(Arc::clone)
     }
 
     /// A usable index by name.
@@ -331,10 +335,7 @@ impl HierarchyIndexManager {
     /// rather than dependent on hash iteration order.
     pub fn usable_containing(&self, ids: &[NodeId]) -> Option<Arc<RwLock<HierarchyEntry>>> {
         let entries = self.entries.read().unwrap();
-        let mut names: Vec<&String> = entries.keys().collect();
-        names.sort();
-        for name in names {
-            let e = &entries[name];
+        for e in entries.values() {
             let g = e.read().unwrap();
             if !g.usable() {
                 continue;
@@ -384,12 +385,11 @@ impl HierarchyIndexManager {
     /// All registered indexes, name-sorted.
     pub fn list(&self) -> Vec<HierarchyInfo> {
         let entries = self.entries.read().unwrap();
-        let mut out: Vec<HierarchyInfo> = entries
+        // BTreeMap iteration is already name-ordered.
+        entries
             .values()
             .map(|e| Self::info_for(&e.read().unwrap()))
-            .collect();
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        out
+            .collect()
     }
 
     fn info_for(entry: &HierarchyEntry) -> HierarchyInfo {

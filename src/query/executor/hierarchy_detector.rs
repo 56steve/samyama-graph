@@ -42,6 +42,22 @@ pub enum HierarchyRewrite {
         /// Output column name.
         alias: String,
     },
+    /// Filter a scan by an O(1) subsumption test instead of evaluating `subsumes()` as a
+    /// generic expression once per row.
+    OrderTest {
+        /// Index that answers it.
+        index_name: String,
+        /// Pinned ancestor.
+        root: NodeId,
+        /// Variable being tested.
+        var: String,
+        /// Label to scan, if the pattern gave one.
+        labels: Vec<Label>,
+        /// `NOT subsumes(...)` keeps the rows *outside* the subtree.
+        negated: bool,
+        /// What the query asks for once the rows are filtered.
+        output: OrderTestOutput,
+    },
     /// Enumerate the reflexive descendant set from the index.
     DescendantScan {
         /// Index that answers it.
@@ -51,6 +67,15 @@ pub enum HierarchyRewrite {
         /// Variable each descendant binds to.
         var: String,
     },
+}
+
+/// What an order-test query projects.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderTestOutput {
+    /// `RETURN count(x)` / `count(*)` — one scalar row.
+    Count(String),
+    /// `RETURN x` — the surviving rows themselves.
+    Nodes,
 }
 
 /// The shape common to both rewrites, extracted once.
@@ -68,6 +93,10 @@ pub fn detect(query: &Query, store: &GraphStore) -> Option<HierarchyRewrite> {
     if store.hierarchy_index.is_empty() {
         return None;
     }
+    if let Some(rewrite) = detect_order_test(query, store) {
+        return Some(rewrite);
+    }
+
     let pattern = match_pattern(query, store)?;
     let ret = query.return_clause.as_ref()?;
 
@@ -150,6 +179,140 @@ pub fn detect(query: &Query, store: &GraphStore) -> Option<HierarchyRewrite> {
     }
 
     None
+}
+
+/// Recognize `MATCH (d:L), (r:L2 {pin}) WHERE subsumes(d, r) RETURN count(d) | d`.
+///
+/// Without this the predicate is evaluated as a generic expression once per row: an
+/// expression-tree walk, a `Value` clone per argument, a function dispatch, and a registry
+/// probe to find the covering index — against two integer comparisons for the same answer.
+/// ADR-035 §8 specifies the rewrite; the operator has existed and been tested since #344,
+/// but nothing emitted it, which is why HIER classes H1 and H6 ran *slower* with the index
+/// than without and H5 lost outright to Neo4j.
+///
+/// Deliberately narrow: the pinned side must resolve to exactly one node in the hierarchy,
+/// and the projection must be a plain count or the rows themselves. Anything else returns
+/// `None` and takes the standard plan.
+fn detect_order_test(query: &Query, store: &GraphStore) -> Option<HierarchyRewrite> {
+    if query.match_clauses.len() != 1
+        || query.with_clause.is_some()
+        || query.create_clause.is_some()
+        || query.delete_clause.is_some()
+        || query.call_clause.is_some()
+        || query.call_subquery.is_some()
+        || query.unwind_clause.is_some()
+        || query.merge_clause.is_some()
+        || query.foreach_clause.is_some()
+        || !query.set_clauses.is_empty()
+        || !query.remove_clauses.is_empty()
+        || !query.union_queries.is_empty()
+        || query.order_by.is_some()
+        || query.limit.is_some()
+        || query.skip.is_some()
+    {
+        return None;
+    }
+    let clause = &query.match_clauses[0];
+    if clause.optional || clause.pattern.paths.len() != 2 {
+        return None;
+    }
+    // Both paths must be bare nodes — no edges to expand.
+    if clause
+        .pattern
+        .paths
+        .iter()
+        .any(|p| !p.segments.is_empty() || p.path_variable.is_some())
+    {
+        return None;
+    }
+
+    // The WHERE must be exactly `subsumes(a, b)` or `NOT subsumes(a, b)`.
+    let where_expr = &query.where_clause.as_ref()?.predicate;
+    let (negated, call) = match where_expr {
+        Expression::Unary {
+            op: crate::query::ast::UnaryOp::Not,
+            expr,
+        } => (true, expr.as_ref()),
+        other => (false, other),
+    };
+    let (child_var, root_var) = match call {
+        Expression::Function {
+            name,
+            args,
+            distinct: false,
+        } if name.eq_ignore_ascii_case("subsumes") && args.len() == 2 => {
+            match (&args[0], &args[1]) {
+                (Expression::Variable(a), Expression::Variable(b)) => (a.clone(), b.clone()),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+
+    // Identify which path is the tested side and which is the pinned ancestor.
+    let node_of = |var: &str| {
+        clause
+            .pattern
+            .paths
+            .iter()
+            .map(|p| &p.start)
+            .find(|n| n.variable.as_deref() == Some(var))
+    };
+    let child = node_of(&child_var)?;
+    let root_pattern = node_of(&root_var)?;
+    if child.properties.is_some() {
+        // A property constraint on the scanned side is a filter the scan does not apply.
+        return None;
+    }
+
+    let entry = {
+        // The pinned node has to belong to a usable hierarchy; which one is decided by the
+        // hierarchy that contains it, since no edge type is named in this shape.
+        let root = resolve_pinned_node(store, root_pattern)?;
+        store.hierarchy_index.usable_containing(&[root])?
+    };
+    let root = resolve_pinned_node(store, root_pattern)?;
+    let index_name = entry.read().unwrap().spec.name.clone();
+
+    let ret = query.return_clause.as_ref()?;
+    if ret.items.len() != 1 || ret.distinct {
+        return None;
+    }
+    let item = &ret.items[0];
+    let output = match &item.expression {
+        Expression::Function {
+            name,
+            args,
+            distinct: false,
+        } if name.eq_ignore_ascii_case("count") => {
+            let counts_the_scan = match args.as_slice() {
+                [Expression::Variable(v)] => *v == child_var,
+                [Expression::Literal(_)] => true, // count(*)
+                _ => false,
+            };
+            if !counts_the_scan {
+                return None;
+            }
+            OrderTestOutput::Count(
+                item.alias
+                    .clone()
+                    .unwrap_or_else(|| format!("count({child_var})")),
+            )
+        }
+        Expression::Variable(v) if *v == child_var && item.alias.is_none() => {
+            OrderTestOutput::Nodes
+        }
+        _ => return None,
+    };
+
+    Some(HierarchyRewrite::OrderTest {
+        index_name,
+        root,
+        var: child_var,
+        labels: child.labels.clone(),
+        negated,
+        output,
+    })
 }
 
 /// Match `MATCH (d)-[:T*0..]->(root {pinned})` (or its reversed spelling) against a usable
