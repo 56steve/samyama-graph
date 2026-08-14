@@ -34,6 +34,11 @@ gate, identical on every machine. `benches/hier_common/mod.rs` builds it: 18,975
 | Ontology | Term ⊑ Term, 5 levels × fanout 6 | `IS_A` | tree | nested-set | 1, 7, 43, 259, 1555, 9331 |
 | Threat | Technique ⊑ Technique, 2 parents each | `MAPS_TO` | multi-parent DAG | chain | 1 … 36 |
 
+A fourth encoding, **near-tree** (#371), covers posets that are trees apart from a small
+fraction of extra parent edges — real administrative geography, which the all-or-nothing
+`is_tree()` test previously threw away. It is not exercised by this generated dataset; see
+[`results/real-ontologies.md`](results/real-ontologies.md) for GeoNames.
+
 ## Correctness is the gate
 
 Every query runs twice: once against a store with the four hierarchies declared, once
