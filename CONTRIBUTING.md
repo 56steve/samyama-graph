@@ -44,7 +44,20 @@ in a large PR.
 ## Development Setup
 
 You will need a recent stable Rust toolchain (installed via
-[rustup](https://rustup.rs/)).
+[rustup](https://rustup.rs/)) and a few system packages. `zstd-sys` generates its
+bindings with `bindgen`, which needs libclang — without it the build fails part-way
+through with a misleading `'stddef.h' file not found`, so install these first:
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install -y build-essential cmake pkg-config libssl-dev clang libclang-dev
+
+# Fedora / RHEL
+sudo dnf install -y gcc gcc-c++ cmake pkgconf-pkg-config openssl-devel clang clang-devel
+
+# macOS — the Xcode Command Line Tools already provide clang
+xcode-select --install
+```
 
 Fork the repository on GitHub, then:
 
