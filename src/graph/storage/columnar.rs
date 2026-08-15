@@ -36,6 +36,16 @@ impl Column {
         }
     }
 
+    /// Remove this row's value from the column, if present.
+    pub fn remove(&mut self, idx: usize) {
+        match self {
+            Column::Int(m) => { m.remove(&idx); }
+            Column::Float(m) => { m.remove(&idx); }
+            Column::String(m) => { m.remove(&idx); }
+            Column::Bool(m) => { m.remove(&idx); }
+        }
+    }
+
     pub fn get(&self, idx: usize) -> PropertyValue {
         match self {
             Column::Int(m) => m.get(&idx).map(|&v| PropertyValue::Integer(v)).unwrap_or(PropertyValue::Null),
@@ -92,6 +102,18 @@ impl ColumnStore {
             };
             col.set(idx, value);
             self.columns.insert(key.to_string(), col);
+        }
+    }
+
+    /// Drop every property stored for one row.
+    ///
+    /// Node ids are recycled through a free list, so a deleted node's slot is handed to the
+    /// next `create_node`. Without this the new node inherits whatever the previous
+    /// occupant left in each column — values from deleted data reappearing on new data
+    /// (#364). Deletion has to clear the columns as well as the sparse map.
+    pub fn clear_row(&mut self, idx: usize) {
+        for col in self.columns.values_mut() {
+            col.remove(idx);
         }
     }
 

@@ -1214,6 +1214,11 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
             self.handle_index_event(event, None);
         }
 
+        // Clear the columnar row. The id goes on the free list just above and will be
+        // handed to the next create_node, which would otherwise inherit whatever this node
+        // left in each column — deleted values reappearing on new nodes (#364).
+        self.node_columns.clear_row(idx);
+
         // Remove from the versions (breaking historical reads for now, full MVCC is complex)
         // TODO: Implement proper tombstone versions
         let node = self.nodes[idx].pop().unwrap();

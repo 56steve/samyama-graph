@@ -730,3 +730,45 @@ fn a_second_match_joins_on_every_shared_variable() {
         "a variant must pair only with its own model's other variant: {r:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Deletion hygiene (#364)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_deleted_nodes_property_does_not_reappear_on_its_successor() {
+    // Node ids are recycled through a free list, so the next CREATE gets the deleted
+    // node's slot. If deletion leaves the columnar row behind, the new node inherits the
+    // old value for any property it does not itself set — deleted data reappearing on new
+    // data, with nothing in the query to hint at it.
+    let mut s = GraphStore::new();
+    let engine = QueryEngine::new();
+    engine
+        .execute_mut(
+            "CREATE (:Ghost {id: \"a\", secret: \"LEAKED\"})",
+            &mut s,
+            "default",
+        )
+        .unwrap();
+    engine
+        .execute_mut("MATCH (n:Ghost) DETACH DELETE n", &mut s, "default")
+        .unwrap();
+    assert_eq!(scalar(&s, "MATCH (n:Ghost) RETURN count(n) AS n"), "n=0");
+
+    // the successor sets `id` but never `secret`
+    engine
+        .execute_mut("CREATE (:Ghost {id: \"b\"})", &mut s, "default")
+        .unwrap();
+    let r = bag(&s, "MATCH (n:Ghost) RETURN n.id AS id, n.secret AS secret");
+    assert_eq!(r, vec!["id=b secret=NULL"], "{r:?}");
+
+    // and again after a global wipe
+    engine
+        .execute_mut("MATCH (n) DETACH DELETE n", &mut s, "default")
+        .unwrap();
+    engine
+        .execute_mut("CREATE (:Ghost {id: \"c\"})", &mut s, "default")
+        .unwrap();
+    let r = bag(&s, "MATCH (n:Ghost) RETURN n.id AS id, n.secret AS secret");
+    assert_eq!(r, vec!["id=c secret=NULL"], "{r:?}");
+}
