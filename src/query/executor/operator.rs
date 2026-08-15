@@ -5539,6 +5539,13 @@ impl PhysicalOperator for CreateVectorIndexOperator {
         store.create_vector_index(self.label.as_str(), &self.property_key, self.dimensions, metric)
             .map_err(|e| ExecutionError::GraphError(e.to_string()))?;
 
+        // Backfill nodes that already carry the embedding. Registering the index without
+        // populating it leaves every search returning nothing on a graph that was loaded
+        // before the index was declared — which is the normal order for a bulk import
+        // followed by DDL. `rebuild_vector_index` reads both the inline map and the
+        // columnar store, so it covers whichever tier the vectors landed in.
+        store.rebuild_vector_index();
+
         self.executed = true;
         
         // Return an empty record or a success record
