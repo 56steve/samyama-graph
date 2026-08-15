@@ -210,6 +210,16 @@ impl VectorIndex {
         if n == 0 {
             return Ok(Vec::new());
         }
+        // Below this size, search exactly. HNSW is an approximation that earns its keep at
+        // scale; on a tiny index its randomised layer assignment can produce a graph whose
+        // search returns NOTHING for a vector that is present — observed on a 1-vector
+        // index roughly one run in six, silently (#382). A linear scan over a handful of
+        // vectors costs microseconds and is always right, so there is nothing to trade.
+        const EXACT_SEARCH_MAX: usize = 128;
+        if n <= EXACT_SEARCH_MAX {
+            return Ok(self.brute_force_search(query, k.min(n)));
+        }
+
         let ef_search = (k * 2).max(64).min(n);
         // hnsw_rs 0.2.1 can panic deep in search_layer (hnsw.rs:938,
         // `return_points.peek().unwrap()`) on certain graphs. A panic here would
@@ -236,7 +246,17 @@ impl VectorIndex {
         for res in results {
             neighbors.push((NodeId::new(res.d_id as u64), res.distance));
         }
-        
+
+        // An empty result from a non-empty index is not an answer, it is a failure of the
+        // approximation — and unlike a panic it is silent. Fall back rather than report
+        // "no matches" for data that is present.
+        if neighbors.is_empty() {
+            eprintln!(
+                "[vector] HNSW returned no neighbours from a {n}-vector index; using exact fallback"
+            );
+            return Ok(self.brute_force_search(query, k.min(n)));
+        }
+
         Ok(neighbors)
     }
 
