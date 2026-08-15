@@ -186,6 +186,22 @@ docker compose down -v
 
 #### Option 2 — Build from source
 
+**System packages.** `zstd-sys` generates its bindings with `bindgen`, which needs libclang.
+Without it the build fails part-way through with a misleading `'stddef.h' file not found`.
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install -y build-essential cmake pkg-config libssl-dev clang libclang-dev
+
+# Fedora / RHEL
+sudo dnf install -y gcc gcc-c++ cmake pkgconf-pkg-config openssl-devel clang clang-devel
+
+# macOS — the Xcode Command Line Tools already provide clang
+xcode-select --install
+```
+
+Then, with a stable Rust toolchain from [rustup](https://rustup.rs/):
+
 ```bash
 # Build from source
 git clone https://github.com/samyama-ai/samyama-graph && cd samyama-graph
