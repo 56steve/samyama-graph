@@ -116,6 +116,10 @@ name = "property_access"
 harness = false
 
 [[bench]]
+name = "varlength_expand"
+harness = false
+
+[[bench]]
 name = "ingest_profile"
 harness = false
 

@@ -3349,6 +3349,13 @@ pub struct VarLengthExpandOperator {
     path_variable: Option<String>,
     /// Output records buffered for the current input record.
     pending: std::collections::VecDeque<Record>,
+    /// `edge_types` resolved to interned ids, cached after the first use.
+    ///
+    /// Resolving is a hash lookup per type against the store, and the answer
+    /// cannot change during a query. Empty vec inside the `Some` means "no
+    /// filter"; a requested type the graph has never seen simply contributes
+    /// no id, so it matches nothing -- which is correct.
+    type_ids: Option<Vec<u16>>,
 }
 
 impl VarLengthExpandOperator {
@@ -3375,6 +3382,7 @@ impl VarLengthExpandOperator {
             max_hops,
             path_variable: None,
             pending: std::collections::VecDeque::new(),
+            type_ids: None,
         }
     }
 
@@ -3390,37 +3398,57 @@ impl VarLengthExpandOperator {
         self
     }
 
-    /// One-hop neighbours of `node` honouring direction + edge-type filter,
-    /// returned as `(neighbour_node, edge_id)` pairs.
-    fn neighbors(&self, node: NodeId, store: &GraphStore) -> Vec<(NodeId, crate::graph::EdgeId)> {
-        let raw: Vec<(crate::graph::EdgeId, NodeId, NodeId, EdgeType)> = match self.direction {
-            Direction::Outgoing => store.get_outgoing_edge_targets_owned(node),
-            Direction::Incoming => store.get_incoming_edge_sources_owned(node),
+    /// The edge-type filter as interned ids, resolved once per query.
+    ///
+    /// Returns `None` when the pattern named no types at all -- the wildcard.
+    /// A pattern that named types none of which exist in the graph returns
+    /// `Some(empty)`, which matches nothing. Collapsing those two cases makes
+    /// `-[:NO_SUCH_TYPE*1..3]->` follow every edge in the graph; a test does
+    /// exactly that, and it failed against the first version of this.
+    fn type_ids(&mut self, store: &GraphStore) -> Option<Vec<u16>> {
+        if self.edge_types.is_empty() {
+            return None;
+        }
+        if self.type_ids.is_none() {
+            let ids = self
+                .edge_types
+                .iter()
+                .filter_map(|t| store.edge_type_id(&EdgeType::new(t.as_str())))
+                .collect();
+            self.type_ids = Some(ids);
+        }
+        self.type_ids.clone()
+    }
+
+    /// Visit each one-hop neighbour of `node` honouring direction and the
+    /// edge-type filter, without allocating.
+    ///
+    /// This used to build a `Vec` of `(EdgeId, NodeId, NodeId, EdgeType)` per
+    /// node -- three allocations and an `EdgeType` **string clone per incident
+    /// edge** -- and then filter it by comparing those strings. The filter was
+    /// therefore paid *after* materialising every incident edge, which on a
+    /// real graph is most of the cost: an LDBC `Person` has ~41 `KNOWS` edges
+    /// and ~900 others (inbound `HAS_CREATOR` from every post and comment they
+    /// wrote, `LIKES`, `HAS_MEMBER`, `HAS_INTEREST`), so `KNOWS*1..3` from one
+    /// person enumerated ~9.3M edges to traverse 404K (#520).
+    ///
+    /// Filtering on the interned type id inside the walk skips a non-matching
+    /// edge in a compare rather than a string clone.
+    fn for_each_neighbor(
+        &self,
+        node: NodeId,
+        type_ids: Option<&[u16]>,
+        store: &GraphStore,
+        mut visit: impl FnMut(NodeId, crate::graph::EdgeId),
+    ) {
+        match self.direction {
+            Direction::Outgoing => store.for_each_outgoing_neighbor(node, type_ids, &mut visit),
+            Direction::Incoming => store.for_each_incoming_neighbor(node, type_ids, &mut visit),
             Direction::Both => {
-                let mut all = store.get_outgoing_edge_targets_owned(node);
-                all.extend(store.get_incoming_edge_sources_owned(node));
-                all
+                store.for_each_outgoing_neighbor(node, type_ids, &mut visit);
+                store.for_each_incoming_neighbor(node, type_ids, &mut visit);
             }
-        };
-        raw.into_iter()
-            .filter(|(_, _, _, et)| {
-                self.edge_types.is_empty() || self.edge_types.iter().any(|t| et.as_str() == t)
-            })
-            .map(|(eid, src, tgt, _)| {
-                let other = match self.direction {
-                    Direction::Outgoing => tgt,
-                    Direction::Incoming => src,
-                    Direction::Both => {
-                        if src == node {
-                            tgt
-                        } else {
-                            src
-                        }
-                    }
-                };
-                (other, eid)
-            })
-            .collect()
+        }
     }
 
     /// BFS from the source bound in `record`, buffering one output record per
@@ -3445,19 +3473,30 @@ impl VarLengthExpandOperator {
             self.buffer(record, source_id, &parent, source_id);
         }
 
+        let type_ids: Option<Vec<u16>> = self.type_ids(store);
+        let type_filter = type_ids.as_deref();
+
         let mut frontier = vec![source_id];
         let mut depth = 0usize;
         while !frontier.is_empty() && depth < self.max_hops {
             depth += 1;
             let mut next = Vec::new();
             for &cur in &frontier {
-                for (nb, eid) in self.neighbors(cur, store) {
+                // The closure borrows the BFS state; buffering an output
+                // record needs `&mut self`, so discovery and emission are
+                // separated. The emission order is unchanged: `next` is filled
+                // in exactly the order the old code emitted in.
+                self.for_each_neighbor(cur, type_filter, store, |nb, eid| {
                     if visited.insert(nb) {
                         parent.insert(nb, (cur, eid));
                         next.push(nb);
-                        if depth >= self.min_hops && self.emit_ok(nb, store) {
-                            self.buffer(record, nb, &parent, source_id);
-                        }
+                    }
+                });
+            }
+            if depth >= self.min_hops {
+                for &nb in &next {
+                    if self.emit_ok(nb, store) {
+                        self.buffer(record, nb, &parent, source_id);
                     }
                 }
             }
