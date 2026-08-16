@@ -1974,6 +1974,101 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
 
     /// Get outgoing edge targets with owned EdgeType — works for both full and stub edges.
     /// Uses compact edge_type_ids array (DS-07c) when Edge objects are not available.
+    /// The interned id of an edge type, if the graph has ever seen one.
+    ///
+    /// `None` means no edge in the graph has this type, so a filter on it
+    /// matches nothing — which is the right answer, not an error.
+    pub fn edge_type_id(&self, edge_type: &EdgeType) -> Option<u16> {
+        self.edge_type_to_id.get(edge_type).copied()
+    }
+
+    /// Visit each outgoing neighbour of `node`, without allocating.
+    ///
+    /// `type_ids` is `None` for "any type", or `Some(ids)` for the interned
+    /// ids to accept. `Some(&[])` therefore matches **nothing** -- which is
+    /// the right answer when a caller asked for an edge type the graph has
+    /// never seen, and the reason this is an `Option` rather than a slice
+    /// whose emptiness means "wildcard". Conflating the two makes
+    /// `-[:NO_SUCH_TYPE*1..3]->` follow every edge in the graph.
+    ///
+    /// This exists because `get_outgoing_edge_targets_owned` — which the
+    /// traversal operators used — allocates a `Vec` for the frozen tier, a
+    /// second `Vec` for the result, and **clones an `EdgeType` string per
+    /// edge**, only for the caller to compare that string against a filter and
+    /// usually discard it.
+    ///
+    /// That is paid per *incident* edge, not per matching one, and the
+    /// difference is the whole cost on a real graph: an LDBC `Person` has ~41
+    /// `KNOWS` edges and ~900 other incident edges — inbound `HAS_CREATOR`
+    /// from every post and comment they wrote, `LIKES`, `HAS_MEMBER`,
+    /// `HAS_INTEREST`. Expanding `KNOWS*1..3` from one person enumerated
+    /// roughly 9.3M edges to traverse 404K of them (#520).
+    ///
+    /// `incoming_degree_for_type` already took this approach and says so in its
+    /// own doc comment; this generalises it.
+    pub fn for_each_outgoing_neighbor(
+        &self,
+        node_id: NodeId,
+        type_ids: Option<&[u16]>,
+        mut visit: impl FnMut(NodeId, EdgeId),
+    ) {
+        let idx = node_id.as_u64() as usize;
+        for seg in &self.frozen_outgoing.segments {
+            for &(target, eid) in seg.neighbors(idx) {
+                if self.edge_type_matches(eid, type_ids) {
+                    visit(target, eid);
+                }
+            }
+        }
+        if let Some(entries) = self.outgoing.get(idx) {
+            for &(target, eid) in entries {
+                if self.edge_type_matches(eid, type_ids) {
+                    visit(target, eid);
+                }
+            }
+        }
+    }
+
+    /// Visit each incoming neighbour of `node`, without allocating.
+    /// See [`GraphStore::for_each_outgoing_neighbor`].
+    pub fn for_each_incoming_neighbor(
+        &self,
+        node_id: NodeId,
+        type_ids: Option<&[u16]>,
+        mut visit: impl FnMut(NodeId, EdgeId),
+    ) {
+        let idx = node_id.as_u64() as usize;
+        for seg in &self.frozen_incoming.segments {
+            for &(source, eid) in seg.neighbors(idx) {
+                if self.edge_type_matches(eid, type_ids) {
+                    visit(source, eid);
+                }
+            }
+        }
+        if let Some(entries) = self.incoming.get(idx) {
+            for &(source, eid) in entries {
+                if self.edge_type_matches(eid, type_ids) {
+                    visit(source, eid);
+                }
+            }
+        }
+    }
+
+    /// Compare an edge's interned type against a filter.
+    ///
+    /// `None` accepts everything; `Some(ids)` accepts only those ids, so
+    /// `Some(&[])` accepts nothing.
+    #[inline]
+    fn edge_type_matches(&self, edge_id: EdgeId, type_ids: Option<&[u16]>) -> bool {
+        let Some(ids) = type_ids else { return true };
+        let id = self
+            .edge_type_ids
+            .get(edge_id.as_u64() as usize)
+            .copied()
+            .unwrap_or(Self::EDGE_TYPE_UNSET);
+        ids.contains(&id)
+    }
+
     pub fn get_outgoing_edge_targets_owned(&self, node_id: NodeId) -> Vec<(EdgeId, NodeId, NodeId, EdgeType)> {
         let src_idx = node_id.as_u64() as usize;
         let mut result = Vec::new();
