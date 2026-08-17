@@ -64,6 +64,7 @@
 //! - `HashMap` — build phase of hash joins in `JoinOperator`
 //! - `BTreeSet` — sorted unique results where ordering matters
 
+use crate::query::executor::record::PropertyCursor;
 use crate::graph::{GraphStore, Label, NodeId, EdgeType};
 use crate::query::ast::{Expression, BinaryOp, UnaryOp, Direction, Pattern};
 use crate::query::executor::{ExecutionError, ExecutionResult, Record, Value, RecordBatch};
@@ -867,7 +868,7 @@ pub fn eval_predicate_standalone(predicate: &Expression, record: &Record, store:
         fn next(&mut self, _: &GraphStore) -> ExecutionResult<Option<Record>> { Ok(None) }
         fn reset(&mut self) {}
     }
-    let evaluator = FilterOperator { input: Box::new(NullScan), predicate: predicate.clone() };
+    let evaluator = FilterOperator::new(Box::new(NullScan), predicate.clone());
     evaluator.evaluate_predicate(record, store)
 }
 
@@ -2618,18 +2619,129 @@ impl PhysicalOperator for EdgeTypeCountOperator {
 }
 
 /// Filter operator: WHERE n.age > 30
+/// Rows must be worth at least this much per-row predicate work before a batch
+/// is filtered in parallel.
+///
+/// Fitted to a measured crossover, not chosen. Interleaved A/B over 1,000,000
+/// rows, only the threshold varying (#559):
+///
+/// | predicate                                  | cost | parallel | sequential |
+/// |--------------------------------------------|-----:|---------:|-----------:|
+/// | `i.v > 500`                                |    2 |  404.8ms | **252.0ms**|
+/// | `i.v > 500 AND i.w > 5`                    |    5 |  486.7ms | **327.4ms**|
+/// | `i.name CONTAINS "99"`                     |    5 |  525.7ms | **285.8ms**|
+/// | `toUpper(i.name) CONTAINS "99"`            |   13 |  512.1ms | **363.8ms**|
+/// | 4 conjuncts, two of them string operations |   25 |**461.5ms**|  604.9ms  |
+///
+/// So the crossover sits between 13 and 25, and 20 puts every measured case on
+/// the side that won. The exact figure is host-dependent — it is a ratio
+/// between per-row work and cross-core coordination — so it is a threshold
+/// with a reproducer rather than a constant to be trusted.
+const PARALLEL_PREDICATE_COST: u32 = 20;
+
+/// Roughly what evaluating `expr` costs per row, in units where reading one
+/// property is 1.
+///
+/// This exists because the previous rule went parallel on **batch size**, which
+/// says nothing about how much work a predicate does — and with a batch size of
+/// 65,536, every batch qualified. A `Record` holds `Arc<str>` binding names, so
+/// moving records across threads churns atomic refcounts on cache lines every
+/// thread shares; against a predicate as cheap as one comparison there is
+/// nothing to amortise that against, and parallel filtering lost 1.4-1.8x on
+/// every predicate a real query writes.
+///
+/// Absolute accuracy does not matter. Only the side of `PARALLEL_PREDICATE_COST`
+/// the answer lands on does, so the weights are deliberately coarse.
+fn predicate_cost(expr: &Expression) -> u32 {
+    match expr {
+        // The unit. A scattered column read plus the match to unwrap it.
+        Expression::Property { .. } => 1,
+        // Free: already in the record, or in the expression.
+        Expression::Literal(_) | Expression::Variable(_) | Expression::Parameter(_) => 0,
+        Expression::PathVariable(_) => 0,
+        Expression::Binary { left, op, right } => {
+            // String comparisons scan and often allocate; numeric ones are a
+            // register compare.
+            let op_cost = match op {
+                BinaryOp::Contains
+                | BinaryOp::StartsWith
+                | BinaryOp::EndsWith
+                | BinaryOp::RegexMatch => 4,
+                _ => 1,
+            };
+            op_cost + predicate_cost(left) + predicate_cost(right)
+        }
+        Expression::Unary { expr, .. } => 1 + predicate_cost(expr),
+        // A call allocates its result and usually its arguments.
+        Expression::Function { args, .. } => {
+            8 + args.iter().map(predicate_cost).sum::<u32>()
+        }
+        Expression::Case { operand, when_clauses, else_result } => {
+            1 + operand.as_deref().map(predicate_cost).unwrap_or(0)
+                + when_clauses.iter().map(|(w, t)| predicate_cost(w) + predicate_cost(t)).sum::<u32>()
+                + else_result.as_deref().map(predicate_cost).unwrap_or(0)
+        }
+        Expression::Index { expr, index } => 1 + predicate_cost(expr) + predicate_cost(index),
+        Expression::ListSlice { expr, start, end } => {
+            2 + predicate_cost(expr)
+                + start.as_deref().map(predicate_cost).unwrap_or(0)
+                + end.as_deref().map(predicate_cost).unwrap_or(0)
+        }
+        // These run a query or a loop per row. Whatever the body costs, the
+        // per-row work is large enough that coordination is worth paying.
+        Expression::ExistsSubquery { .. } => 50,
+        Expression::ListComprehension { list_expr, filter, map_expr, .. } => {
+            20 + predicate_cost(list_expr)
+                + filter.as_deref().map(predicate_cost).unwrap_or(0)
+                + predicate_cost(map_expr)
+        }
+        Expression::PredicateFunction { list_expr, predicate, .. } => {
+            20 + predicate_cost(list_expr) + predicate_cost(predicate)
+        }
+        Expression::Reduce { init, list_expr, expression, .. } => {
+            20 + predicate_cost(init) + predicate_cost(list_expr) + predicate_cost(expression)
+        }
+        Expression::PatternComprehension { .. } => 50,
+    }
+}
+
 pub struct FilterOperator {
     /// Input operator
     input: OperatorBox,
     /// Predicate expression
     predicate: Expression,
+    /// Whether this predicate is expensive enough per row to be worth filtering
+    /// across threads. Computed once, from the expression, not from batch size.
+    parallel: bool,
 }
 
 impl FilterOperator {
     /// Create a new filter operator
     pub fn new(input: OperatorBox, predicate: Expression) -> Self {
-        Self { input, predicate }
+        let parallel = Self::predicate_is_parallel(&predicate);
+        Self { input, predicate, parallel }
     }
+
+    /// Whether this predicate is worth filtering across threads.
+    ///
+    /// `SAMYAMA_FILTER_PARALLEL_COST` overrides the threshold. It exists so
+    /// `benches/filter_throughput.rs` can run both sides **interleaved in one
+    /// process**, which is the only way to A/B this reliably: the effect is a
+    /// ratio between per-row work and cross-core coordination, so it moves with
+    /// the host, and comparing two separate benchmark runs measured 16% drift
+    /// on an otherwise idle dedicated box (#529). A threshold fitted from
+    /// across-run numbers would be fitted to noise.
+    ///
+    /// Unset in normal use. `0` forces parallel, a large value forces
+    /// sequential.
+    pub fn predicate_is_parallel(predicate: &Expression) -> bool {
+        let threshold = std::env::var("SAMYAMA_FILTER_PARALLEL_COST")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(PARALLEL_PREDICATE_COST);
+        predicate_cost(predicate) >= threshold
+    }
+
 
     fn evaluate_predicate(&self, record: &Record, _store: &GraphStore) -> ExecutionResult<bool> {
         let result = self.evaluate_expression(&self.predicate, record, _store)?;
@@ -3029,8 +3141,10 @@ impl PhysicalOperator for FilterOperator {
         while filtered_records.len() < batch_size {
             if let Some(batch) = self.input.next_batch(store, batch_size)? {
                 let records = batch.records;
-                // Parallel filter for large batches (256+ records)
-                if records.len() >= 256 {
+                // Parallel only where the predicate is expensive enough to pay
+                // for moving records across threads (#559). A small batch is
+                // still not worth splitting whatever the predicate costs.
+                if self.parallel && records.len() >= 256 {
                     let predicate = self.predicate.clone();
                     let passed: Vec<Record> = records.into_par_iter()
                         .filter(|record| {
@@ -4359,6 +4473,38 @@ impl PhysicalOperator for AggregateOperator {
     }
 }
 
+
+/// Per-row evaluation of one expression, specialised where it is a plain
+/// `x.prop`.
+///
+/// Built once per fold rather than held on the operator, because the operator
+/// borrows `self.aggregates` immutably across the loop and a cursor needs
+/// `&mut` to memoise its column.
+enum RowReader {
+    /// `x.prop` — the column is located once (#557).
+    Cursor(PropertyCursor),
+    /// Anything else: a literal, an arithmetic expression, a function call.
+    General(Expression),
+}
+
+impl RowReader {
+    fn for_expression(expr: &Expression) -> Self {
+        match expr {
+            Expression::Property { variable, property } => {
+                RowReader::Cursor(PropertyCursor::new(variable.as_str(), property.as_str()))
+            }
+            other => RowReader::General(other.clone()),
+        }
+    }
+
+    fn read(&mut self, record: &Record, store: &GraphStore) -> ExecutionResult<Value> {
+        match self {
+            RowReader::Cursor(cursor) => Ok(Value::Property(cursor.read(record, store))),
+            RowReader::General(expr) => AggregateOperator::evaluate_expression(expr, record, store),
+        }
+    }
+}
+
 /// The group key of a row, before the key expressions are evaluated.
 ///
 /// Grouping on a node's *identity* is at least as fine as grouping on any
@@ -4441,6 +4587,8 @@ impl AggregateOperator {
     /// and without the merge they would come out as two.
     fn execute_all_by_identity(&mut self, var: &str, store: &GraphStore) -> ExecutionResult<()> {
         let all_simple_count = Self::all_simple_count(&self.aggregates);
+        let mut readers: Vec<RowReader> =
+            self.aggregates.iter().map(|a| RowReader::for_expression(&a.expr)).collect();
 
         // The representative is the first `Value` seen for an identity, kept so
         // phase 2 has something to resolve properties against. Cloned once per
@@ -4475,8 +4623,8 @@ impl AggregateOperator {
                         }
                     }
                 } else {
-                    for (i, agg) in self.aggregates.iter().enumerate() {
-                        let val = Self::evaluate_expression(&agg.expr, &record, store)?;
+                    for (i, reader) in readers.iter_mut().enumerate() {
+                        let val = reader.read(&record, store)?;
                         states[i].update(&val);
                     }
                 }
@@ -4545,6 +4693,10 @@ impl AggregateOperator {
         let mut groups: rustc_hash::FxHashMap<Vec<Value>, Vec<AggregatorState>> =
             rustc_hash::FxHashMap::default();
         let all_simple_count = Self::all_simple_count(&self.aggregates);
+        let mut key_readers: Vec<RowReader> =
+            self.group_by.iter().map(|(e, _)| RowReader::for_expression(e)).collect();
+        let mut readers: Vec<RowReader> =
+            self.aggregates.iter().map(|a| RowReader::for_expression(&a.expr)).collect();
 
         // Reused across rows. `entry` needs an owned key, so building the tuple
         // straight into the map allocated a `Vec` per input row and freed it
@@ -4559,8 +4711,8 @@ impl AggregateOperator {
             if batch_count % 10 == 0 { check_deadline()?; }
             for record in batch.records {
                 scratch.clear();
-                for (expr, _) in &self.group_by {
-                    scratch.push(Self::evaluate_expression(expr, &record, store)?);
+                for reader in key_readers.iter_mut() {
+                    scratch.push(reader.read(&record, store)?);
                 }
 
                 let states = match groups.get_mut(&scratch) {
@@ -4577,8 +4729,8 @@ impl AggregateOperator {
                         }
                     }
                 } else {
-                    for (i, agg) in self.aggregates.iter().enumerate() {
-                        let val = Self::evaluate_expression(&agg.expr, &record, store)?;
+                    for (i, reader) in readers.iter_mut().enumerate() {
+                        let val = reader.read(&record, store)?;
                         states[i].update(&val);
                     }
                 }
@@ -4606,7 +4758,9 @@ impl AggregateOperator {
     fn execute_all_single_key(&mut self, store: &GraphStore) -> ExecutionResult<()> {
         let mut groups: rustc_hash::FxHashMap<Value, Vec<AggregatorState>> =
             rustc_hash::FxHashMap::default();
-        let group_expr = &self.group_by[0].0;
+        let mut key_reader = RowReader::for_expression(&self.group_by[0].0);
+        let mut readers: Vec<RowReader> =
+            self.aggregates.iter().map(|a| RowReader::for_expression(&a.expr)).collect();
 
         let all_simple_count = Self::all_simple_count(&self.aggregates);
 
@@ -4616,7 +4770,7 @@ impl AggregateOperator {
             batch_count += 1;
             if batch_count % 10 == 0 { check_deadline()?; }
             for record in batch.records {
-                let key = Self::evaluate_expression(group_expr, &record, store)?;
+                let key = key_reader.read(&record, store)?;
 
                 let states = groups.entry(key).or_insert_with(|| {
                     self.aggregates.iter().map(|agg| AggregatorState::new(&agg.func, agg.distinct)).collect()
@@ -4630,8 +4784,8 @@ impl AggregateOperator {
                         }
                     }
                 } else {
-                    for (i, agg) in self.aggregates.iter().enumerate() {
-                        let val = Self::evaluate_expression(&agg.expr, &record, store)?;
+                    for (i, reader) in readers.iter_mut().enumerate() {
+                        let val = reader.read(&record, store)?;
                         states[i].update(&val);
                     }
                 }
@@ -4661,6 +4815,8 @@ impl AggregateOperator {
             .collect();
 
         let all_simple_count = Self::all_simple_count(&self.aggregates);
+        let mut readers: Vec<RowReader> =
+            self.aggregates.iter().map(|a| RowReader::for_expression(&a.expr)).collect();
 
         let batch_size = 65536;
         let mut batch_count = 0u64;
@@ -4678,8 +4834,8 @@ impl AggregateOperator {
                 }
             } else {
                 for record in batch.records {
-                    for (i, agg) in self.aggregates.iter().enumerate() {
-                        let val = Self::evaluate_expression(&agg.expr, &record, store)?;
+                    for (i, reader) in readers.iter_mut().enumerate() {
+                        let val = reader.read(&record, store)?;
                         states[i].update(&val);
                     }
                 }
