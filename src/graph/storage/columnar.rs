@@ -483,14 +483,33 @@ impl Column {
     }
 }
 
+/// A column's position in the store, stable for the store's lifetime.
+///
+/// The point of handing these out is that a property name is fixed at plan
+/// time but was hashed once per *row*: `get_property(idx, "title")` probed a
+/// `FxHashMap<String, Column>` a million times to reach the same column. An
+/// operator can resolve the id once and index directly, which measured 37.6 ns
+/// to 22.6 ns per read in scattered order (#557).
+///
+/// Stability is what makes caching one safe: columns are only ever appended.
+/// `clear_row` clears a row's *values*; nothing removes a column, so an id
+/// handed out earlier still names the same column later.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ColumnId(u32);
+
 /// Manages multiple property columns.
 #[derive(Debug, Default, Clone)]
 pub struct ColumnStore {
-    /// Mapping from property key -> Column.
+    /// Columns by id. Append-only, so a `ColumnId` never dangles or shifts.
+    columns: Vec<Column>,
+    /// Parallel to `columns`, for reporting a row's property names back.
+    names: Vec<String>,
+    /// Property key -> id. Consulted once per query per property rather than
+    /// once per row, wherever the caller keeps the id.
     ///
-    /// Also `FxHashMap`: property names are short, the set of them is small
-    /// and fixed after load, and this lookup happens on every property read.
-    columns: FxHashMap<String, Column>,
+    /// `FxHashMap`: property names are short, the set of them is small and
+    /// fixed after load.
+    index: FxHashMap<String, ColumnId>,
 }
 
 impl ColumnStore {
@@ -498,9 +517,28 @@ impl ColumnStore {
         Self::default()
     }
 
+    /// The id of a property's column, if it has one.
+    ///
+    /// Resolve this once and read with `get_by_id`. `None` means no column
+    /// exists *yet* — a later `set_property` may create one, so a caller that
+    /// caches a `None` has to keep asking.
+    #[inline]
+    pub fn column_id(&self, key: &str) -> Option<ColumnId> {
+        self.index.get(key).copied()
+    }
+
+    /// Read a value by column id — a bounds-checked index, no hashing.
+    #[inline]
+    pub fn get_by_id(&self, id: ColumnId, idx: usize) -> PropertyValue {
+        match self.columns.get(id.0 as usize) {
+            Some(col) => col.get(idx),
+            None => PropertyValue::Null,
+        }
+    }
+
     pub fn set_property(&mut self, idx: usize, key: &str, value: PropertyValue) {
-        if let Some(col) = self.columns.get_mut(key) {
-            col.set(idx, value);
+        if let Some(&ColumnId(slot)) = self.index.get(key) {
+            self.columns[slot as usize].set(idx, value);
         } else {
             // Every `PropertyValue` gets a column. Returning early for the
             // ones without a typed representation is what made row storage
@@ -508,7 +546,10 @@ impl ColumnStore {
             // there, so the duplication could not be removed (#545).
             let mut col = Column::for_value(&value);
             col.set(idx, value);
-            self.columns.insert(key.to_string(), col);
+            let id = ColumnId(self.columns.len() as u32);
+            self.columns.push(col);
+            self.names.push(key.to_string());
+            self.index.insert(key.to_string(), id);
         }
     }
 
@@ -519,24 +560,28 @@ impl ColumnStore {
     /// occupant left in each column — values from deleted data reappearing on new data
     /// (#364). Deletion has to clear the columns as well as the sparse map.
     pub fn clear_row(&mut self, idx: usize) {
-        for col in self.columns.values_mut() {
+        for col in self.columns.iter_mut() {
             col.remove(idx);
         }
     }
 
     pub fn get_property(&self, idx: usize, key: &str) -> PropertyValue {
-        self.columns.get(key).map(|col| col.get(idx)).unwrap_or(PropertyValue::Null)
+        match self.index.get(key) {
+            Some(&ColumnId(slot)) => self.columns[slot as usize].get(idx),
+            None => PropertyValue::Null,
+        }
     }
 
     /// Optimized batch read for a single property
     pub fn get_column(&self, key: &str) -> Option<&Column> {
-        self.columns.get(key)
+        self.index.get(key).and_then(|&ColumnId(slot)| self.columns.get(slot as usize))
     }
 
     /// Get all property keys that have a non-null value for a given node index.
     /// Used by `keys()` function to discover column-store-only properties.
     pub fn get_property_keys(&self, idx: usize) -> Vec<String> {
-        self.columns.iter()
+        self.names.iter()
+            .zip(self.columns.iter())
             .filter(|(_, col)| col.has(idx))
             .map(|(key, _)| key.clone())
             .collect()

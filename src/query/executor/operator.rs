@@ -64,6 +64,7 @@
 //! - `HashMap` — build phase of hash joins in `JoinOperator`
 //! - `BTreeSet` — sorted unique results where ordering matters
 
+use crate::query::executor::record::PropertyCursor;
 use crate::graph::{GraphStore, Label, NodeId, EdgeType};
 use crate::query::ast::{Expression, BinaryOp, UnaryOp, Direction, Pattern};
 use crate::query::executor::{ExecutionError, ExecutionResult, Record, Value, RecordBatch};
@@ -4359,6 +4360,38 @@ impl PhysicalOperator for AggregateOperator {
     }
 }
 
+
+/// Per-row evaluation of one expression, specialised where it is a plain
+/// `x.prop`.
+///
+/// Built once per fold rather than held on the operator, because the operator
+/// borrows `self.aggregates` immutably across the loop and a cursor needs
+/// `&mut` to memoise its column.
+enum RowReader {
+    /// `x.prop` — the column is located once (#557).
+    Cursor(PropertyCursor),
+    /// Anything else: a literal, an arithmetic expression, a function call.
+    General(Expression),
+}
+
+impl RowReader {
+    fn for_expression(expr: &Expression) -> Self {
+        match expr {
+            Expression::Property { variable, property } => {
+                RowReader::Cursor(PropertyCursor::new(variable.as_str(), property.as_str()))
+            }
+            other => RowReader::General(other.clone()),
+        }
+    }
+
+    fn read(&mut self, record: &Record, store: &GraphStore) -> ExecutionResult<Value> {
+        match self {
+            RowReader::Cursor(cursor) => Ok(Value::Property(cursor.read(record, store))),
+            RowReader::General(expr) => AggregateOperator::evaluate_expression(expr, record, store),
+        }
+    }
+}
+
 /// The group key of a row, before the key expressions are evaluated.
 ///
 /// Grouping on a node's *identity* is at least as fine as grouping on any
@@ -4441,6 +4474,8 @@ impl AggregateOperator {
     /// and without the merge they would come out as two.
     fn execute_all_by_identity(&mut self, var: &str, store: &GraphStore) -> ExecutionResult<()> {
         let all_simple_count = Self::all_simple_count(&self.aggregates);
+        let mut readers: Vec<RowReader> =
+            self.aggregates.iter().map(|a| RowReader::for_expression(&a.expr)).collect();
 
         // The representative is the first `Value` seen for an identity, kept so
         // phase 2 has something to resolve properties against. Cloned once per
@@ -4475,8 +4510,8 @@ impl AggregateOperator {
                         }
                     }
                 } else {
-                    for (i, agg) in self.aggregates.iter().enumerate() {
-                        let val = Self::evaluate_expression(&agg.expr, &record, store)?;
+                    for (i, reader) in readers.iter_mut().enumerate() {
+                        let val = reader.read(&record, store)?;
                         states[i].update(&val);
                     }
                 }
@@ -4545,6 +4580,10 @@ impl AggregateOperator {
         let mut groups: rustc_hash::FxHashMap<Vec<Value>, Vec<AggregatorState>> =
             rustc_hash::FxHashMap::default();
         let all_simple_count = Self::all_simple_count(&self.aggregates);
+        let mut key_readers: Vec<RowReader> =
+            self.group_by.iter().map(|(e, _)| RowReader::for_expression(e)).collect();
+        let mut readers: Vec<RowReader> =
+            self.aggregates.iter().map(|a| RowReader::for_expression(&a.expr)).collect();
 
         // Reused across rows. `entry` needs an owned key, so building the tuple
         // straight into the map allocated a `Vec` per input row and freed it
@@ -4559,8 +4598,8 @@ impl AggregateOperator {
             if batch_count % 10 == 0 { check_deadline()?; }
             for record in batch.records {
                 scratch.clear();
-                for (expr, _) in &self.group_by {
-                    scratch.push(Self::evaluate_expression(expr, &record, store)?);
+                for reader in key_readers.iter_mut() {
+                    scratch.push(reader.read(&record, store)?);
                 }
 
                 let states = match groups.get_mut(&scratch) {
@@ -4577,8 +4616,8 @@ impl AggregateOperator {
                         }
                     }
                 } else {
-                    for (i, agg) in self.aggregates.iter().enumerate() {
-                        let val = Self::evaluate_expression(&agg.expr, &record, store)?;
+                    for (i, reader) in readers.iter_mut().enumerate() {
+                        let val = reader.read(&record, store)?;
                         states[i].update(&val);
                     }
                 }
@@ -4606,7 +4645,9 @@ impl AggregateOperator {
     fn execute_all_single_key(&mut self, store: &GraphStore) -> ExecutionResult<()> {
         let mut groups: rustc_hash::FxHashMap<Value, Vec<AggregatorState>> =
             rustc_hash::FxHashMap::default();
-        let group_expr = &self.group_by[0].0;
+        let mut key_reader = RowReader::for_expression(&self.group_by[0].0);
+        let mut readers: Vec<RowReader> =
+            self.aggregates.iter().map(|a| RowReader::for_expression(&a.expr)).collect();
 
         let all_simple_count = Self::all_simple_count(&self.aggregates);
 
@@ -4616,7 +4657,7 @@ impl AggregateOperator {
             batch_count += 1;
             if batch_count % 10 == 0 { check_deadline()?; }
             for record in batch.records {
-                let key = Self::evaluate_expression(group_expr, &record, store)?;
+                let key = key_reader.read(&record, store)?;
 
                 let states = groups.entry(key).or_insert_with(|| {
                     self.aggregates.iter().map(|agg| AggregatorState::new(&agg.func, agg.distinct)).collect()
@@ -4630,8 +4671,8 @@ impl AggregateOperator {
                         }
                     }
                 } else {
-                    for (i, agg) in self.aggregates.iter().enumerate() {
-                        let val = Self::evaluate_expression(&agg.expr, &record, store)?;
+                    for (i, reader) in readers.iter_mut().enumerate() {
+                        let val = reader.read(&record, store)?;
                         states[i].update(&val);
                     }
                 }
@@ -4661,6 +4702,8 @@ impl AggregateOperator {
             .collect();
 
         let all_simple_count = Self::all_simple_count(&self.aggregates);
+        let mut readers: Vec<RowReader> =
+            self.aggregates.iter().map(|a| RowReader::for_expression(&a.expr)).collect();
 
         let batch_size = 65536;
         let mut batch_count = 0u64;
@@ -4678,8 +4721,8 @@ impl AggregateOperator {
                 }
             } else {
                 for record in batch.records {
-                    for (i, agg) in self.aggregates.iter().enumerate() {
-                        let val = Self::evaluate_expression(&agg.expr, &record, store)?;
+                    for (i, reader) in readers.iter_mut().enumerate() {
+                        let val = reader.read(&record, store)?;
                         states[i].update(&val);
                     }
                 }

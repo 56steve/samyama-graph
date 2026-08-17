@@ -968,3 +968,95 @@ mod tests {
         assert_ne!(hash_value(&Value::Null), hash_value(&v1));
     }
 }
+
+/// One `x.prop` read, with the column located once instead of once per row.
+///
+/// `Value::resolve_property` takes the property name as a `&str` and hashes it
+/// against the store's column index on every call. For an operator looping over
+/// a million rows evaluating the same expression, that is a million hashes to
+/// reach the same column: 37.6 ns per read in scattered order against 22.6 ns
+/// when the column is hoisted out of the loop (#557).
+///
+/// The name is fixed at plan time, so the operator holds one of these per
+/// property expression and the lookup happens once.
+///
+/// Two things it does **not** do, both deliberate:
+///
+/// * it caches only a *found* column. `None` means no column exists **yet** —
+///   a `MERGE` or `SET` later in the same query may create one — so a miss
+///   re-resolves rather than being remembered as absent;
+/// * it keeps the row-storage fallback. A property whose value has no typed
+///   column representation is readable only from the per-node map (#545), and
+///   dropping that path would silently return null for complex types.
+#[derive(Debug, Clone)]
+pub struct PropertyCursor {
+    variable: Arc<str>,
+    property: Arc<str>,
+    node_column: Option<crate::graph::storage::columnar::ColumnId>,
+    edge_column: Option<crate::graph::storage::columnar::ColumnId>,
+}
+
+impl PropertyCursor {
+    pub fn new(variable: impl Into<Arc<str>>, property: impl Into<Arc<str>>) -> Self {
+        Self {
+            variable: variable.into(),
+            property: property.into(),
+            node_column: None,
+            edge_column: None,
+        }
+    }
+
+    /// The value of `variable.property` in `record`.
+    ///
+    /// Equivalent to `record.get(variable).resolve_property(property, store)`,
+    /// which is what it falls back to for anything that is not a node or edge.
+    pub fn read(&mut self, record: &Record, store: &GraphStore) -> PropertyValue {
+        match record.get(&self.variable) {
+            Some(Value::NodeRef(id)) | Some(Value::Node(id, _)) => {
+                let idx = id.as_u64() as usize;
+                let column = match self.node_column {
+                    Some(id) => Some(id),
+                    None => {
+                        let found = store.node_columns.column_id(&self.property);
+                        self.node_column = found;
+                        found
+                    }
+                };
+                if let Some(column) = column {
+                    let value = store.node_columns.get_by_id(column, idx);
+                    if !value.is_null() {
+                        return value;
+                    }
+                }
+                // The column has no value here. Row storage may still.
+                match store.get_node(*id) {
+                    Some(node) => node.get_property(&self.property).cloned().unwrap_or(PropertyValue::Null),
+                    None => PropertyValue::Null,
+                }
+            }
+            Some(Value::EdgeRef(id, ..)) | Some(Value::Edge(id, _)) => {
+                let idx = id.as_u64() as usize;
+                let column = match self.edge_column {
+                    Some(id) => Some(id),
+                    None => {
+                        let found = store.edge_columns.column_id(&self.property);
+                        self.edge_column = found;
+                        found
+                    }
+                };
+                if let Some(column) = column {
+                    let value = store.edge_columns.get_by_id(column, idx);
+                    if !value.is_null() {
+                        return value;
+                    }
+                }
+                match store.get_edge(*id) {
+                    Some(edge) => edge.get_property(&self.property).cloned().unwrap_or(PropertyValue::Null),
+                    None => PropertyValue::Null,
+                }
+            }
+            Some(other) => other.resolve_property(&self.property, store),
+            None => PropertyValue::Null,
+        }
+    }
+}

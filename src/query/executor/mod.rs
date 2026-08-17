@@ -94,7 +94,7 @@ pub mod record;
 // Export operators - added CreateNodeOperator, CreateEdgeOperator, CartesianProductOperator for CREATE support
 pub use operator::{PhysicalOperator, OperatorBox, OperatorDescription, CreateNodeOperator, CreateEdgeOperator, MatchCreateEdgeOperator, CartesianProductOperator};
 pub use planner::{QueryPlanner, ExecutionPlan, PlannerConfig};
-pub use record::{Record, RecordBatch, Value};
+pub use record::{PropertyCursor, Record, RecordBatch, Value};
 
 use crate::graph::GraphStore;
 use crate::query::ast::Query;
