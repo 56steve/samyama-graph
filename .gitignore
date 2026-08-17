@@ -21,3 +21,7 @@ data/
 .env
 social_network.svg
 .DS_Store
+
+# Python bytecode, swept in by an over-broad `git add -A` (#551 was the same mistake)
+__pycache__/
+*.pyc
