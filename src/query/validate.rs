@@ -26,6 +26,10 @@ pub enum ValidationError {
     UnionColumnMismatch { left: Vec<String>, right: Vec<String> },
     MixedUnionAndUnionAll,
     CreateOnBoundVariable(String),
+    CreateRelationshipWithoutType,
+    CreateUndirectedRelationship,
+    CreateVariableLengthRelationship,
+    CreateOnBoundRelationship(String),
 }
 
 impl std::fmt::Display for ValidationError {
@@ -46,6 +50,22 @@ impl std::fmt::Display for ValidationError {
             Self::CreateOnBoundVariable(name) => write!(
                 f,
                 "Variable `{name}` already declared; CREATE cannot add labels or properties to it"
+            ),
+            Self::CreateRelationshipWithoutType => write!(
+                f,
+                "Exactly one relationship type must be specified for CREATE"
+            ),
+            Self::CreateUndirectedRelationship => write!(
+                f,
+                "Only directed relationships are supported in CREATE"
+            ),
+            Self::CreateVariableLengthRelationship => write!(
+                f,
+                "Variable length relationships cannot be created"
+            ),
+            Self::CreateOnBoundRelationship(name) => write!(
+                f,
+                "Variable `{name}` already declared; CREATE cannot rebind a relationship"
             ),
         }
     }
@@ -147,6 +167,35 @@ pub fn validate(query: &Query) -> Result<(), ValidationError> {
     // an edge between matched nodes and stays legal.
     if let Some(create) = &query.create_clause {
         let bound = matched_variables(query);
+
+        // A relationship being *created* has to say exactly what it is. These
+        // are ambiguous rather than merely unsupported: `CREATE (a)-->(b)`
+        // does not say what kind of edge to make, `CREATE (a)-[:R]-(b)` does
+        // not say which way it points, and `CREATE (a)-[:R*2]->(b)` does not
+        // say what the intermediate node is. Cypher rejects all three, and
+        // accepting them means inventing an answer.
+        //
+        // Note this is only in CREATE. The same patterns are perfectly good in
+        // MATCH, where they mean "any type", "either direction" and "two
+        // hops" — which is why the check lives here and not in the grammar.
+        for path in &create.pattern.paths {
+            for seg in &path.segments {
+                if seg.edge.length.is_some() {
+                    return Err(ValidationError::CreateVariableLengthRelationship);
+                }
+                if seg.edge.types.len() != 1 {
+                    return Err(ValidationError::CreateRelationshipWithoutType);
+                }
+                if matches!(seg.edge.direction, crate::query::ast::Direction::Both) {
+                    return Err(ValidationError::CreateUndirectedRelationship);
+                }
+                if let Some(v) = &seg.edge.variable {
+                    if bound.contains(v) {
+                        return Err(ValidationError::CreateOnBoundRelationship(v.clone()));
+                    }
+                }
+            }
+        }
         for path in &create.pattern.paths {
             let mut check = |np: &crate::query::ast::NodePattern| -> Result<(), ValidationError> {
                 if let Some(v) = &np.variable {

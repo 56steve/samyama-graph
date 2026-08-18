@@ -212,3 +212,60 @@ fn a_map_literal_is_not_read_as_a_label_test() {
         Some(Value::Property(PropertyValue::Map(_)))
     ));
 }
+
+// ------------------------------------------------- CREATE relationship rules
+
+// A relationship being *created* has to say exactly what it is. These three
+// forms are ambiguous rather than merely unsupported, which is why Cypher
+// rejects them and why accepting them means inventing an answer:
+//
+//   CREATE (a)-->(b)        — what kind of edge?
+//   CREATE (a)-[:R]-(b)     — pointing which way?
+//   CREATE (a)-[:R*2]->(b)  — and what is the node in the middle?
+//
+// The same three patterns are perfectly good in MATCH, where they mean "any
+// type", "either direction" and "two hops". That asymmetry is the whole
+// reason the rule lives in validation and not in the grammar, and every test
+// below has a MATCH counterpart asserting the pattern still parses there.
+
+#[test]
+fn creating_a_relationship_requires_a_type() {
+    rejected("CREATE (a)-->(b)");
+    accepted("CREATE (a)-[:R]->(b)");
+    accepted("MATCH (a)-->(b) RETURN a");
+}
+
+#[test]
+fn creating_a_relationship_requires_a_direction() {
+    rejected("CREATE (a)-[:R]-(b)");
+    accepted("CREATE (a)-[:R]->(b)");
+    accepted("CREATE (a)<-[:R]-(b)");
+    accepted("MATCH (a)-[:R]-(b) RETURN a");
+}
+
+#[test]
+fn a_variable_length_relationship_cannot_be_created() {
+    rejected("CREATE (a)-[:R*2]->(b)");
+    rejected("CREATE (a)-[:R*]->(b)");
+    accepted("MATCH (a)-[:R*2]->(b) RETURN a");
+}
+
+#[test]
+fn create_may_not_rebind_a_matched_relationship() {
+    rejected("MATCH (a)-[r]->(b) CREATE (a)-[r:R]->(b)");
+    // A fresh name is fine.
+    accepted("MATCH (a)-[r]->(b) CREATE (a)-[r2:R]->(b)");
+}
+
+#[test]
+fn the_ordinary_create_forms_are_untouched() {
+    for q in [
+        "CREATE (a)-[:R]->(b)",
+        "CREATE (a:A)-[r:R {w: 1}]->(b:B)",
+        "CREATE (a), (b), (a)-[:R]->(b)",
+        "CREATE (h:Hub) CREATE (h)-[:E]->(:Leaf)",
+        "MATCH (a:P), (b:P) CREATE (a)-[:KNOWS]->(b)",
+    ] {
+        accepted(q);
+    }
+}
