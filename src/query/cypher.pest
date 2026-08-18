@@ -49,7 +49,11 @@ options = { ^"OPTIONS" ~ "{" ~ property_list? ~ "}" }
 // CALL statement (Standalone or followed by MATCH)
 // `WHERE` may filter YIELDed variables directly. It previously only appeared inside
 // `match_stmt_partial`, so filtering a CALL's output required an intervening MATCH.
-call_stmt = { (call_subquery | call_clause) ~ where_clause? ~ match_stmt_partial? ~ return_clause? }
+// `ORDER BY` / `SKIP` / `LIMIT` after the RETURN, as every other statement
+// allows. Without them `CALL pagerank(...) YIELD nodeId, score RETURN ...
+// ORDER BY score DESC LIMIT 10` — the example in our own README — was a
+// syntax error.
+call_stmt = { (call_subquery | call_clause) ~ where_clause? ~ match_stmt_partial? ~ return_clause? ~ order_by_clause? ~ skip_clause? ~ limit_clause? }
 match_stmt_partial = { ^"MATCH" ~ pattern ~ where_clause? }
 
 // CALL subquery: CALL { MATCH ... RETURN ... }

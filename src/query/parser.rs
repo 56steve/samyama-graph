@@ -567,6 +567,23 @@ fn parse_call_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) ->
             Rule::return_clause => {
                 query.return_clause = Some(parse_return_clause(inner)?);
             }
+            Rule::order_by_clause => {
+                query.order_by = Some(parse_order_by_clause(inner)?);
+            }
+            Rule::skip_clause => {
+                for i in inner.into_inner() {
+                    if i.as_rule() == Rule::integer {
+                        query.skip = i.as_str().parse::<usize>().ok();
+                    }
+                }
+            }
+            Rule::limit_clause => {
+                for i in inner.into_inner() {
+                    if i.as_rule() == Rule::integer {
+                        query.limit = i.as_str().parse::<usize>().ok();
+                    }
+                }
+            }
             _ => {}
         }
     }
