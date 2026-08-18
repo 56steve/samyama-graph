@@ -893,11 +893,19 @@ impl QueryPlanner {
                 let on_match: Vec<(String, String, Expression)> = merge_clause.on_match_set.iter()
                     .map(|s| (s.variable.clone(), s.property.clone(), s.value.clone()))
                     .collect();
+                let on_create_labels: Vec<(String, Vec<Label>)> = merge_clause.on_create_labels.iter()
+                    .map(|l| (l.variable.clone(), l.labels.clone()))
+                    .collect();
+                let on_match_labels: Vec<(String, Vec<Label>)> = merge_clause.on_match_labels.iter()
+                    .map(|l| (l.variable.clone(), l.labels.clone()))
+                    .collect();
 
                 let mut operator: OperatorBox = Box::new(MergeOperator::new(
                     merge_clause.pattern.clone(),
                     on_create,
                     on_match,
+                    on_create_labels,
+                    on_match_labels,
                 ));
 
                 // A bare `SET` after MERGE applies on both branches, unlike ON CREATE /
@@ -1236,6 +1244,19 @@ impl QueryPlanner {
                     unwind.variable.clone(),
                 )));
                 known_vars.insert(unwind.variable.clone());
+
+                // A run of UNWINDs at the head of the query: each expands the
+                // rows the previous produced, giving the cross product the TCK
+                // uses to enumerate three-variable truth tables.
+                for extra in &query.extra_unwind_clauses {
+                    let base = operator.take().expect("previous UNWIND produced an operator");
+                    operator = Some(Box::new(UnwindOperator::new(
+                        base,
+                        extra.expression.clone(),
+                        extra.variable.clone(),
+                    )));
+                    known_vars.insert(extra.variable.clone());
+                }
             }
         }
 
@@ -1637,6 +1658,16 @@ impl QueryPlanner {
                     unwind_clause.expression.clone(),
                     unwind_clause.variable.clone(),
                 ));
+                // Consecutive UNWINDs stack: each one expands the rows the
+                // previous produced, so `UNWIND [1,2] AS a UNWIND [3,4] AS b`
+                // is four rows and not two.
+                for extra in &query.extra_unwind_clauses {
+                    operator = Box::new(UnwindOperator::new(
+                        operator,
+                        extra.expression.clone(),
+                        extra.variable.clone(),
+                    ));
+                }
             }
         }
 
@@ -1694,6 +1725,9 @@ impl QueryPlanner {
              -> String {
                 match &node.variable {
                     Some(v) if matched_vars.contains(v) => v.clone(),
+                    // Already registered by an earlier path in this same
+                    // CREATE — reuse it rather than creating a second node.
+                    Some(v) if nodes_to_create.iter().any(|(h, ..)| h == v) => v.clone(),
                     Some(v) => {
                         nodes_to_create.push((
                             v.clone(),
@@ -1890,8 +1924,22 @@ impl QueryPlanner {
                 ));
             } else {
                 // Node-only MERGE: use existing MergeOperator with input
+                let on_create_labels: Vec<(String, Vec<Label>)> = merge_clause
+                    .on_create_labels
+                    .iter()
+                    .map(|l| (l.variable.clone(), l.labels.clone()))
+                    .collect();
+                let on_match_labels: Vec<(String, Vec<Label>)> = merge_clause
+                    .on_match_labels
+                    .iter()
+                    .map(|l| (l.variable.clone(), l.labels.clone()))
+                    .collect();
                 operator = Box::new(MergeOperator::new(
-                    merge_clause.pattern.clone(), on_create, on_match,
+                    merge_clause.pattern.clone(),
+                    on_create,
+                    on_match,
+                    on_create_labels,
+                    on_match_labels,
                 ));
             }
             true
@@ -2004,7 +2052,12 @@ impl QueryPlanner {
                 && query.match_clauses[0].pattern.paths[0].start.labels.is_empty()
                 && query.match_clauses[0].pattern.paths[0].segments[0].node.labels.is_empty()
                 && matches!(&group_by[0].0, Expression::Function { name, args, .. }
-                    if name == "type" && args.len() == 1 && matches!(&args[0], Expression::Variable(_)));
+                    if name == "type" && args.len() == 1 && matches!(&args[0], Expression::Variable(_)))
+                // Directed only — see the note on `use_edge_count` below.
+                && !matches!(
+                    query.match_clauses[0].pattern.paths[0].segments[0].edge.direction,
+                    Direction::Both
+                );
 
             // O(1) count for a single edge type (or all edges): the metadata that already
             // answers `type(r), count(r)` and node label counts can answer this too, but
@@ -2046,7 +2099,23 @@ impl QueryPlanner {
                     Expression::Literal(_) => true,
                     Expression::Variable(v) => Some(v) == edge_var.as_ref(),
                     _ => false,
-                };
+                }
+                // Last, because it indexes into the pattern and every check
+                // that guarantees those indices exist is above it. Placing it
+                // earlier panicked on `UNWIND [1,2,3] AS x RETURN max(x)`,
+                // which has no match clause at all.
+                //
+                // Both fast paths read the edge count straight off the store,
+                // which counts each edge once. An **undirected** pattern
+                // matches every edge twice — once from each end — so
+                // `MATCH (a)--(b) RETURN count(*)` over two edges is 4, not 2.
+                // Doubling here would then have to reason about self-loops, so
+                // the fast path is restricted to directed patterns and the
+                // general operator answers the rest.
+                && !matches!(
+                    query.match_clauses[0].pattern.paths[0].segments[0].edge.direction,
+                    Direction::Both
+                );
 
             if use_edge_count {
                 let edge_type = query.match_clauses[0].pattern.paths[0].segments[0]
@@ -3594,6 +3663,17 @@ impl QueryPlanner {
             }
         };
 
+        // A variable bound earlier in the *same* CREATE refers to the node
+        // already being created, not to a new one:
+        //
+        //     CREATE (a), (b), (a)-[:R]->(b)
+        //
+        // creates two nodes and one edge. Re-registering `a` and `b` for
+        // creation made it four nodes — the edge was correct, so the query
+        // succeeded and quietly doubled the graph. This is the shape every
+        // TCK fixture and most of our own loaders are written in.
+        let mut created_vars: HashSet<String> = HashSet::new();
+
         for path in &pattern.paths {
             // Add start node
             let start = &path.start;
@@ -3601,9 +3681,16 @@ impl QueryPlanner {
             let properties: HashMap<String, PropertyValue> = start.properties.clone().unwrap_or_default();
             let variable = start.variable.clone();
 
-            // Track output column if variable exists
+            let start_already_bound = variable
+                .as_ref()
+                .is_some_and(|v| created_vars.contains(v));
+
+            // Track output column if variable exists — once per variable, since
+            // a repeat mention is the same node.
             if let Some(ref var) = variable {
-                output_columns.push(var.clone());
+                if !start_already_bound {
+                    output_columns.push(var.clone());
+                }
             }
 
             // Only the *named* variable reaches output_columns above; the synthetic one is
@@ -3612,12 +3699,17 @@ impl QueryPlanner {
                 Some(v) => v.clone(),
                 None => next_anon(&declared),
             };
-            nodes_to_create.push((
-                labels,
-                properties,
-                Some(start_handle.clone()),
-                start.property_exprs.clone(),
-            ));
+            if !start_already_bound {
+                if let Some(v) = &variable {
+                    created_vars.insert(v.clone());
+                }
+                nodes_to_create.push((
+                    labels,
+                    properties,
+                    Some(start_handle.clone()),
+                    start.property_exprs.clone(),
+                ));
+            }
 
             // Track current source variable for edge creation
             let mut current_source_var = Some(start_handle);
@@ -3630,20 +3722,31 @@ impl QueryPlanner {
                 let node_properties: HashMap<String, PropertyValue> = node.properties.clone().unwrap_or_default();
                 let node_variable = node.variable.clone();
 
+                let node_already_bound = node_variable
+                    .as_ref()
+                    .is_some_and(|v| created_vars.contains(v));
+
                 if let Some(ref var) = node_variable {
-                    output_columns.push(var.clone());
+                    if !node_already_bound {
+                        output_columns.push(var.clone());
+                    }
                 }
 
                 let node_handle = match &node_variable {
                     Some(v) => v.clone(),
                     None => next_anon(&declared),
                 };
-                nodes_to_create.push((
-                    node_labels,
-                    node_properties,
-                    Some(node_handle.clone()),
-                    node.property_exprs.clone(),
-                ));
+                if !node_already_bound {
+                    if let Some(v) = &node_variable {
+                        created_vars.insert(v.clone());
+                    }
+                    nodes_to_create.push((
+                        node_labels,
+                        node_properties,
+                        Some(node_handle.clone()),
+                        node.property_exprs.clone(),
+                    ));
+                }
 
                 // Extract edge information
                 let edge = &segment.edge;
@@ -5077,6 +5180,7 @@ mod tests {
             create_clause: None,
             order_by: None,
             limit: None,
+            extra_unwind_clauses: Vec::new(),
             skip: None,
             call_clause: None,
             call_subquery: None,

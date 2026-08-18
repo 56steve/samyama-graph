@@ -38,6 +38,14 @@ The split follows from where a reader can act: a number you can reproduce
 belongs next to the code that produces it; a number that required another
 vendor's licensed software to obtain does not.
 
+**LDBC SNB Interactive at SF10, against Neo4j on the same host** (2026-08-19,
+AWS r6a.8xlarge): 12 of 14 complex reads within 5× of Neo4j and **6 faster**,
+with IC6 timing out and IC11 at 11.5×. That is a cross-engine result, so it
+lives in the private repo with the competitor configs it depends on —
+`benchmarks/ldbc-snb-interactive/SF10-2026-08-19-SAME-HOST.md`. It supersedes
+the "85–170× slower on complex reads" figure, which came from a run whose
+Samyama and competitor columns were measured on *different machines*.
+
 **Not on this page either: the scorecard.** Every figure here is one suite's
 result. The single file that says where the product stands against all 254
 requirements — measured, unmeasured, or measured only by proxy — is
@@ -130,18 +138,25 @@ cargo run --release --example tck_runner -- --features <openCypher>/tck/features
 | | |
 |---|---:|
 | scenarios in the TCK | 1,615 |
-| **evaluated** by the harness | **1,049** (65.0%) |
-| pass | 489 |
-| wrong result | 282 |
-| errored | 278 |
-| skipped | 566 |
-| **pass rate, of evaluated** | **46.6%** |
-| pass rate, of all 1,615 | 30.3% |
+| **evaluated** by the harness | **1,239** (76.7%) |
+| pass | 663 |
+| wrong result | 320 |
+| errored | 256 |
+| skipped | 376 |
+| **pass rate, of evaluated** | **53.5%** |
+| pass rate, of all 1,615 | 41.1% |
 | gate `CH-TCK ≥ 85%` | **not met** |
 
-Measured at `f295b73` on `vultr-bench-16c-32g-blr`, via the conformance
-harness's `CH-TCK` suite; the envelope is in
-`samyama-graph-competitor-benchmarks/harness/runs/`.
+Measured at `ab4ae61` via the conformance harness's `CH-TCK` suite; the
+envelope is in `samyama-graph-competitor-benchmarks/harness/runs/`.
+
+**Coverage moved further than the rate.** 65.0% → 76.7% of scenarios are now
+judged rather than skipped, because 197 of them were being skipped for
+"setup did not parse" — every TCK fixture is written as a run of `CREATE`
+clauses, which did not parse. Making them parse then exposed a worse bug:
+`CREATE (a), (b), (a)-[:R]->(b)` created **four** nodes instead of two. The
+rate rising from 46.6% to 53.5% *while* 190 harder scenarios joined the
+denominator is the more useful way to read this.
 
 **This number was nondeterministic until 2026-08-18.** Running the TCK five
 times at a fixed commit gave 484, 485, 486 and 487 passes while `errored`
@@ -163,14 +178,16 @@ published:
 | skipped | reason |
 |---:|---|
 | 274 | `Scenario Outline` — the harness does not expand `Examples` tables |
-| 197 | the scenario's setup Cypher did not parse |
 | 39 | user-defined procedures |
 | 34 | query parameters |
 | 19 | named fixture graphs (`binary-tree-N`) |
+| 3 | the scenario's setup did not run |
 
-The 197 setup failures are a **result, not only a harness gap**: those are
-ordinary `CREATE` statements the parser rejects, so they measure the same thing
-the TCK is measuring.
+The 197 "setup did not parse" skips are **gone**: they were ordinary `CREATE`
+statements the parser rejected, and fixing that moved them into the judged set
+— which is where most of the coverage gain came from. `Scenario Outline`
+expansion is now the single largest remaining skip category and is a harness
+gap rather than an engine one.
 
 Weakest areas, among features with at least 5 evaluated scenarios — all at 0%:
 `Boolean5`, `Comparison3`, `Create3`, `Create6`, `Match6`, `Merge6`, `Set4`,
@@ -180,7 +197,7 @@ Weakest areas, among features with at least 5 evaluated scenarios — all at 0%:
 ### How this relates to the hand-written sweeps
 
 Four hand-written sweeps in `examples/cypher_probe*.rs` (168 cases) pass
-100%, 100%, 100% and 29/30. That is not in tension with 46.6% — those sweeps
+100%, 100%, 100% and 29/30. That is not in tension with 53.5% — those sweeps
 were written to probe areas suspected of being wrong, and every case in them was
 either already correct or has since been fixed. They found seven silent
 wrong answers; they were never a coverage measurement. **The TCK is the coverage

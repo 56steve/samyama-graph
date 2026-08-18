@@ -481,8 +481,32 @@ impl<'a> MutQueryExecutor<'a> {
             return Ok(QueryExecutor::explain_plan_with_stats(&plan, Some(store_ref)));
         }
 
-        // Execute the plan with mutable access
-        self.execute_plan_mut(plan)
+        // Execute the plan with mutable access.
+        //
+        // A write statement with no RETURN produces **no rows**. `CREATE ()`
+        // returns an empty result and one new node; it does not return the
+        // node. We were emitting a row per created entity, so 34 TCK
+        // scenarios whose whole assertion is "the result should be empty"
+        // failed while the side effect was perfectly correct.
+        //
+        // The plan is still driven to exhaustion — the rows are what is
+        // discarded, not the work. Discarding earlier would skip the writes.
+        let batch = self.execute_plan_mut(plan)?;
+        // Scoped to **data writes**, not to "any query without a RETURN".
+        // Two neighbours produce rows with no RETURN and must keep doing so:
+        // `CALL … YIELD` yields its results, and DDL such as
+        // `CREATE HIERARCHY INDEX …` reports the encoding it chose. Widening
+        // the rule to every RETURN-less query broke both, which is why it is
+        // written as the narrow thing it actually is.
+        let is_data_write = query.create_clause.is_some()
+            || query.merge_clause.is_some()
+            || !query.set_clauses.is_empty()
+            || !query.remove_clauses.is_empty()
+            || query.delete_clause.is_some();
+        if is_data_write && query.return_clause.is_none() && query.call_clause.is_none() {
+            return Ok(RecordBatch { records: Vec::new(), columns: Vec::new() });
+        }
+        Ok(batch)
     }
 
     fn execute_plan_mut(&mut self, mut plan: ExecutionPlan) -> ExecutionResult<RecordBatch> {
@@ -769,7 +793,11 @@ mod tests {
         let result = executor.execute(&query);
         assert!(result.is_ok(), "MERGE create failed: {:?}", result.err());
         let batch = result.unwrap();
-        assert_eq!(batch.records.len(), 1);
+        // A data write with no RETURN yields no rows — the side effect is the
+        // point. This asserted 1 row and was pinning the older behaviour; 34
+        // TCK scenarios whose entire assertion is "the result should be empty"
+        // were failing against it while the write itself was correct.
+        assert_eq!(batch.records.len(), 0, "MERGE without RETURN returns no rows");
 
         // Verify node was created
         let nodes = store.get_nodes_by_label(&Label::new("Person"));

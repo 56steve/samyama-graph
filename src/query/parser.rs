@@ -153,6 +153,18 @@ pub fn parse_query(input: &str) -> ParseResult<Query> {
         }
     }
 
+    // `RETURN *` / `WITH *` are resolved here rather than in the planner, so
+    // that nothing downstream has to know the sentinel exists. See
+    // `crate::query::star`.
+    crate::query::star::expand_stars(&mut query);
+
+    // Checks the grammar cannot express — duplicate result columns, UNION
+    // arity, CREATE over an already-bound variable. Reported as a parse
+    // failure because that is what they are to a caller: the query was never
+    // well-formed, and running it would answer a question nobody asked.
+    crate::query::validate::validate(&query)
+        .map_err(|e| ParseError::SemanticError(e.to_string()))?;
+
     Ok(query)
 }
 
@@ -555,6 +567,23 @@ fn parse_call_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) ->
             Rule::return_clause => {
                 query.return_clause = Some(parse_return_clause(inner)?);
             }
+            Rule::order_by_clause => {
+                query.order_by = Some(parse_order_by_clause(inner)?);
+            }
+            Rule::skip_clause => {
+                for i in inner.into_inner() {
+                    if i.as_rule() == Rule::integer {
+                        query.skip = i.as_str().parse::<usize>().ok();
+                    }
+                }
+            }
+            Rule::limit_clause => {
+                for i in inner.into_inner() {
+                    if i.as_rule() == Rule::integer {
+                        query.limit = i.as_str().parse::<usize>().ok();
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -765,7 +794,14 @@ fn parse_match_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) -
                 query.remove_clauses.push(parse_remove_clause(inner)?);
             }
             Rule::unwind_clause => {
-                query.unwind_clause = Some(parse_unwind_clause(inner)?);
+                // The first UNWIND stays in `unwind_clause`; the rest queue up
+                // behind it, each a cross product with everything before.
+                let u = parse_unwind_clause(inner)?;
+                if query.unwind_clause.is_none() {
+                    query.unwind_clause = Some(u);
+                } else {
+                    query.extra_unwind_clauses.push(u);
+                }
             }
             Rule::merge_inline => {
                 query.merge_clause = Some(parse_merge_clause(inner)?);
@@ -798,18 +834,52 @@ fn parse_match_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) -
 }
 
 fn parse_create_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) -> ParseResult<()> {
+    // Adjacent CREATE clauses are merged into one pattern. They are equivalent
+    // by definition — `CREATE (a) CREATE (b)` and `CREATE (a), (b)` bind the
+    // same variables to the same nodes — and merging means the planner and the
+    // executor never learn that repeated clauses exist. The alternative,
+    // `Vec<CreateClause>` on the AST, would touch 36 call sites, most of them
+    // `is_some()` guards asking only "is this a write query".
+    let mut paths = Vec::new();
     for inner in pair.into_inner() {
         match inner.as_rule() {
-            Rule::pattern => {
-                query.create_clause = Some(CreateClause {
-                    pattern: parse_pattern(inner)?,
-                });
+            // A bare `CREATE` statement yields `pattern` directly; a repeated
+            // one yields `create_clause` wrappers.
+            Rule::pattern => paths.extend(parse_pattern(inner)?.paths),
+            Rule::create_clause => {
+                for c in inner.into_inner() {
+                    if c.as_rule() == Rule::pattern {
+                        paths.extend(parse_pattern(c)?.paths);
+                    }
+                }
             }
             Rule::return_clause => {
                 query.return_clause = Some(parse_return_clause(inner)?);
             }
+            Rule::order_by_clause => {
+                query.order_by = Some(parse_order_by_clause(inner)?);
+            }
+            Rule::skip_clause => {
+                for i in inner.into_inner() {
+                    if i.as_rule() == Rule::integer {
+                        query.skip = i.as_str().parse::<usize>().ok();
+                    }
+                }
+            }
+            Rule::limit_clause => {
+                for i in inner.into_inner() {
+                    if i.as_rule() == Rule::integer {
+                        query.limit = i.as_str().parse::<usize>().ok();
+                    }
+                }
+            }
             _ => {}
         }
+    }
+    if !paths.is_empty() {
+        query.create_clause = Some(CreateClause {
+            pattern: crate::query::ast::Pattern { paths },
+        });
     }
     Ok(())
 }
@@ -869,24 +939,34 @@ fn parse_delete_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<DeleteC
     Ok(DeleteClause { expressions, detach })
 }
 
+/// `variable (":" label)+` — the label form of a SET item.
+///
+/// Shared by `SET`, `ON CREATE SET` and `ON MATCH SET`. Kept as one function
+/// because the last time these were parsed in two places the copies drifted
+/// and one of them silently dropped items it did not recognise.
+fn parse_set_label_item(pair: pest::iterators::Pair<Rule>) -> ParseResult<SetLabelItem> {
+    let mut variable = String::new();
+    let mut labels = Vec::new();
+    for sl in pair.into_inner() {
+        match sl.as_rule() {
+            Rule::variable => variable = sl.as_str().to_string(),
+            Rule::label => labels.push(Label::new(sl.as_str())),
+            _ => {}
+        }
+    }
+    if labels.is_empty() {
+        return Err(ParseError::SemanticError("SET label item has no label".to_string()));
+    }
+    Ok(SetLabelItem { variable, labels })
+}
+
 fn parse_set_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<SetClause> {
     let mut items = Vec::new();
     let mut label_items: Vec<SetLabelItem> = Vec::new();
 
     for inner in pair.into_inner() {
         if inner.as_rule() == Rule::set_label_item {
-            let mut variable = String::new();
-            let mut labels = Vec::new();
-            for sl in inner.into_inner() {
-                match sl.as_rule() {
-                    Rule::variable => variable = sl.as_str().to_string(),
-                    Rule::label => labels.push(Label::new(sl.as_str())),
-                    _ => {}
-                }
-            }
-            if !labels.is_empty() {
-                label_items.push(SetLabelItem { variable, labels });
-            }
+            label_items.push(parse_set_label_item(inner)?);
             continue;
         }
         if inner.as_rule() == Rule::set_item {
@@ -941,17 +1021,23 @@ fn parse_remove_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<RemoveC
                 }
                 items.push(RemoveItem::Property { variable, property });
             } else {
-                // variable : label
+                // `variable (":" label)+` — one item per label, so
+                // `REMOVE n:L1:L3` removes both rather than only the first.
                 let mut variable = String::new();
-                let mut label = String::new();
+                let mut labels = Vec::new();
                 for child in children {
                     match child.as_rule() {
                         Rule::variable => variable = child.as_str().to_string(),
-                        Rule::label => label = child.as_str().to_string(),
+                        Rule::label => labels.push(child.as_str().to_string()),
                         _ => {}
                     }
                 }
-                items.push(RemoveItem::Label { variable, label: Label::new(&label) });
+                for label in labels {
+                    items.push(RemoveItem::Label {
+                        variable: variable.clone(),
+                        label: Label::new(&label),
+                    });
+                }
             }
         }
     }
@@ -982,21 +1068,27 @@ fn parse_merge_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) -
     let mut pattern = None;
     let mut on_create_set = Vec::new();
     let mut on_match_set = Vec::new();
+    let mut on_create_labels = Vec::new();
+    let mut on_match_labels = Vec::new();
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
             Rule::pattern => pattern = Some(parse_pattern(inner)?),
             Rule::on_create_set => {
                 for si in inner.into_inner() {
-                    if si.as_rule() == Rule::set_item {
-                        on_create_set.push(parse_set_item(si)?);
+                    match si.as_rule() {
+                        Rule::set_item => on_create_set.push(parse_set_item(si)?),
+                        Rule::set_label_item => on_create_labels.push(parse_set_label_item(si)?),
+                        _ => {}
                     }
                 }
             }
             Rule::on_match_set => {
                 for si in inner.into_inner() {
-                    if si.as_rule() == Rule::set_item {
-                        on_match_set.push(parse_set_item(si)?);
+                    match si.as_rule() {
+                        Rule::set_item => on_match_set.push(parse_set_item(si)?),
+                        Rule::set_label_item => on_match_labels.push(parse_set_label_item(si)?),
+                        _ => {}
                     }
                 }
             }
@@ -1021,6 +1113,8 @@ fn parse_merge_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) -
         pattern: pattern.ok_or_else(|| ParseError::SemanticError("MERGE missing pattern".to_string()))?,
         on_create_set,
         on_match_set,
+        on_create_labels,
+        on_match_labels,
     });
     Ok(())
 }
@@ -1029,21 +1123,27 @@ fn parse_merge_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<MergeCla
     let mut pattern = None;
     let mut on_create_set = Vec::new();
     let mut on_match_set = Vec::new();
+    let mut on_create_labels = Vec::new();
+    let mut on_match_labels = Vec::new();
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
             Rule::pattern => pattern = Some(parse_pattern(inner)?),
             Rule::on_create_set => {
                 for si in inner.into_inner() {
-                    if si.as_rule() == Rule::set_item {
-                        on_create_set.push(parse_set_item(si)?);
+                    match si.as_rule() {
+                        Rule::set_item => on_create_set.push(parse_set_item(si)?),
+                        Rule::set_label_item => on_create_labels.push(parse_set_label_item(si)?),
+                        _ => {}
                     }
                 }
             }
             Rule::on_match_set => {
                 for si in inner.into_inner() {
-                    if si.as_rule() == Rule::set_item {
-                        on_match_set.push(parse_set_item(si)?);
+                    match si.as_rule() {
+                        Rule::set_item => on_match_set.push(parse_set_item(si)?),
+                        Rule::set_label_item => on_match_labels.push(parse_set_label_item(si)?),
+                        _ => {}
                     }
                 }
             }
@@ -1058,6 +1158,8 @@ fn parse_merge_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<MergeCla
         pattern: pattern.ok_or_else(|| ParseError::SemanticError("MERGE missing pattern".to_string()))?,
         on_create_set,
         on_match_set,
+        on_create_labels,
+        on_match_labels,
     })
 }
 
@@ -1089,22 +1191,19 @@ fn parse_set_item(pair: pest::iterators::Pair<Rule>) -> ParseResult<SetItem> {
     })
 }
 
+/// Parse a `RETURN` / `WITH` item list.
+///
+/// Delegates to `parse_return_item` rather than repeating its body. The two
+/// had drifted: this one matched only `expression` and `variable` and dropped
+/// anything else *silently* (`if let Some(e) = expr`), so when `star_item` was
+/// added `WITH *` parsed to an empty projection and the query failed at
+/// runtime with "Variable not found" — a grammar addition that looked like an
+/// executor bug. One implementation cannot drift from itself.
 fn parse_return_items(pair: pest::iterators::Pair<Rule>) -> ParseResult<Vec<ReturnItem>> {
     let mut items = Vec::new();
     for inner in pair.into_inner() {
         if inner.as_rule() == Rule::return_item {
-            let mut expr = None;
-            let mut alias = None;
-            for ri in inner.into_inner() {
-                match ri.as_rule() {
-                    Rule::expression => expr = Some(parse_expression(ri)?),
-                    Rule::variable => alias = Some(ri.as_str().to_string()),
-                    _ => {}
-                }
-            }
-            if let Some(e) = expr {
-                items.push(ReturnItem { expression: e, alias });
-            }
+            items.push(parse_return_item(inner)?);
         }
     }
     Ok(items)
@@ -1521,6 +1620,9 @@ fn parse_return_item(pair: pest::iterators::Pair<Rule>) -> ParseResult<ReturnIte
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
+            Rule::star_item => {
+                expression = Some(Expression::Variable(crate::query::ast::STAR_ITEM.to_string()));
+            }
             Rule::expression => {
                 expression = Some(parse_expression(inner)?);
             }
@@ -1699,16 +1801,46 @@ fn parse_term(pair: pest::iterators::Pair<Rule>) -> ParseResult<Expression> {
 
             // Apply postfix operator (IS NULL / IS NOT NULL)
             if let Some(postfix) = postfix_pair {
-                let text = postfix.as_str().to_uppercase();
-                let op = if text.contains("NOT") {
-                    UnaryOp::IsNotNull
+                // `n:A:B` — a label test used as a boolean value. Desugared to
+                // a function call rather than given its own `Expression`
+                // variant: a new variant would have to be handled by every
+                // exhaustive match over `Expression`, and this needs no
+                // information a call cannot carry.
+                // The labels sit two levels down: postfix_op → label_check →
+                // label. Reading only the first level found nothing and fell
+                // through to the `IS NULL` branch, so `n:A` silently became
+                // `n IS NULL` — a wrong answer rather than a parse error.
+                let labels: Vec<PropertyValue> = postfix
+                    .clone()
+                    .into_inner()
+                    .flat_map(|p| {
+                        if p.as_rule() == Rule::label_check {
+                            p.into_inner().collect::<Vec<_>>()
+                        } else {
+                            vec![p]
+                        }
+                    })
+                    .filter(|p| p.as_rule() == Rule::label)
+                    .map(|p| PropertyValue::String(p.as_str().to_string()))
+                    .collect();
+                if !labels.is_empty() {
+                    expr = Expression::Function {
+                        name: "hasLabels".to_string(),
+                        args: vec![expr, Expression::Literal(PropertyValue::Array(labels))],
+                        distinct: false,
+                    };
                 } else {
-                    UnaryOp::IsNull
-                };
-                expr = Expression::Unary {
-                    op,
-                    expr: Box::new(expr),
-                };
+                    let text = postfix.as_str().to_uppercase();
+                    let op = if text.contains("NOT") {
+                        UnaryOp::IsNotNull
+                    } else {
+                        UnaryOp::IsNull
+                    };
+                    expr = Expression::Unary {
+                        op,
+                        expr: Box::new(expr),
+                    };
+                }
             }
 
             // Apply prefix operators in reverse order (innermost first)

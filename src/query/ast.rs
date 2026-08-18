@@ -121,6 +121,13 @@ pub struct Query {
     pub foreach_clause: Option<ForeachClause>,
     /// UNWIND clause (optional)
     pub unwind_clause: Option<UnwindClause>,
+    /// Further `UNWIND`s written directly after the first, in order.
+    ///
+    /// Each is a cross product with everything before it. Kept beside
+    /// `unwind_clause` rather than replacing it with a `Vec` because the
+    /// single-UNWIND field is read in a dozen places that only ever care
+    /// about the first one.
+    pub extra_unwind_clauses: Vec<UnwindClause>,
     /// Whether the UNWIND *led* the statement (`UNWIND ... MATCH ...`) rather than
     /// following the match. The AST keeps a single `unwind_clause` with no position, but
     /// the two orders plan differently: a leading UNWIND must bind its variable before the
@@ -524,6 +531,16 @@ pub struct ReturnClause {
     pub distinct: bool,
 }
 
+/// The variable name standing for `RETURN *` / `WITH *` between parsing and
+/// star expansion.
+///
+/// A sentinel rather than a new `Expression` variant because `*` is not a
+/// value and never survives into a plan: `expand_stars` replaces it with the
+/// variables in scope immediately after parsing, so nothing downstream can
+/// encounter it. `*` is not a legal identifier in Cypher, so the sentinel
+/// cannot collide with a user variable.
+pub const STAR_ITEM: &str = "*";
+
 /// Return item: n, n.name AS name, count(n)
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReturnItem {
@@ -627,6 +644,14 @@ pub struct MergeClause {
     pub on_create_set: Vec<SetItem>,
     /// ON MATCH SET items
     pub on_match_set: Vec<SetItem>,
+    /// Labels added by `ON CREATE SET n:Label`.
+    ///
+    /// Separate from `on_create_set` for the same reason `SetClause` keeps
+    /// `label_items` apart from `items`: the property form is read by field in
+    /// several places and an enum would touch all of them.
+    pub on_create_labels: Vec<SetLabelItem>,
+    /// Labels added by `ON MATCH SET n:Label`.
+    pub on_match_labels: Vec<SetLabelItem>,
 }
 
 /// WITH clause
@@ -693,6 +718,7 @@ impl Query {
             params: HashMap::new(),
             foreach_clause: None,
             unwind_clause: None,
+            extra_unwind_clauses: Vec::new(),
             unwind_leading: false,
             merge_clause: None,
             union_queries: Vec::new(),

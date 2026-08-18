@@ -1420,6 +1420,45 @@ pub fn eval_function(name: &str, args: &[Value], store: Option<&GraphStore>) -> 
                 _ => Err(ExecutionError::TypeError("id() requires node or edge".to_string())),
             }
         }
+        // `n:A:B` as a value, produced by the parser's postfix label check.
+        // True when the node carries *every* named label; null when the
+        // subject is null, following Cypher's three-valued logic.
+        "haslabels" => {
+            let wanted: Vec<String> = match &args[1] {
+                Value::Property(PropertyValue::Array(items)) => items
+                    .iter()
+                    .filter_map(|v| match v {
+                        PropertyValue::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => return Err(ExecutionError::TypeError("hasLabels expects a label list".into())),
+            };
+            let node = match &args[0] {
+                Value::Node(_, n) => Some((**n).clone()),
+                Value::NodeRef(id) => {
+                    let s = store.ok_or_else(|| {
+                        ExecutionError::RuntimeError("hasLabels on NodeRef requires store".into())
+                    })?;
+                    s.get_node(*id).cloned()
+                }
+                Value::Property(PropertyValue::Null) => {
+                    return Ok(Value::Property(PropertyValue::Null))
+                }
+                _ => {
+                    return Err(ExecutionError::TypeError(
+                        "a label test requires a node".to_string(),
+                    ))
+                }
+            };
+            let Some(node) = node else {
+                return Ok(Value::Property(PropertyValue::Null));
+            };
+            let has_all = wanted
+                .iter()
+                .all(|w| node.labels.iter().any(|l| l.as_str() == w));
+            Ok(Value::Property(PropertyValue::Boolean(has_all)))
+        }
         "labels" => {
             match &args[0] {
                 Value::Node(_, node) => {
@@ -9217,6 +9256,10 @@ pub struct MergeOperator {
     pattern: Pattern,
     on_create_set: Vec<(String, String, Expression)>,
     on_match_set: Vec<(String, String, Expression)>,
+    /// `(variable, labels)` from `ON CREATE SET n:Label`.
+    on_create_labels: Vec<(String, Vec<Label>)>,
+    /// `(variable, labels)` from `ON MATCH SET n:Label`.
+    on_match_labels: Vec<(String, Vec<Label>)>,
     executed: bool,
 }
 
@@ -9225,8 +9268,40 @@ impl MergeOperator {
         pattern: Pattern,
         on_create_set: Vec<(String, String, Expression)>,
         on_match_set: Vec<(String, String, Expression)>,
+        on_create_labels: Vec<(String, Vec<Label>)>,
+        on_match_labels: Vec<(String, Vec<Label>)>,
     ) -> Self {
-        Self { pattern, on_create_set, on_match_set, executed: false }
+        Self {
+            pattern,
+            on_create_set,
+            on_match_set,
+            on_create_labels,
+            on_match_labels,
+            executed: false,
+        }
+    }
+
+    /// Add the labels an `ON CREATE` / `ON MATCH` branch asks for.
+    ///
+    /// Resolved through the record rather than against a single variable name,
+    /// because a MERGE pattern binds several variables and the branch may name
+    /// any of them.
+    fn apply_labels(
+        items: &[(String, Vec<Label>)],
+        record: &Record,
+        store: &mut GraphStore,
+        tenant_id: &str,
+    ) {
+        for (var, labels) in items {
+            let node_id = match record.get(var) {
+                Some(Value::NodeRef(id)) => *id,
+                Some(Value::Node(id, _)) => *id,
+                _ => continue,
+            };
+            for label in labels {
+                let _ = store.add_label_to_node(tenant_id, node_id, label.clone());
+            }
+        }
     }
 
     /// Does a node satisfy the pattern's labels and inline properties?
@@ -9312,6 +9387,8 @@ impl MergeOperator {
             }
             let sets = self.on_match_set.clone();
             self.apply_sets(&sets, &record, store, tenant_id)?;
+            let labels = self.on_match_labels.clone();
+            Self::apply_labels(&labels, &record, store, tenant_id);
             return Ok(Some(record));
         }
 
@@ -9480,6 +9557,7 @@ impl PhysicalOperator for MergeOperator {
                     }
                 }
             }
+            Self::apply_labels(&self.on_match_labels, &record, store, tenant_id);
         } else {
             let label_str = labels.first().map(|l| l.as_str()).unwrap_or("Node");
             node_id = store.create_node(label_str);
@@ -9511,6 +9589,7 @@ impl PhysicalOperator for MergeOperator {
                     }
                 }
             }
+            Self::apply_labels(&self.on_create_labels, &record, store, tenant_id);
         }
 
         Ok(Some(record))
