@@ -524,6 +524,16 @@ pub struct ReturnClause {
     pub distinct: bool,
 }
 
+/// The variable name standing for `RETURN *` / `WITH *` between parsing and
+/// star expansion.
+///
+/// A sentinel rather than a new `Expression` variant because `*` is not a
+/// value and never survives into a plan: `expand_stars` replaces it with the
+/// variables in scope immediately after parsing, so nothing downstream can
+/// encounter it. `*` is not a legal identifier in Cypher, so the sentinel
+/// cannot collide with a user variable.
+pub const STAR_ITEM: &str = "*";
+
 /// Return item: n, n.name AS name, count(n)
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReturnItem {

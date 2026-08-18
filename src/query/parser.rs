@@ -153,6 +153,11 @@ pub fn parse_query(input: &str) -> ParseResult<Query> {
         }
     }
 
+    // `RETURN *` / `WITH *` are resolved here rather than in the planner, so
+    // that nothing downstream has to know the sentinel exists. See
+    // `crate::query::star`.
+    crate::query::star::expand_stars(&mut query);
+
     Ok(query)
 }
 
@@ -1089,22 +1094,19 @@ fn parse_set_item(pair: pest::iterators::Pair<Rule>) -> ParseResult<SetItem> {
     })
 }
 
+/// Parse a `RETURN` / `WITH` item list.
+///
+/// Delegates to `parse_return_item` rather than repeating its body. The two
+/// had drifted: this one matched only `expression` and `variable` and dropped
+/// anything else *silently* (`if let Some(e) = expr`), so when `star_item` was
+/// added `WITH *` parsed to an empty projection and the query failed at
+/// runtime with "Variable not found" — a grammar addition that looked like an
+/// executor bug. One implementation cannot drift from itself.
 fn parse_return_items(pair: pest::iterators::Pair<Rule>) -> ParseResult<Vec<ReturnItem>> {
     let mut items = Vec::new();
     for inner in pair.into_inner() {
         if inner.as_rule() == Rule::return_item {
-            let mut expr = None;
-            let mut alias = None;
-            for ri in inner.into_inner() {
-                match ri.as_rule() {
-                    Rule::expression => expr = Some(parse_expression(ri)?),
-                    Rule::variable => alias = Some(ri.as_str().to_string()),
-                    _ => {}
-                }
-            }
-            if let Some(e) = expr {
-                items.push(ReturnItem { expression: e, alias });
-            }
+            items.push(parse_return_item(inner)?);
         }
     }
     Ok(items)
@@ -1521,6 +1523,9 @@ fn parse_return_item(pair: pest::iterators::Pair<Rule>) -> ParseResult<ReturnIte
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
+            Rule::star_item => {
+                expression = Some(Expression::Variable(crate::query::ast::STAR_ITEM.to_string()));
+            }
             Rule::expression => {
                 expression = Some(parse_expression(inner)?);
             }

@@ -2004,7 +2004,12 @@ impl QueryPlanner {
                 && query.match_clauses[0].pattern.paths[0].start.labels.is_empty()
                 && query.match_clauses[0].pattern.paths[0].segments[0].node.labels.is_empty()
                 && matches!(&group_by[0].0, Expression::Function { name, args, .. }
-                    if name == "type" && args.len() == 1 && matches!(&args[0], Expression::Variable(_)));
+                    if name == "type" && args.len() == 1 && matches!(&args[0], Expression::Variable(_)))
+                // Directed only — see the note on `use_edge_count` below.
+                && !matches!(
+                    query.match_clauses[0].pattern.paths[0].segments[0].edge.direction,
+                    Direction::Both
+                );
 
             // O(1) count for a single edge type (or all edges): the metadata that already
             // answers `type(r), count(r)` and node label counts can answer this too, but
@@ -2046,7 +2051,23 @@ impl QueryPlanner {
                     Expression::Literal(_) => true,
                     Expression::Variable(v) => Some(v) == edge_var.as_ref(),
                     _ => false,
-                };
+                }
+                // Last, because it indexes into the pattern and every check
+                // that guarantees those indices exist is above it. Placing it
+                // earlier panicked on `UNWIND [1,2,3] AS x RETURN max(x)`,
+                // which has no match clause at all.
+                //
+                // Both fast paths read the edge count straight off the store,
+                // which counts each edge once. An **undirected** pattern
+                // matches every edge twice — once from each end — so
+                // `MATCH (a)--(b) RETURN count(*)` over two edges is 4, not 2.
+                // Doubling here would then have to reason about self-loops, so
+                // the fast path is restricted to directed patterns and the
+                // general operator answers the rest.
+                && !matches!(
+                    query.match_clauses[0].pattern.paths[0].segments[0].edge.direction,
+                    Direction::Both
+                );
 
             if use_edge_count {
                 let edge_type = query.match_clauses[0].pattern.paths[0].segments[0]

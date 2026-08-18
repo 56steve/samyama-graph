@@ -120,10 +120,18 @@ labels = { (":" ~ label)+ }
 label = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 
 // Edge pattern: -[:KNOWS]-> or <-[:KNOWS]- or -[:KNOWS]-
+//
+// The bracket is **optional**: `-->`, `<--` and `--` are ordinary Cypher and
+// mean "an edge of any type, unbound". Requiring `edge_detail` made
+// `MATCH (a)-->(b)` — about the simplest pattern there is — a syntax error,
+// which is invisible in a codebase whose own queries always name a type.
+//
+// Alternative order matters and is not arbitrary: `-` `->` must be tried
+// before `-` `-`, or `-->` matches the undirected form and leaves a stray `>`.
 edge_pattern = {
-    ("<-" ~ edge_detail ~ "-") |
-    ("-" ~ edge_detail ~ "->") |
-    ("-" ~ edge_detail ~ "-")
+    ("<-" ~ edge_detail? ~ "-") |
+    ("-" ~ edge_detail? ~ "->") |
+    ("-" ~ edge_detail? ~ "-")
 }
 edge_detail = { "[" ~ variable? ~ edge_types? ~ length_pattern? ~ properties? ~ "]" }
 edge_types = { ":" ~ edge_type ~ (("|" | ":") ~ edge_type)* }
@@ -147,8 +155,14 @@ expression_continues = { "+" | "-" | "*" | "/" | "%" | "." | "[" | "=" | "<" | "
 property_key = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 
 // RETURN items
+//
+// `star_item` must be tried before `expression`, because `*` would otherwise
+// be consumed as the start of a multiplication and fail on the missing
+// left-hand side. `RETURN *, extra` is legal, so the star is an item rather
+// than a replacement for the whole list.
 return_items = { return_item ~ ("," ~ return_item)* }
-return_item = { expression ~ (^"AS" ~ variable)? }
+return_item = { star_item | (expression ~ (^"AS" ~ variable)?) }
+star_item = { "*" }
 
 // ORDER BY items
 order_items = { order_item ~ ("," ~ order_item)* }
