@@ -192,3 +192,91 @@ fn return_star_survives_order_by() {
     let store = chain();
     assert_eq!(rows(&store, "MATCH (n) RETURN * ORDER BY n.n"), 3);
 }
+
+// ---------------------------------------------------------- SET / REMOVE / MERGE
+
+#[test]
+fn remove_strips_every_label_named_in_one_item() {
+    // `REMOVE n:L1:L3` was a syntax error: the grammar accepted a single
+    // label where `SET n:A:B` already accepted several.
+    let mut store = GraphStore::new();
+    write(&mut store, "CREATE (:L1:L2:L3)");
+    write(&mut store, "MATCH (n) REMOVE n:L1:L3");
+
+    let q = parse_query("MATCH (n) RETURN labels(n) AS l").unwrap();
+    let batch = QueryExecutor::new(&store).execute(&q).unwrap();
+    match batch.records[0].get("l") {
+        Some(Value::Property(PropertyValue::Array(items))) => {
+            let got: Vec<String> = items
+                .iter()
+                .map(|v| match v {
+                    PropertyValue::String(s) => s.clone(),
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            assert_eq!(got, vec!["L2"], "only the labels named are removed");
+        }
+        other => panic!("expected a label list, got {other:?}"),
+    }
+}
+
+/// The labels of the single node in `store`, sorted.
+fn only_node_labels(store: &GraphStore) -> Vec<String> {
+    let q = parse_query("MATCH (n) RETURN labels(n) AS l").unwrap();
+    let batch = QueryExecutor::new(store).execute(&q).expect("query should run");
+    assert_eq!(batch.records.len(), 1, "fixture should hold exactly one node");
+    match batch.records[0].get("l") {
+        Some(Value::Property(PropertyValue::Array(items))) => {
+            let mut got: Vec<String> = items
+                .iter()
+                .map(|v| match v {
+                    PropertyValue::String(s) => s.clone(),
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            got.sort();
+            got
+        }
+        other => panic!("expected a label list, got {other:?}"),
+    }
+}
+
+#[test]
+fn merge_on_create_can_add_a_label() {
+    let mut store = GraphStore::new();
+    write(&mut store, "MERGE (a:L) ON MATCH SET a:M1 ON CREATE SET a:M2");
+    assert_eq!(only_node_labels(&store), vec!["L", "M2"], "the node was created");
+}
+
+#[test]
+fn merge_on_match_can_add_a_label() {
+    let mut store = GraphStore::new();
+    write(&mut store, "CREATE (:L)");
+    write(&mut store, "MERGE (a:L) ON MATCH SET a:M1 ON CREATE SET a:M2");
+    assert_eq!(only_node_labels(&store), vec!["L", "M1"], "the node already existed");
+}
+
+#[test]
+fn merge_on_match_applies_on_the_path_that_has_an_input() {
+    // `MATCH () MERGE (…)` plans a different operator method from a bare
+    // `MERGE`, and only one of the two applied the labels. Both are exercised
+    // because the first fix looked complete and was not.
+    let mut store = GraphStore::new();
+    write(&mut store, "CREATE (:L)");
+    write(&mut store, "MATCH () MERGE (a:L) ON MATCH SET a:M1 ON CREATE SET a:M2");
+    assert_eq!(only_node_labels(&store), vec!["L", "M1"]);
+}
+
+#[test]
+fn the_on_clauses_may_be_written_in_either_order() {
+    // The grammar fixed the order as ON CREATE then ON MATCH, so the other
+    // order — which the TCK uses — was a syntax error.
+    for clauses in [
+        "ON CREATE SET a:M2 ON MATCH SET a:M1",
+        "ON MATCH SET a:M1 ON CREATE SET a:M2",
+    ] {
+        let mut store = GraphStore::new();
+        write(&mut store, &format!("MERGE (a:L) {clauses}"));
+        assert_eq!(only_node_labels(&store), vec!["L", "M2"], "{clauses}");
+    }
+}

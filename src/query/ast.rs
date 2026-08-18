@@ -637,6 +637,14 @@ pub struct MergeClause {
     pub on_create_set: Vec<SetItem>,
     /// ON MATCH SET items
     pub on_match_set: Vec<SetItem>,
+    /// Labels added by `ON CREATE SET n:Label`.
+    ///
+    /// Separate from `on_create_set` for the same reason `SetClause` keeps
+    /// `label_items` apart from `items`: the property form is read by field in
+    /// several places and an enum would touch all of them.
+    pub on_create_labels: Vec<SetLabelItem>,
+    /// Labels added by `ON MATCH SET n:Label`.
+    pub on_match_labels: Vec<SetLabelItem>,
 }
 
 /// WITH clause

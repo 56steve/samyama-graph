@@ -64,9 +64,15 @@ yield_item = { variable ~ (^"AS" ~ variable)? }
 // MERGE statement: MERGE (n:Person {name: "Alice"}) ON CREATE SET ... ON MATCH SET ...
 // A bare `SET` after MERGE applies whichever branch was taken, unlike ON CREATE / ON
 // MATCH which are branch-specific. Only the branch-specific forms were accepted.
-merge_stmt = { ^"MERGE" ~ pattern ~ on_create_set? ~ on_match_set? ~ set_clause* ~ remove_clause* ~ return_clause? }
-on_create_set = { ^"ON" ~ ^"CREATE" ~ ^"SET" ~ set_item ~ ("," ~ set_item)* }
-on_match_set = { ^"ON" ~ ^"MATCH" ~ ^"SET" ~ set_item ~ ("," ~ set_item)* }
+// `(on_create_set | on_match_set)*` rather than a fixed `ON CREATE` then
+// `ON MATCH`: Cypher lets them be written in either order, and requiring one
+// made `ON MATCH SET … ON CREATE SET …` a syntax error.
+merge_stmt = { ^"MERGE" ~ pattern ~ (on_create_set | on_match_set)* ~ set_clause* ~ remove_clause* ~ return_clause? }
+// `set_entry`, not `set_item`: `MERGE (a:L) ON MATCH SET a:M1` sets a label,
+// and restricting these to property assignment made the branch-specific forms
+// less capable than the bare `SET` on the same statement.
+on_create_set = { ^"ON" ~ ^"CREATE" ~ ^"SET" ~ set_entry ~ ("," ~ set_entry)* }
+on_match_set = { ^"ON" ~ ^"MATCH" ~ ^"SET" ~ set_entry ~ ("," ~ set_entry)* }
 
 // MATCH statement: sequence of reading clauses, optional write, finishing with RETURN
 match_stmt = { (optional_match_clause | match_clause)+ ~ where_clause? ~ call_clause? ~ unwind_clause? ~ ((optional_match_clause | match_clause)+ ~ where_clause?)* ~ (with_clause ~ unwind_clause? ~ ((optional_match_clause | match_clause)+ ~ where_clause?)*)* ~ create_clause? ~ merge_inline? ~ delete_clause? ~ foreach_clause? ~ set_clause* ~ remove_clause* ~ return_clause? ~ order_by_clause? ~ skip_clause? ~ limit_clause? }
@@ -76,7 +82,7 @@ foreach_stmt = { foreach_clause }
 foreach_clause = { ^"FOREACH" ~ "(" ~ variable ~ in_op ~ expression ~ "|" ~ foreach_body+ ~ ")" }
 foreach_body = _{ set_clause | remove_clause | delete_clause | create_clause }
 unwind_clause = { ^"UNWIND" ~ expression ~ ^"AS" ~ variable }
-merge_inline = { ^"MERGE" ~ pattern ~ on_create_set? ~ on_match_set? }
+merge_inline = { ^"MERGE" ~ pattern ~ (on_create_set | on_match_set)* }
 // A statement that *begins* with UNWIND. UNWIND was already allowed after a MATCH or a
 // WITH, but a leading one had no rule to match, so the batch-write idiom
 // `UNWIND $rows AS row CREATE (...)` was a parse error at column 1. Same tail as
@@ -96,7 +102,10 @@ set_item = { property_access ~ "=" ~ expression }
 // `SET n:A` and `SET n:A:B`, mirroring `remove_item`'s label form (#596).
 set_label_item = { variable ~ (":" ~ label)+ }
 remove_clause = { ^"REMOVE" ~ remove_item ~ ("," ~ remove_item)* }
-remove_item = { property_access | variable ~ ":" ~ label }
+// `REMOVE n:L1:L3` removes both labels in one item, exactly as `SET n:A:B`
+// adds both. Accepting only one label made the multi-label form a syntax
+// error rather than a partial effect.
+remove_item = { property_access | variable ~ (":" ~ label)+ }
 return_clause = { ^"RETURN" ~ distinct? ~ return_items }
 distinct = { ^"DISTINCT" }
 order_by_clause = { ^"ORDER" ~ ^"BY" ~ order_items }

@@ -893,11 +893,19 @@ impl QueryPlanner {
                 let on_match: Vec<(String, String, Expression)> = merge_clause.on_match_set.iter()
                     .map(|s| (s.variable.clone(), s.property.clone(), s.value.clone()))
                     .collect();
+                let on_create_labels: Vec<(String, Vec<Label>)> = merge_clause.on_create_labels.iter()
+                    .map(|l| (l.variable.clone(), l.labels.clone()))
+                    .collect();
+                let on_match_labels: Vec<(String, Vec<Label>)> = merge_clause.on_match_labels.iter()
+                    .map(|l| (l.variable.clone(), l.labels.clone()))
+                    .collect();
 
                 let mut operator: OperatorBox = Box::new(MergeOperator::new(
                     merge_clause.pattern.clone(),
                     on_create,
                     on_match,
+                    on_create_labels,
+                    on_match_labels,
                 ));
 
                 // A bare `SET` after MERGE applies on both branches, unlike ON CREATE /
@@ -1890,8 +1898,22 @@ impl QueryPlanner {
                 ));
             } else {
                 // Node-only MERGE: use existing MergeOperator with input
+                let on_create_labels: Vec<(String, Vec<Label>)> = merge_clause
+                    .on_create_labels
+                    .iter()
+                    .map(|l| (l.variable.clone(), l.labels.clone()))
+                    .collect();
+                let on_match_labels: Vec<(String, Vec<Label>)> = merge_clause
+                    .on_match_labels
+                    .iter()
+                    .map(|l| (l.variable.clone(), l.labels.clone()))
+                    .collect();
                 operator = Box::new(MergeOperator::new(
-                    merge_clause.pattern.clone(), on_create, on_match,
+                    merge_clause.pattern.clone(),
+                    on_create,
+                    on_match,
+                    on_create_labels,
+                    on_match_labels,
                 ));
             }
             true

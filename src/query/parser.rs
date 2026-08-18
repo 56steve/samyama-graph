@@ -874,24 +874,34 @@ fn parse_delete_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<DeleteC
     Ok(DeleteClause { expressions, detach })
 }
 
+/// `variable (":" label)+` — the label form of a SET item.
+///
+/// Shared by `SET`, `ON CREATE SET` and `ON MATCH SET`. Kept as one function
+/// because the last time these were parsed in two places the copies drifted
+/// and one of them silently dropped items it did not recognise.
+fn parse_set_label_item(pair: pest::iterators::Pair<Rule>) -> ParseResult<SetLabelItem> {
+    let mut variable = String::new();
+    let mut labels = Vec::new();
+    for sl in pair.into_inner() {
+        match sl.as_rule() {
+            Rule::variable => variable = sl.as_str().to_string(),
+            Rule::label => labels.push(Label::new(sl.as_str())),
+            _ => {}
+        }
+    }
+    if labels.is_empty() {
+        return Err(ParseError::SemanticError("SET label item has no label".to_string()));
+    }
+    Ok(SetLabelItem { variable, labels })
+}
+
 fn parse_set_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<SetClause> {
     let mut items = Vec::new();
     let mut label_items: Vec<SetLabelItem> = Vec::new();
 
     for inner in pair.into_inner() {
         if inner.as_rule() == Rule::set_label_item {
-            let mut variable = String::new();
-            let mut labels = Vec::new();
-            for sl in inner.into_inner() {
-                match sl.as_rule() {
-                    Rule::variable => variable = sl.as_str().to_string(),
-                    Rule::label => labels.push(Label::new(sl.as_str())),
-                    _ => {}
-                }
-            }
-            if !labels.is_empty() {
-                label_items.push(SetLabelItem { variable, labels });
-            }
+            label_items.push(parse_set_label_item(inner)?);
             continue;
         }
         if inner.as_rule() == Rule::set_item {
@@ -946,17 +956,23 @@ fn parse_remove_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<RemoveC
                 }
                 items.push(RemoveItem::Property { variable, property });
             } else {
-                // variable : label
+                // `variable (":" label)+` — one item per label, so
+                // `REMOVE n:L1:L3` removes both rather than only the first.
                 let mut variable = String::new();
-                let mut label = String::new();
+                let mut labels = Vec::new();
                 for child in children {
                     match child.as_rule() {
                         Rule::variable => variable = child.as_str().to_string(),
-                        Rule::label => label = child.as_str().to_string(),
+                        Rule::label => labels.push(child.as_str().to_string()),
                         _ => {}
                     }
                 }
-                items.push(RemoveItem::Label { variable, label: Label::new(&label) });
+                for label in labels {
+                    items.push(RemoveItem::Label {
+                        variable: variable.clone(),
+                        label: Label::new(&label),
+                    });
+                }
             }
         }
     }
@@ -987,21 +1003,27 @@ fn parse_merge_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) -
     let mut pattern = None;
     let mut on_create_set = Vec::new();
     let mut on_match_set = Vec::new();
+    let mut on_create_labels = Vec::new();
+    let mut on_match_labels = Vec::new();
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
             Rule::pattern => pattern = Some(parse_pattern(inner)?),
             Rule::on_create_set => {
                 for si in inner.into_inner() {
-                    if si.as_rule() == Rule::set_item {
-                        on_create_set.push(parse_set_item(si)?);
+                    match si.as_rule() {
+                        Rule::set_item => on_create_set.push(parse_set_item(si)?),
+                        Rule::set_label_item => on_create_labels.push(parse_set_label_item(si)?),
+                        _ => {}
                     }
                 }
             }
             Rule::on_match_set => {
                 for si in inner.into_inner() {
-                    if si.as_rule() == Rule::set_item {
-                        on_match_set.push(parse_set_item(si)?);
+                    match si.as_rule() {
+                        Rule::set_item => on_match_set.push(parse_set_item(si)?),
+                        Rule::set_label_item => on_match_labels.push(parse_set_label_item(si)?),
+                        _ => {}
                     }
                 }
             }
@@ -1026,6 +1048,8 @@ fn parse_merge_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) -
         pattern: pattern.ok_or_else(|| ParseError::SemanticError("MERGE missing pattern".to_string()))?,
         on_create_set,
         on_match_set,
+        on_create_labels,
+        on_match_labels,
     });
     Ok(())
 }
@@ -1034,21 +1058,27 @@ fn parse_merge_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<MergeCla
     let mut pattern = None;
     let mut on_create_set = Vec::new();
     let mut on_match_set = Vec::new();
+    let mut on_create_labels = Vec::new();
+    let mut on_match_labels = Vec::new();
 
     for inner in pair.into_inner() {
         match inner.as_rule() {
             Rule::pattern => pattern = Some(parse_pattern(inner)?),
             Rule::on_create_set => {
                 for si in inner.into_inner() {
-                    if si.as_rule() == Rule::set_item {
-                        on_create_set.push(parse_set_item(si)?);
+                    match si.as_rule() {
+                        Rule::set_item => on_create_set.push(parse_set_item(si)?),
+                        Rule::set_label_item => on_create_labels.push(parse_set_label_item(si)?),
+                        _ => {}
                     }
                 }
             }
             Rule::on_match_set => {
                 for si in inner.into_inner() {
-                    if si.as_rule() == Rule::set_item {
-                        on_match_set.push(parse_set_item(si)?);
+                    match si.as_rule() {
+                        Rule::set_item => on_match_set.push(parse_set_item(si)?),
+                        Rule::set_label_item => on_match_labels.push(parse_set_label_item(si)?),
+                        _ => {}
                     }
                 }
             }
@@ -1063,6 +1093,8 @@ fn parse_merge_clause(pair: pest::iterators::Pair<Rule>) -> ParseResult<MergeCla
         pattern: pattern.ok_or_else(|| ParseError::SemanticError("MERGE missing pattern".to_string()))?,
         on_create_set,
         on_match_set,
+        on_create_labels,
+        on_match_labels,
     })
 }
 
