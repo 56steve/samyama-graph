@@ -87,6 +87,46 @@ thread_local! {
 /// Returns the rewritten expression and the list of extracted aggregates.
 /// This enables expressions like `round(sum(b.runs) * 100 / sum(b.balls))` where
 /// aggregate calls are nested inside arithmetic or scalar function calls.
+/// Rewrite an `ORDER BY` expression so it refers to the projection's aliases.
+///
+/// Cypher lets a sort key be written either as the alias or as a repeat of the
+/// projected expression:
+///
+/// ```cypher
+/// WITH a.num2 % 3 AS mod, sum(a.num) AS total ORDER BY sum(a.num)   -- this
+/// WITH a.num2 % 3 AS mod, sum(a.num) AS total ORDER BY total        -- and this
+/// ```
+///
+/// are the same query. The second worked; the first did not, and failed in the
+/// worst available way. After the aggregation barrier the rows hold `mod` and
+/// `total` — there is no `a` to evaluate `sum(a.num)` against — so the sort key
+/// evaluated to null for every row, the sort became a no-op, and any `LIMIT`
+/// then took an arbitrary prefix of whatever order the group hash map happened
+/// to produce. Not a stable wrong answer: the same query over the same data
+/// returned **five different results across 100 runs**, of which 36 were right.
+///
+/// The rewrite is by structural equality against the projected expressions,
+/// recursing through compound keys so `ORDER BY sum(x) + 1` resolves too. An
+/// expression that matches nothing is left alone — it may legitimately name a
+/// grouping key that is still in scope, and rewriting it would break that.
+fn rewrite_sort_key(expr: &Expression, projections: &[(Expression, String)]) -> Expression {
+    if let Some((_, alias)) = projections.iter().find(|(projected, _)| projected == expr) {
+        return Expression::Variable(alias.clone());
+    }
+    match expr {
+        Expression::Binary { left, op, right } => Expression::Binary {
+            left: Box::new(rewrite_sort_key(left, projections)),
+            op: op.clone(),
+            right: Box::new(rewrite_sort_key(right, projections)),
+        },
+        Expression::Unary { op, expr } => Expression::Unary {
+            op: op.clone(),
+            expr: Box::new(rewrite_sort_key(expr, projections)),
+        },
+        other => other.clone(),
+    }
+}
+
 fn extract_nested_aggregates(
     expr: &Expression,
     counter: &mut usize,
@@ -205,20 +245,71 @@ enum SortPosition {
 ///
 /// A key that matches nothing is returned unchanged: it may legitimately reference a
 /// variable that is still in scope, and rewriting it would be worse than leaving it.
+/// Replace RETURN aliases in a sort key with the expressions they name.
+///
+/// A sort placed *below* the projection sees the pre-projection record, where
+/// the alias does not exist yet — only the expression behind it does. Handling
+/// the bare `ORDER BY alias` case but not `ORDER BY alias.property` made this
+/// silently wrong:
+///
+/// ```cypher
+/// MATCH (a)-[r]->(b) RETURN r AS rel ORDER BY rel.id DESC
+/// ```
+///
+/// `rel` was unbound at sort time, so the key was null on every row, the sort
+/// was a no-op, and the rows came back in scan order — which for a small
+/// fixture is often *already* the ascending order, so the bug reads as a
+/// correct answer until you ask for `DESC` and get the same rows back.
+///
+/// It surfaced through the TCK as a scenario that passed or failed depending
+/// on the process, because after a `WITH` that aggregates, "scan order"
+/// becomes hash order.
+///
+/// Only aliases naming a variable can be substituted into a property access:
+/// if `rel` aliases `count(*)` then `rel.id` means nothing and is left alone
+/// for the executor to reject rather than silently rewritten into something
+/// else.
+fn substitute_aliases(key: &Expression, return_items: &[(Expression, String)]) -> Expression {
+    let aliased = |name: &str| -> Option<&Expression> {
+        return_items.iter().find(|(_, alias)| alias == name).map(|(expr, _)| expr)
+    };
+    match key {
+        Expression::Variable(name) => match aliased(name) {
+            Some(expr) => expr.clone(),
+            None => key.clone(),
+        },
+        Expression::Property { variable, property } => match aliased(variable) {
+            Some(Expression::Variable(underlying)) => Expression::Property {
+                variable: underlying.clone(),
+                property: property.clone(),
+            },
+            _ => key.clone(),
+        },
+        Expression::Binary { left, op, right } => Expression::Binary {
+            left: Box::new(substitute_aliases(left, return_items)),
+            op: op.clone(),
+            right: Box::new(substitute_aliases(right, return_items)),
+        },
+        Expression::Unary { op, expr } => Expression::Unary {
+            op: op.clone(),
+            expr: Box::new(substitute_aliases(expr, return_items)),
+        },
+        Expression::Function { name, args, distinct } => Expression::Function {
+            name: name.clone(),
+            args: args.iter().map(|a| substitute_aliases(a, return_items)).collect(),
+            distinct: *distinct,
+        },
+        other => other.clone(),
+    }
+}
+
 fn resolve_sort_key(
     key: &Expression,
     return_items: &[(Expression, String)],
     position: SortPosition,
 ) -> Expression {
     match position {
-        SortPosition::BeforeProjection => {
-            if let Expression::Variable(name) = key {
-                if let Some((expr, _)) = return_items.iter().find(|(_, alias)| alias == name) {
-                    return expr.clone();
-                }
-            }
-            key.clone()
-        }
+        SortPosition::BeforeProjection => substitute_aliases(key, return_items),
         SortPosition::AfterProjection => {
             if let Some((_, alias)) = return_items.iter().find(|(expr, _)| expr == key) {
                 return Expression::Variable(alias.clone());
@@ -4161,6 +4252,13 @@ impl QueryPlanner {
             });
         }
 
+        // Captured before `item_infos` is consumed: ORDER BY may restate any
+        // projected expression instead of naming its alias.
+        let projections: Vec<(Expression, String)> = item_infos
+            .iter()
+            .map(|i| (i.original_expr.clone(), i.alias.clone()))
+            .collect();
+
         for info in item_infos {
             if has_aggregation {
                 if !info.extracted_aggs.is_empty() {
@@ -4175,8 +4273,15 @@ impl QueryPlanner {
             }
         }
 
-        let sort_items: Vec<(Expression, bool)> = with_clause.order_by.as_ref()
-            .map(|ob| ob.items.iter().map(|i| (i.expression.clone(), i.ascending)).collect())
+        let sort_items: Vec<(Expression, bool)> = with_clause
+            .order_by
+            .as_ref()
+            .map(|ob| {
+                ob.items
+                    .iter()
+                    .map(|i| (rewrite_sort_key(&i.expression, &projections), i.ascending))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let where_predicate = with_clause.where_clause.as_ref()
