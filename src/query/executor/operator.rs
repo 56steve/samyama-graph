@@ -1420,6 +1420,45 @@ pub fn eval_function(name: &str, args: &[Value], store: Option<&GraphStore>) -> 
                 _ => Err(ExecutionError::TypeError("id() requires node or edge".to_string())),
             }
         }
+        // `n:A:B` as a value, produced by the parser's postfix label check.
+        // True when the node carries *every* named label; null when the
+        // subject is null, following Cypher's three-valued logic.
+        "haslabels" => {
+            let wanted: Vec<String> = match &args[1] {
+                Value::Property(PropertyValue::Array(items)) => items
+                    .iter()
+                    .filter_map(|v| match v {
+                        PropertyValue::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => return Err(ExecutionError::TypeError("hasLabels expects a label list".into())),
+            };
+            let node = match &args[0] {
+                Value::Node(_, n) => Some((**n).clone()),
+                Value::NodeRef(id) => {
+                    let s = store.ok_or_else(|| {
+                        ExecutionError::RuntimeError("hasLabels on NodeRef requires store".into())
+                    })?;
+                    s.get_node(*id).cloned()
+                }
+                Value::Property(PropertyValue::Null) => {
+                    return Ok(Value::Property(PropertyValue::Null))
+                }
+                _ => {
+                    return Err(ExecutionError::TypeError(
+                        "a label test requires a node".to_string(),
+                    ))
+                }
+            };
+            let Some(node) = node else {
+                return Ok(Value::Property(PropertyValue::Null));
+            };
+            let has_all = wanted
+                .iter()
+                .all(|w| node.labels.iter().any(|l| l.as_str() == w));
+            Ok(Value::Property(PropertyValue::Boolean(has_all)))
+        }
         "labels" => {
             match &args[0] {
                 Value::Node(_, node) => {

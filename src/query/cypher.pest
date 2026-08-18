@@ -199,7 +199,11 @@ order_direction = { ^"ASC" | ^"DESC" }
 // parser give it a precedence between AND and the comparison operators.
 expression = { not_op* ~ term ~ (binary_op ~ not_op* ~ term)* }
 term = { unary_op* ~ primary ~ index_op* ~ postfix_op? }
-postfix_op = { ^"IS" ~ ^"NOT" ~ ^"NULL" | ^"IS" ~ ^"NULL" }
+// `n:Label` used as a *value*, not as a pattern: `WHERE n:Person`,
+// `RETURN n:Person AS isPerson`. It is a postfix on a term, which gives it a
+// tighter binding than any comparison — the same shape as `IS NULL`.
+postfix_op = { label_check | (^"IS" ~ ^"NOT" ~ ^"NULL") | (^"IS" ~ ^"NULL") }
+label_check = { (":" ~ label)+ }
 index_op = { "[" ~ (slice_op | expression) ~ "]" }
 slice_op = { slice_start ~ ".." ~ slice_end | slice_start ~ ".." | ".." ~ slice_end | ".." }
 slice_start = { expression }

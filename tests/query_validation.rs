@@ -112,3 +112,103 @@ fn ordinary_queries_are_unaffected() {
         accepted(q);
     }
 }
+
+// ---------------------------------------------------------- label predicates
+
+// `n:Label` used as a *value* rather than as a pattern — `WHERE n:Person`,
+// `RETURN n:Person AS isPerson`. It parses as a postfix on a term, which puts
+// it at the same binding strength as `IS NULL`.
+//
+// The first implementation read the labels from the wrong nesting level, found
+// none, and fell through to the `IS NULL` branch — so `n:A` silently became
+// `n IS NULL`. It parsed, it ran, and it returned a plausible boolean. That is
+// why these tests assert the *value*, and assert both polarities.
+
+use samyama::graph::{GraphStore, PropertyValue};
+use samyama::query::executor::{MutQueryExecutor, QueryExecutor, Value};
+
+fn labelled_graph() -> GraphStore {
+    let mut store = GraphStore::new();
+    let q = parse_query("CREATE (:A:B {n: 'ab'}), (:A {n: 'a'}), (:C {n: 'c'})").unwrap();
+    MutQueryExecutor::new(&mut store, "default".to_string())
+        .execute(&q)
+        .expect("fixture should run");
+    store
+}
+
+fn one_bool(store: &GraphStore, cypher: &str) -> Option<bool> {
+    let q = parse_query(cypher).expect("query should parse");
+    let batch = QueryExecutor::new(store).execute(&q).expect("query should run");
+    match batch.records[0].get("r") {
+        Some(Value::Property(PropertyValue::Boolean(b))) => Some(*b),
+        Some(Value::Property(PropertyValue::Null)) => None,
+        other => panic!("expected a boolean, got {other:?}"),
+    }
+}
+
+fn names(store: &GraphStore, cypher: &str) -> Vec<String> {
+    let q = parse_query(cypher).expect("query should parse");
+    let batch = QueryExecutor::new(store).execute(&q).expect("query should run");
+    let mut out: Vec<String> = batch
+        .records
+        .iter()
+        .map(|r| match r.get("x") {
+            Some(Value::Property(PropertyValue::String(s))) => s.clone(),
+            other => panic!("expected a name, got {other:?}"),
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn a_label_test_returns_true_only_when_the_label_is_present() {
+    let store = labelled_graph();
+    assert_eq!(one_bool(&store, "MATCH (n) WHERE n.n = 'a' RETURN n:A AS r"), Some(true));
+    assert_eq!(one_bool(&store, "MATCH (n) WHERE n.n = 'a' RETURN n:C AS r"), Some(false));
+}
+
+#[test]
+fn a_multi_label_test_requires_every_label() {
+    let store = labelled_graph();
+    assert_eq!(one_bool(&store, "MATCH (n) WHERE n.n = 'ab' RETURN n:A:B AS r"), Some(true));
+    // `a` has A but not B, so the conjunction is false.
+    assert_eq!(one_bool(&store, "MATCH (n) WHERE n.n = 'a' RETURN n:A:B AS r"), Some(false));
+}
+
+#[test]
+fn a_label_test_filters_in_where() {
+    let store = labelled_graph();
+    assert_eq!(names(&store, "MATCH (n) WHERE n:A RETURN n.n AS x"), vec!["a", "ab"]);
+    assert_eq!(names(&store, "MATCH (n) WHERE n:A:B RETURN n.n AS x"), vec!["ab"]);
+    assert_eq!(names(&store, "MATCH (n) WHERE NOT n:C RETURN n.n AS x"), vec!["a", "ab"]);
+}
+
+#[test]
+fn parenthesising_a_label_test_changes_nothing() {
+    let store = labelled_graph();
+    assert_eq!(one_bool(&store, "MATCH (n) WHERE n.n = 'a' RETURN (n:A) AS r"), Some(true));
+}
+
+#[test]
+fn is_null_still_parses_as_is_null() {
+    // The regression the nesting bug caused: a label test that failed to read
+    // its labels became `IS NULL`. This pins the other direction — `IS NULL`
+    // must not become a label test.
+    let store = labelled_graph();
+    assert_eq!(one_bool(&store, "MATCH (n) WHERE n.n = 'a' RETURN n.missing IS NULL AS r"), Some(true));
+    assert_eq!(one_bool(&store, "MATCH (n) WHERE n.n = 'a' RETURN n.n IS NULL AS r"), Some(false));
+    assert_eq!(one_bool(&store, "MATCH (n) WHERE n.n = 'a' RETURN n.n IS NOT NULL AS r"), Some(true));
+}
+
+#[test]
+fn a_map_literal_is_not_read_as_a_label_test() {
+    // `:` is also the map-literal separator, so the postfix must not steal it.
+    let store = labelled_graph();
+    let q = parse_query("RETURN {a: 1, b: 2} AS m").expect("map literal should still parse");
+    let batch = QueryExecutor::new(&store).execute(&q).expect("query should run");
+    assert!(matches!(
+        batch.records[0].get("m"),
+        Some(Value::Property(PropertyValue::Map(_)))
+    ));
+}

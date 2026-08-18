@@ -1801,16 +1801,46 @@ fn parse_term(pair: pest::iterators::Pair<Rule>) -> ParseResult<Expression> {
 
             // Apply postfix operator (IS NULL / IS NOT NULL)
             if let Some(postfix) = postfix_pair {
-                let text = postfix.as_str().to_uppercase();
-                let op = if text.contains("NOT") {
-                    UnaryOp::IsNotNull
+                // `n:A:B` — a label test used as a boolean value. Desugared to
+                // a function call rather than given its own `Expression`
+                // variant: a new variant would have to be handled by every
+                // exhaustive match over `Expression`, and this needs no
+                // information a call cannot carry.
+                // The labels sit two levels down: postfix_op → label_check →
+                // label. Reading only the first level found nothing and fell
+                // through to the `IS NULL` branch, so `n:A` silently became
+                // `n IS NULL` — a wrong answer rather than a parse error.
+                let labels: Vec<PropertyValue> = postfix
+                    .clone()
+                    .into_inner()
+                    .flat_map(|p| {
+                        if p.as_rule() == Rule::label_check {
+                            p.into_inner().collect::<Vec<_>>()
+                        } else {
+                            vec![p]
+                        }
+                    })
+                    .filter(|p| p.as_rule() == Rule::label)
+                    .map(|p| PropertyValue::String(p.as_str().to_string()))
+                    .collect();
+                if !labels.is_empty() {
+                    expr = Expression::Function {
+                        name: "hasLabels".to_string(),
+                        args: vec![expr, Expression::Literal(PropertyValue::Array(labels))],
+                        distinct: false,
+                    };
                 } else {
-                    UnaryOp::IsNull
-                };
-                expr = Expression::Unary {
-                    op,
-                    expr: Box::new(expr),
-                };
+                    let text = postfix.as_str().to_uppercase();
+                    let op = if text.contains("NOT") {
+                        UnaryOp::IsNotNull
+                    } else {
+                        UnaryOp::IsNull
+                    };
+                    expr = Expression::Unary {
+                        op,
+                        expr: Box::new(expr),
+                    };
+                }
             }
 
             // Apply prefix operators in reverse order (innermost first)
