@@ -113,7 +113,14 @@ skip_clause = { ^"SKIP" ~ integer }
 limit_clause = { ^"LIMIT" ~ integer }
 
 // Standalone CREATE clause
-create_stmt = { ^"CREATE" ~ pattern ~ return_clause? }
+// Adjacent `CREATE` clauses are one create: `CREATE (a) CREATE (b)` and
+// `CREATE (a), (b)` mean the same thing, and a variable bound by an earlier
+// one refers to the same node. The parser merges the patterns, so nothing
+// downstream needs to know which spelling was used.
+//
+// Every TCK fixture is written with repeated CREATE clauses, which is why 197
+// scenarios were skipped for "setup did not parse" rather than being judged.
+create_stmt = { create_clause+ ~ return_clause? ~ order_by_clause? ~ skip_clause? ~ limit_clause? }
 
 // Pattern matching
 pattern = { named_path ~ ("," ~ named_path)* }

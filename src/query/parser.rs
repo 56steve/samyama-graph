@@ -803,18 +803,52 @@ fn parse_match_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) -
 }
 
 fn parse_create_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) -> ParseResult<()> {
+    // Adjacent CREATE clauses are merged into one pattern. They are equivalent
+    // by definition — `CREATE (a) CREATE (b)` and `CREATE (a), (b)` bind the
+    // same variables to the same nodes — and merging means the planner and the
+    // executor never learn that repeated clauses exist. The alternative,
+    // `Vec<CreateClause>` on the AST, would touch 36 call sites, most of them
+    // `is_some()` guards asking only "is this a write query".
+    let mut paths = Vec::new();
     for inner in pair.into_inner() {
         match inner.as_rule() {
-            Rule::pattern => {
-                query.create_clause = Some(CreateClause {
-                    pattern: parse_pattern(inner)?,
-                });
+            // A bare `CREATE` statement yields `pattern` directly; a repeated
+            // one yields `create_clause` wrappers.
+            Rule::pattern => paths.extend(parse_pattern(inner)?.paths),
+            Rule::create_clause => {
+                for c in inner.into_inner() {
+                    if c.as_rule() == Rule::pattern {
+                        paths.extend(parse_pattern(c)?.paths);
+                    }
+                }
             }
             Rule::return_clause => {
                 query.return_clause = Some(parse_return_clause(inner)?);
             }
+            Rule::order_by_clause => {
+                query.order_by = Some(parse_order_by_clause(inner)?);
+            }
+            Rule::skip_clause => {
+                for i in inner.into_inner() {
+                    if i.as_rule() == Rule::integer {
+                        query.skip = i.as_str().parse::<usize>().ok();
+                    }
+                }
+            }
+            Rule::limit_clause => {
+                for i in inner.into_inner() {
+                    if i.as_rule() == Rule::integer {
+                        query.limit = i.as_str().parse::<usize>().ok();
+                    }
+                }
+            }
             _ => {}
         }
+    }
+    if !paths.is_empty() {
+        query.create_clause = Some(CreateClause {
+            pattern: crate::query::ast::Pattern { paths },
+        });
     }
     Ok(())
 }

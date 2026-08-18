@@ -1702,6 +1702,9 @@ impl QueryPlanner {
              -> String {
                 match &node.variable {
                     Some(v) if matched_vars.contains(v) => v.clone(),
+                    // Already registered by an earlier path in this same
+                    // CREATE — reuse it rather than creating a second node.
+                    Some(v) if nodes_to_create.iter().any(|(h, ..)| h == v) => v.clone(),
                     Some(v) => {
                         nodes_to_create.push((
                             v.clone(),
@@ -3637,6 +3640,17 @@ impl QueryPlanner {
             }
         };
 
+        // A variable bound earlier in the *same* CREATE refers to the node
+        // already being created, not to a new one:
+        //
+        //     CREATE (a), (b), (a)-[:R]->(b)
+        //
+        // creates two nodes and one edge. Re-registering `a` and `b` for
+        // creation made it four nodes — the edge was correct, so the query
+        // succeeded and quietly doubled the graph. This is the shape every
+        // TCK fixture and most of our own loaders are written in.
+        let mut created_vars: HashSet<String> = HashSet::new();
+
         for path in &pattern.paths {
             // Add start node
             let start = &path.start;
@@ -3644,9 +3658,16 @@ impl QueryPlanner {
             let properties: HashMap<String, PropertyValue> = start.properties.clone().unwrap_or_default();
             let variable = start.variable.clone();
 
-            // Track output column if variable exists
+            let start_already_bound = variable
+                .as_ref()
+                .is_some_and(|v| created_vars.contains(v));
+
+            // Track output column if variable exists — once per variable, since
+            // a repeat mention is the same node.
             if let Some(ref var) = variable {
-                output_columns.push(var.clone());
+                if !start_already_bound {
+                    output_columns.push(var.clone());
+                }
             }
 
             // Only the *named* variable reaches output_columns above; the synthetic one is
@@ -3655,12 +3676,17 @@ impl QueryPlanner {
                 Some(v) => v.clone(),
                 None => next_anon(&declared),
             };
-            nodes_to_create.push((
-                labels,
-                properties,
-                Some(start_handle.clone()),
-                start.property_exprs.clone(),
-            ));
+            if !start_already_bound {
+                if let Some(v) = &variable {
+                    created_vars.insert(v.clone());
+                }
+                nodes_to_create.push((
+                    labels,
+                    properties,
+                    Some(start_handle.clone()),
+                    start.property_exprs.clone(),
+                ));
+            }
 
             // Track current source variable for edge creation
             let mut current_source_var = Some(start_handle);
@@ -3673,20 +3699,31 @@ impl QueryPlanner {
                 let node_properties: HashMap<String, PropertyValue> = node.properties.clone().unwrap_or_default();
                 let node_variable = node.variable.clone();
 
+                let node_already_bound = node_variable
+                    .as_ref()
+                    .is_some_and(|v| created_vars.contains(v));
+
                 if let Some(ref var) = node_variable {
-                    output_columns.push(var.clone());
+                    if !node_already_bound {
+                        output_columns.push(var.clone());
+                    }
                 }
 
                 let node_handle = match &node_variable {
                     Some(v) => v.clone(),
                     None => next_anon(&declared),
                 };
-                nodes_to_create.push((
-                    node_labels,
-                    node_properties,
-                    Some(node_handle.clone()),
-                    node.property_exprs.clone(),
-                ));
+                if !node_already_bound {
+                    if let Some(v) = &node_variable {
+                        created_vars.insert(v.clone());
+                    }
+                    nodes_to_create.push((
+                        node_labels,
+                        node_properties,
+                        Some(node_handle.clone()),
+                        node.property_exprs.clone(),
+                    ));
+                }
 
                 // Extract edge information
                 let edge = &segment.edge;
