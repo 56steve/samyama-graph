@@ -72,6 +72,7 @@
 pub mod ast;
 pub mod parser;
 pub mod star;
+pub mod validate;
 pub mod executor;
 
 use std::num::NonZeroUsize;

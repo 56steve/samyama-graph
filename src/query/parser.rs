@@ -158,6 +158,13 @@ pub fn parse_query(input: &str) -> ParseResult<Query> {
     // `crate::query::star`.
     crate::query::star::expand_stars(&mut query);
 
+    // Checks the grammar cannot express — duplicate result columns, UNION
+    // arity, CREATE over an already-bound variable. Reported as a parse
+    // failure because that is what they are to a caller: the query was never
+    // well-formed, and running it would answer a question nobody asked.
+    crate::query::validate::validate(&query)
+        .map_err(|e| ParseError::SemanticError(e.to_string()))?;
+
     Ok(query)
 }
 

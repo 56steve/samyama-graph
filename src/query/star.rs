@@ -91,16 +91,27 @@ fn expand_into(items: &mut Vec<ReturnItem>, scope: &[String]) {
     if !has_star(items) {
         return;
     }
+
+    // Names the query projects explicitly, wherever they appear relative to
+    // the star. `RETURN *, n` must not yield two `n` columns, and checking
+    // only the items already emitted misses that case entirely — the star
+    // comes first, so at that point nothing has been emitted yet. Collected up
+    // front instead.
+    let explicit: Vec<String> = items
+        .iter()
+        .filter(|i| !is_star(i))
+        .filter_map(|i| match (&i.alias, &i.expression) {
+            (Some(alias), _) => Some(alias.clone()),
+            (None, Expression::Variable(v)) => Some(v.clone()),
+            _ => None,
+        })
+        .collect();
+
     let mut out: Vec<ReturnItem> = Vec::with_capacity(items.len() + scope.len());
     for item in items.drain(..) {
         if is_star(&item) {
             for name in scope {
-                // A variable already projected explicitly is not repeated:
-                // `RETURN *, n` must not yield two `n` columns.
-                if out.iter().any(|i: &ReturnItem| {
-                    i.alias.as_deref() == Some(name.as_str())
-                        || matches!(&i.expression, Expression::Variable(v) if v == name)
-                }) {
+                if explicit.iter().any(|e| e == name) {
                     continue;
                 }
                 out.push(ReturnItem {
