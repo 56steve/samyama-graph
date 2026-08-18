@@ -770,7 +770,14 @@ fn parse_match_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) -
                 query.remove_clauses.push(parse_remove_clause(inner)?);
             }
             Rule::unwind_clause => {
-                query.unwind_clause = Some(parse_unwind_clause(inner)?);
+                // The first UNWIND stays in `unwind_clause`; the rest queue up
+                // behind it, each a cross product with everything before.
+                let u = parse_unwind_clause(inner)?;
+                if query.unwind_clause.is_none() {
+                    query.unwind_clause = Some(u);
+                } else {
+                    query.extra_unwind_clauses.push(u);
+                }
             }
             Rule::merge_inline => {
                 query.merge_clause = Some(parse_merge_clause(inner)?);

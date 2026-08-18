@@ -1244,6 +1244,19 @@ impl QueryPlanner {
                     unwind.variable.clone(),
                 )));
                 known_vars.insert(unwind.variable.clone());
+
+                // A run of UNWINDs at the head of the query: each expands the
+                // rows the previous produced, giving the cross product the TCK
+                // uses to enumerate three-variable truth tables.
+                for extra in &query.extra_unwind_clauses {
+                    let base = operator.take().expect("previous UNWIND produced an operator");
+                    operator = Some(Box::new(UnwindOperator::new(
+                        base,
+                        extra.expression.clone(),
+                        extra.variable.clone(),
+                    )));
+                    known_vars.insert(extra.variable.clone());
+                }
             }
         }
 
@@ -1645,6 +1658,16 @@ impl QueryPlanner {
                     unwind_clause.expression.clone(),
                     unwind_clause.variable.clone(),
                 ));
+                // Consecutive UNWINDs stack: each one expands the rows the
+                // previous produced, so `UNWIND [1,2] AS a UNWIND [3,4] AS b`
+                // is four rows and not two.
+                for extra in &query.extra_unwind_clauses {
+                    operator = Box::new(UnwindOperator::new(
+                        operator,
+                        extra.expression.clone(),
+                        extra.variable.clone(),
+                    ));
+                }
             }
         }
 
@@ -5157,6 +5180,7 @@ mod tests {
             create_clause: None,
             order_by: None,
             limit: None,
+            extra_unwind_clauses: Vec::new(),
             skip: None,
             call_clause: None,
             call_subquery: None,

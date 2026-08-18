@@ -121,6 +121,13 @@ pub struct Query {
     pub foreach_clause: Option<ForeachClause>,
     /// UNWIND clause (optional)
     pub unwind_clause: Option<UnwindClause>,
+    /// Further `UNWIND`s written directly after the first, in order.
+    ///
+    /// Each is a cross product with everything before it. Kept beside
+    /// `unwind_clause` rather than replacing it with a `Vec` because the
+    /// single-UNWIND field is read in a dozen places that only ever care
+    /// about the first one.
+    pub extra_unwind_clauses: Vec<UnwindClause>,
     /// Whether the UNWIND *led* the statement (`UNWIND ... MATCH ...`) rather than
     /// following the match. The AST keeps a single `unwind_clause` with no position, but
     /// the two orders plan differently: a leading UNWIND must bind its variable before the
@@ -711,6 +718,7 @@ impl Query {
             params: HashMap::new(),
             foreach_clause: None,
             unwind_clause: None,
+            extra_unwind_clauses: Vec::new(),
             unwind_leading: false,
             merge_clause: None,
             union_queries: Vec::new(),

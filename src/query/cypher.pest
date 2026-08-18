@@ -87,7 +87,10 @@ merge_inline = { ^"MERGE" ~ pattern ~ (on_create_set | on_match_set)* }
 // WITH, but a leading one had no rule to match, so the batch-write idiom
 // `UNWIND $rows AS row CREATE (...)` was a parse error at column 1. Same tail as
 // `match_stmt`, with the leading MATCH group optional rather than required.
-unwind_stmt = { unwind_clause ~ ((optional_match_clause | match_clause)+ ~ where_clause?)* ~ (with_clause ~ unwind_clause? ~ ((optional_match_clause | match_clause)+ ~ where_clause?)*)* ~ create_clause? ~ merge_inline? ~ delete_clause? ~ foreach_clause? ~ set_clause* ~ remove_clause* ~ return_clause? ~ order_by_clause? ~ skip_clause? ~ limit_clause? }
+// `unwind_clause+`: consecutive UNWINDs are a cross product —
+// `UNWIND [1,2] AS a UNWIND [3,4] AS b` yields four rows — and the TCK leans
+// on the three-way form to enumerate the truth tables for AND/OR/XOR.
+unwind_stmt = { unwind_clause+ ~ ((optional_match_clause | match_clause)+ ~ where_clause?)* ~ (with_clause ~ unwind_clause? ~ ((optional_match_clause | match_clause)+ ~ where_clause?)*)* ~ create_clause? ~ merge_inline? ~ delete_clause? ~ foreach_clause? ~ set_clause* ~ remove_clause* ~ return_clause? ~ order_by_clause? ~ skip_clause? ~ limit_clause? }
 match_clause = { ^"MATCH" ~ pattern }
 optional_match_clause = { ^"OPTIONAL" ~ ^"MATCH" ~ pattern }
 where_clause = { ^"WHERE" ~ expression }
