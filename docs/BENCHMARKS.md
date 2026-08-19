@@ -139,16 +139,24 @@ cargo run --release --example tck_runner -- --features <openCypher>/tck/features
 |---|---:|
 | scenarios in the TCK | 1,615 |
 | **evaluated** by the harness | **1,244** (77.0%) |
-| pass | 711 |
-| wrong result | 340 |
-| errored | 193 |
+| pass | 759 |
+| wrong result | 305 |
+| errored | 180 |
 | skipped | 371 |
-| **pass rate, of evaluated** | **57.2%** |
-| pass rate, of all 1,615 | 44.0% |
+| **pass rate, of evaluated** | **61.0%** |
+| pass rate, of all 1,615 | 47.0% |
 | gate `CH-TCK ≥ 85%` | **not met** |
 
-Measured at `b223394` via the conformance harness's `CH-TCK` suite; the
+Measured at `9846654` via the conformance harness's `CH-TCK` suite; the
 envelope is in `samyama-graph-competitor-benchmarks/harness/runs/`.
+
+**A storage defect was worth 36 scenarios.** `create_node` takes one label
+and always inserts it, so a pattern with no label had to invent one: CREATE
+passed `""` and MERGE passed the string `"Node"`. Both reached the label
+index and the catalog, so an unlabelled node reported a label it did not
+have and `MATCH (n:Node)` matched nodes nobody had labelled (#625, #626).
+Unlabelled nodes are the default shape across the TCK, which is the whole
+reason one storage bug moved the rate 58.1% → 61.0%.
 
 **Coverage moved further than the rate.** 65.0% → 76.7% of scenarios are now
 judged rather than skipped, because 197 of them were being skipped for
@@ -157,6 +165,16 @@ clauses, which did not parse. Making them parse then exposed a worse bug:
 `CREATE (a), (b), (a)-[:R]->(b)` created **four** nodes instead of two. The
 rate rising from 46.6% to 57.2% *while* 195 harder scenarios joined the
 denominator is the more useful way to read this.
+
+**Every step here was checked by diffing the failure manifest, not by
+comparing the headline.** Completing the clause pipeline (#624) raised the
+rate *and* regressed four TCK negative scenarios: Merge5 [22], [23], [28]
+and [29] had been passing because the grammar rejected the clause **order**,
+so an error came out for an unrelated reason. Routing MERGE through the new
+path made them run, and the Cypher rules they assert — exactly one
+relationship type, no variable-length relationship, no new labels on a bound
+variable, no null property — turned out not to exist anywhere in the engine.
+A rising pass rate hides that; a manifest diff does not.
 
 **The largest single step was not a feature.** Every statement rule in the
 grammar encoded one permitted clause order, with writes at the end — so
