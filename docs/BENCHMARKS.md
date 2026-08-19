@@ -139,16 +139,42 @@ cargo run --release --example tck_runner -- --features <openCypher>/tck/features
 |---|---:|
 | scenarios in the TCK | 1,615 |
 | **evaluated** by the harness | **1,244** (77.0%) |
-| pass | 932 |
-| wrong result | 191 |
+| pass | 950 |
+| wrong result | 173 |
 | errored | 121 |
 | skipped | 371 |
-| **pass rate, of evaluated** | **74.9%** |
-| pass rate, of all 1,615 | 57.7% |
+| **pass rate, of evaluated** | **76.4%** |
+| pass rate, of all 1,615 | 58.8% |
 | gate `CH-TCK ≥ 85%` | **not met** |
 
-Measured at `1a4264b` via the conformance harness's `CH-TCK` suite; the
+Measured at `ee6a961` via the conformance harness's `CH-TCK` suite; the
 envelope is in `samyama-graph-competitor-benchmarks/harness/runs/`.
+
+**The bar is 93.9%, not 85%, and three of our own defects were found by
+asking someone else.** The same 1,249 scenarios were run against Neo4j,
+Memgraph and FalkorDB through this runner — one scenario list, one comparator,
+a per-engine driver that only executes and renders:
+
+| Engine | Rate |
+|---|---:|
+| Neo4j 5 | **98.9%** |
+| Memgraph | 89.8% |
+| FalkorDB | 89.1% |
+| Samyama | 76.4% |
+
+The H1 gate asks for ≥85% **and** within 5 points of the best competitor, so
+the real target is 93.9%. That is ~220 more scenarios rather than ~110, and it
+was invisible while LANG-02 sat unmeasured.
+
+The second output was a set of bug reports about this harness. A reference
+implementation failing a scenario is far more likely to be our defect than
+theirs, and three were: the TCK's *control query* was being run as setup, so
+27 scenarios were scored against the wrong query for every engine; escape
+sequences were un-backslashed rather than interpreted, so `'Foo\nFoo'` became
+`FoonFoo` on the expected side; and the value cursor indexed bytes rather than
+characters, mangling every UTF-8 literal. Fixing them moved **our** number
+932 → 950 with no engine change. Full comparison in
+`samyama-graph-competitor-benchmarks/benchmarks/opencypher-tck/`.
 
 **A rising pass rate is not evidence of a correct change.** `IN` is
 three-valued in Cypher, and the intuitive fix — "if either side contains a
