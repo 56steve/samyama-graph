@@ -139,16 +139,25 @@ cargo run --release --example tck_runner -- --features <openCypher>/tck/features
 |---|---:|
 | scenarios in the TCK | 1,615 |
 | **evaluated** by the harness | **1,244** (77.0%) |
-| pass | 892 |
-| wrong result | 208 |
-| errored | 144 |
+| pass | 932 |
+| wrong result | 191 |
+| errored | 121 |
 | skipped | 371 |
-| **pass rate, of evaluated** | **71.7%** |
-| pass rate, of all 1,615 | 55.2% |
+| **pass rate, of evaluated** | **74.9%** |
+| pass rate, of all 1,615 | 57.7% |
 | gate `CH-TCK ≥ 85%` | **not met** |
 
-Measured at `6de3f32` via the conformance harness's `CH-TCK` suite; the
+Measured at `1a4264b` via the conformance harness's `CH-TCK` suite; the
 envelope is in `samyama-graph-competitor-benchmarks/harness/runs/`.
+
+**A rising pass rate is not evidence of a correct change.** `IN` is
+three-valued in Cypher, and the intuitive fix — "if either side contains a
+null anywhere, the answer is unknown" — gains 8 scenarios and loses 4. That
+nets to **+4 and reads as progress**. The four it breaks are cases where a
+length mismatch settles the comparison without ever reaching the null
+(`[1] IN [[1, null]]` is `false`). Nothing in the headline shows that; only
+diffing the failure manifest does, which is why every step on this page is
+checked that way (#647).
 
 **The largest single engine step was a naming rule.** Cypher names an
 unaliased result column after the expression as written; the planner
