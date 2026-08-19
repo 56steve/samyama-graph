@@ -139,18 +139,32 @@ cargo run --release --example tck_runner -- --features <openCypher>/tck/features
 |---|---:|
 | scenarios in the TCK | 1,615 |
 | **evaluated** by the harness | **1,244** (77.0%) |
-| pass | 784 |
-| wrong result | 280 |
-| errored | 180 |
+| pass | 892 |
+| wrong result | 208 |
+| errored | 144 |
 | skipped | 371 |
-| **pass rate, of evaluated** | **63.0%** |
-| pass rate, of all 1,615 | 48.5% |
+| **pass rate, of evaluated** | **71.7%** |
+| pass rate, of all 1,615 | 55.2% |
 | gate `CH-TCK ≥ 85%` | **not met** |
 
-Measured at `be50c58` via the conformance harness's `CH-TCK` suite; the
+Measured at `6de3f32` via the conformance harness's `CH-TCK` suite; the
 envelope is in `samyama-graph-competitor-benchmarks/harness/runs/`.
 
-**Two of those points are a harness fix, not an engine improvement.** The
+**The largest single engine step was a naming rule.** Cypher names an
+unaliased result column after the expression as written; the planner
+reconstructed it from the AST in **ten separate places that did not agree**.
+`RETURN 1 + 1` produced `col_0` — a column no client can select by key — and
+`count(*)` produced `count()`, because `*` is not an argument expression and
+the text that would say so was discarded at parse time. Recording the source
+text and deriving the name once moved 43 scenarios (#635, #636). The size of
+that jump measures how ordinary the broken case was, not how clever the fix
+is.
+
+**One of these was a reachable crash.** `RETURN 9223372036854775808` did not
+return an error — it panicked, from a string any client can send, which on
+the HTTP or protocol server stops the process (#633, #634).
+
+**Three more harness points, not engine points.** The
 runner discarded every `Background:` block — its parse loop skips lines
 before the first `Scenario:` — so all 29 scenarios in Match5 ran against an
 empty graph, returned no rows, and were scored as **wrong answers**. The
