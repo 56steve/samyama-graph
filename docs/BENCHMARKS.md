@@ -139,16 +139,27 @@ cargo run --release --example tck_runner -- --features <openCypher>/tck/features
 |---|---:|
 | scenarios in the TCK | 1,615 |
 | **evaluated** by the harness | **1,244** (77.0%) |
-| pass | 759 |
-| wrong result | 305 |
+| pass | 784 |
+| wrong result | 280 |
 | errored | 180 |
 | skipped | 371 |
-| **pass rate, of evaluated** | **61.0%** |
-| pass rate, of all 1,615 | 47.0% |
+| **pass rate, of evaluated** | **63.0%** |
+| pass rate, of all 1,615 | 48.5% |
 | gate `CH-TCK ≥ 85%` | **not met** |
 
-Measured at `9846654` via the conformance harness's `CH-TCK` suite; the
+Measured at `be50c58` via the conformance harness's `CH-TCK` suite; the
 envelope is in `samyama-graph-competitor-benchmarks/harness/runs/`.
+
+**Two of those points are a harness fix, not an engine improvement.** The
+runner discarded every `Background:` block — its parse loop skips lines
+before the first `Scenario:` — so all 29 scenarios in Match5 ran against an
+empty graph, returned no rows, and were scored as **wrong answers**. The
+engine had been charged with 26 defects it did not have, and `wrong_result`
+— the class this page calls the most damaging — was 25 too high (#627). Run
+by hand against the fixture, those queries return exactly what the TCK
+expects. Stated plainly because the direction is flattering: 61.0% → 63.0%
+here is the measurement getting more accurate, not the engine getting
+better.
 
 **A storage defect was worth 36 scenarios.** `create_node` takes one label
 and always inserts it, so a pattern with no label had to invent one: CREATE
