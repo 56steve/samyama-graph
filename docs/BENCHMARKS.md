@@ -138,16 +138,16 @@ cargo run --release --example tck_runner -- --features <openCypher>/tck/features
 | | |
 |---|---:|
 | scenarios in the TCK | 1,615 |
-| **evaluated** by the harness | **1,239** (76.7%) |
-| pass | 663 |
-| wrong result | 320 |
-| errored | 256 |
-| skipped | 376 |
-| **pass rate, of evaluated** | **53.5%** |
-| pass rate, of all 1,615 | 41.1% |
+| **evaluated** by the harness | **1,244** (77.0%) |
+| pass | 711 |
+| wrong result | 340 |
+| errored | 193 |
+| skipped | 371 |
+| **pass rate, of evaluated** | **57.2%** |
+| pass rate, of all 1,615 | 44.0% |
 | gate `CH-TCK ≥ 85%` | **not met** |
 
-Measured at `ab4ae61` via the conformance harness's `CH-TCK` suite; the
+Measured at `b223394` via the conformance harness's `CH-TCK` suite; the
 envelope is in `samyama-graph-competitor-benchmarks/harness/runs/`.
 
 **Coverage moved further than the rate.** 65.0% → 76.7% of scenarios are now
@@ -155,8 +155,17 @@ judged rather than skipped, because 197 of them were being skipped for
 "setup did not parse" — every TCK fixture is written as a run of `CREATE`
 clauses, which did not parse. Making them parse then exposed a worse bug:
 `CREATE (a), (b), (a)-[:R]->(b)` created **four** nodes instead of two. The
-rate rising from 46.6% to 53.5% *while* 190 harder scenarios joined the
+rate rising from 46.6% to 57.2% *while* 195 harder scenarios joined the
 denominator is the more useful way to read this.
+
+**The largest single step was not a feature.** Every statement rule in the
+grammar encoded one permitted clause order, with writes at the end — so
+`MATCH (n) SET n.x = 1 WITH n RETURN n.x` was a syntax error. Underneath that
+was the reason: a pass-through operator's default `next_mut` delegates to
+`next`, which reads its input read-only, so a materialising operator severed
+mutability for everything below it. A write below a `WITH` silently did not
+happen. Fixing the operator tree, not the grammar, is what let clause order
+become free (#617, #622).
 
 **This number was nondeterministic until 2026-08-18.** Running the TCK five
 times at a fixed commit gave 484, 485, 486 and 487 passes while `errored`
@@ -198,7 +207,7 @@ Weakest areas, among features with at least 5 evaluated scenarios — all at 0%:
 ### How this relates to the hand-written sweeps
 
 Four hand-written sweeps in `examples/cypher_probe*.rs` (168 cases) pass
-100%, 100%, 100% and 29/30. That is not in tension with 53.5% — those sweeps
+100%, 100%, 100% and 29/30. That is not in tension with 57.2% — those sweeps
 were written to probe areas suspected of being wrong, and every case in them was
 either already correct or has since been fixed. They found seven silent
 wrong answers; they were never a coverage measurement. **The TCK is the coverage
