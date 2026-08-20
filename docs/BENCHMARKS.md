@@ -139,16 +139,16 @@ cargo run --release --example tck_runner -- --features <openCypher>/tck/features
 |---|---:|
 | scenarios in the TCK | 1,615 |
 | **evaluated** by the harness | **1,244** (77.0%) |
-| pass | 986 |
-| wrong result | 167 |
-| errored | 91 |
+| pass | 1,015 |
+| wrong result | 143 |
+| errored | 86 |
 | skipped | 371 |
-| **pass rate, of evaluated** | **79.3%** |
-| pass rate, of all 1,615 | 61.1% |
+| **pass rate, of evaluated** | **81.6%** |
+| pass rate, of all 1,615 | 62.8% |
 | gate `CH-TCK ≥ 85%` | **not met** |
-| gate *within 5 pts of best competitor* | **not met** — 19.6 behind |
+| gate *within 5 pts of best competitor* | **not met** — 17.3 behind |
 
-Measured at `60511dc` via the conformance harness's `CH-TCK` suite; the
+Measured at `5d38516` via the conformance harness's `CH-TCK` suite; the
 envelope is in `samyama-graph-competitor-benchmarks/harness/runs/`.
 
 **The bar is 93.9%, not 85%, and three of our own defects were found by
