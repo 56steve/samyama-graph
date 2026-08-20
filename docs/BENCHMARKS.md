@@ -139,16 +139,16 @@ cargo run --release --example tck_runner -- --features <openCypher>/tck/features
 |---|---:|
 | scenarios in the TCK | 1,615 |
 | **evaluated** by the harness | **1,244** (77.0%) |
-| pass | 981 |
-| wrong result | 171 |
-| errored | 92 |
+| pass | 986 |
+| wrong result | 167 |
+| errored | 91 |
 | skipped | 371 |
-| **pass rate, of evaluated** | **78.9%** |
-| pass rate, of all 1,615 | 60.7% |
+| **pass rate, of evaluated** | **79.3%** |
+| pass rate, of all 1,615 | 61.1% |
 | gate `CH-TCK ≥ 85%` | **not met** |
-| gate *within 5 pts of best competitor* | **not met** — 20.0 behind |
+| gate *within 5 pts of best competitor* | **not met** — 19.6 behind |
 
-Measured at `96e4657` via the conformance harness's `CH-TCK` suite; the
+Measured at `60511dc` via the conformance harness's `CH-TCK` suite; the
 envelope is in `samyama-graph-competitor-benchmarks/harness/runs/`.
 
 **The bar is 93.9%, not 85%, and three of our own defects were found by
@@ -176,6 +176,19 @@ sequences were un-backslashed rather than interpreted, so `'Foo\nFoo'` became
 characters, mangling every UTF-8 literal. Fixing them moved **our** number
 932 → 950 with no engine change. Full comparison in
 `samyama-graph-competitor-benchmarks/benchmarks/opencypher-tck/`.
+
+**Five tests in this repo asserted rules Cypher does not have.** Four were the
+same one: that `WHERE` after an `OPTIONAL MATCH` filters rows, when it scopes
+to the optional match and nulls them (#667). Each passed, each was
+self-consistent with the engine, and one was the stated justification for the
+code producing the wrong answer. None had been checked against anything
+outside this repo.
+
+That is what a suite converges on when it only ever checks the engine against
+itself, and it is the strongest argument for re-running the cross-engine
+comparison on a cadence: it is the only mechanism here that catches the class.
+The corrections were made against Neo4j's *actual output*, not against a
+reading of the spec.
 
 **A rising pass rate is not evidence of a correct change.** `IN` is
 three-valued in Cypher, and the intuitive fix — "if either side contains a
