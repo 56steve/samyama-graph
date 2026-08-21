@@ -103,37 +103,77 @@ impl GraphCatalog {
     ///
     /// For a multi-label source and multi-label target, this generates
     /// one triple entry per (src_label, edge_type, tgt_label) combination.
-    pub fn on_edge_created(
+    /// Generic over the label collections so a caller holding a `HashSet<Label>`
+    /// -- which `Node` does -- can pass it directly. `GraphStore::create_edge`
+    /// previously collected two `Vec<Label>` per edge purely to satisfy a
+    /// `&[Label]` parameter, cloning every label `String` on every insert
+    /// (#491). `&[Label]` still coerces, so existing callers are unchanged.
+    pub fn on_edge_created<'a, S, T>(
         &mut self,
         source_id: NodeId,
-        src_labels: &[Label],
+        src_labels: S,
         edge_type: &EdgeType,
         target_id: NodeId,
-        tgt_labels: &[Label],
-    ) {
+        tgt_labels: T,
+    ) where
+        S: IntoIterator<Item = &'a Label>,
+        // Clone because the inner loop re-iterates the targets for every
+        // source. `&[Label]` and `&HashSet<Label>` are both references, so the
+        // clone is a pointer copy and costs nothing.
+        T: IntoIterator<Item = &'a Label> + Clone,
+    {
         for src_label in src_labels {
-            for tgt_label in tgt_labels {
+            for tgt_label in tgt_labels.clone() {
                 let pattern = TriplePattern::new(src_label.clone(), edge_type.clone(), tgt_label.clone());
 
-                // Update source degree tracking
-                let src_degree = self.source_degrees
-                    .entry(pattern.clone())
-                    .or_default()
-                    .entry(source_id)
-                    .or_insert(0);
-                *src_degree += 1;
-                let new_src_degree = *src_degree;
+                // `entry(k)` takes the key by value, so `entry(pattern.clone())`
+                // clones three Strings on every call whether or not the entry
+                // already exists -- and after the first few edges of a given
+                // (label, type, label) shape it always exists. Three maps meant
+                // nine clones per edge on top of the three in `new` above; the
+                // allocation histogram showed 12 short-string allocations per
+                // edge, all of them here. `get_mut` first, `entry` only on the
+                // genuinely-new path.
+                let src_degree_val = match self.source_degrees.get_mut(&pattern) {
+                    Some(m) => {
+                        let d = m.entry(source_id).or_insert(0);
+                        *d += 1;
+                        *d
+                    }
+                    None => {
+                        let d = self
+                            .source_degrees
+                            .entry(pattern.clone())
+                            .or_default()
+                            .entry(source_id)
+                            .or_insert(0);
+                        *d += 1;
+                        *d
+                    }
+                };
+                let new_src_degree = src_degree_val;
 
-                // Update target degree tracking
-                let tgt_degree = self.target_degrees
-                    .entry(pattern.clone())
-                    .or_default()
-                    .entry(target_id)
-                    .or_insert(0);
-                *tgt_degree += 1;
+                match self.target_degrees.get_mut(&pattern) {
+                    Some(m) => {
+                        *m.entry(target_id).or_insert(0) += 1;
+                    }
+                    None => {
+                        *self
+                            .target_degrees
+                            .entry(pattern.clone())
+                            .or_default()
+                            .entry(target_id)
+                            .or_insert(0) += 1;
+                    }
+                }
 
-                // Update triple stats
-                let stats = self.triple_stats.entry(pattern.clone()).or_insert_with(TripleStats::new);
+                let stats = match self.triple_stats.get_mut(&pattern) {
+                    Some(s) => s,
+                    None => self
+                        .triple_stats
+                        .entry(pattern.clone())
+                        .or_insert_with(TripleStats::new),
+                };
                 stats.count += 1;
 
                 // Recompute distinct sources/targets from degree maps
@@ -308,14 +348,16 @@ impl GraphCatalog {
             let outgoing = store.get_outgoing_edge_targets(node.id);
             for (_, _, target_id, edge_type) in &outgoing {
                 if let Some(target_node) = store.get_node(*target_id) {
-                    let src_labels: Vec<Label> = node.labels.iter().cloned().collect();
-                    let tgt_labels: Vec<Label> = target_node.labels.iter().cloned().collect();
+                    // Borrowed, not collected: `on_edge_created` is generic over
+                    // `IntoIterator<Item = &Label>` since #493, so a full rebuild
+                    // over 176M edges no longer allocates two Vecs and clones a
+                    // String per edge just to satisfy a `&[Label]` parameter.
                     catalog.on_edge_created(
                         node.id,
-                        &src_labels,
+                        &node.labels,
                         &edge_type,
                         *target_id,
-                        &tgt_labels,
+                        &target_node.labels,
                     );
                     // Undo the generation bump from on_edge_created (we'll set it at the end)
                     catalog.generation -= 1;

@@ -186,6 +186,22 @@ docker compose down -v
 
 #### Option 2 — Build from source
 
+**System packages.** `zstd-sys` generates its bindings with `bindgen`, which needs libclang.
+Without it the build fails part-way through with a misleading `'stddef.h' file not found`.
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install -y build-essential cmake pkg-config libssl-dev clang libclang-dev
+
+# Fedora / RHEL
+sudo dnf install -y gcc gcc-c++ cmake pkgconf-pkg-config openssl-devel clang clang-devel
+
+# macOS — the Xcode Command Line Tools already provide clang
+xcode-select --install
+```
+
+Then, with a stable Rust toolchain from [rustup](https://rustup.rs/):
+
 ```bash
 # Build from source
 git clone https://github.com/samyama-ai/samyama-graph && cd samyama-graph
@@ -317,7 +333,7 @@ into a public-health trifecta.* [Browse the catalogue →](case_studies)
 
 ## The 30-Second Tour
 
-**Cypher queries** — ~90% OpenCypher. MATCH, CREATE, MERGE, aggregations, path finding, 30+ functions.
+**Cypher queries** — MATCH, CREATE, MERGE, aggregations, path finding, 30+ functions. Coverage against the openCypher TCK is not yet measured; see [`docs/CYPHER_COMPATIBILITY.md`](docs/CYPHER_COMPATIBILITY.md) for a per-feature matrix verified by an executable probe.
 
 ```cypher
 MATCH (a:Person)-[:KNOWS*1..3]->(b:Person)
@@ -335,8 +351,9 @@ RETURN nodeId, score ORDER BY score DESC LIMIT 10
 **Vector search** — HNSW indexing for semantic search and Graph RAG.
 
 ```cypher
-CREATE VECTOR INDEX ON :Paper(embedding) OPTIONS {dimensions: 384, similarity: 'cosine'}
-CALL vector.search('Paper', 'embedding', [0.1, 0.2, ...], 10) YIELD node, score
+CREATE VECTOR INDEX paper_idx FOR (p:Paper) ON (p.embedding) OPTIONS {dimensions: 384, similarity: 'cosine'}
+
+CALL vector.search('Paper', 'embedding', [0.1, 0.2, 0.3], 10) YIELD node, score
 ```
 
 **Natural language** — Ask questions in English. The LLM translates to Cypher.
@@ -372,6 +389,17 @@ optimization, and micro/MVCC suites are self-contained; LDBC needs a data downlo
 | LDBC SNB Interactive | `cargo bench --bench ldbc_benchmark` | 21 IS/IC queries + 8 updates | needs SF1 download |
 | LDBC SNB BI | `cargo bench --bench ldbc_bi_benchmark` | 20 analytical (BI-1…20) | needs SF1 download |
 | LDBC FinBench | `cargo bench --bench finbench_benchmark` | 40+ CR/SR/RW/W on financial networks | synthetic / download |
+| Hierarchy (OEH) | `cargo bench --bench hierarchy_benchmark` | build, order test, roll-up vs subtree size | self-contained |
+| **HIER corpus** | `cargo run --release --example hier_benchmark` | 112 hierarchy-heavy queries, index on vs off | self-contained |
+
+**HIER** ([`benchmarks/hier/`](benchmarks/hier)) is a category for subsumption and
+hierarchical roll-up over time, geography and ontology — the workload the LDBC and FinBench
+suites do not contain. Every query is checked against an unindexed run of the same
+question, so a speedup is only reported alongside an identical answer. Latest: **108/108
+agree**; roll-up is flat at 15–20 ns from a 1-node subtree to a 137,257-node one. Against
+Neo4j on an identical graph it is **94× faster across the 58 queries expressible on both**,
+with no class losing — though without the index Samyama is 1.6× *slower* than Neo4j, so the
+index is the differentiator rather than the engine.
 
 ### Scale: 74M Nodes, 1 Billion Edges
 

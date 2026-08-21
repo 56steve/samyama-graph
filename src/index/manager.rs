@@ -105,6 +105,21 @@ impl IndexManager {
         self.create_index(label, property);
     }
 
+    /// Exact number of nodes an indexed equality would return, if such an index exists.
+    ///
+    /// Lets the planner cost an anchored lookup from the index itself instead of a
+    /// selectivity estimate that may be a placeholder (#303).
+    pub fn indexed_equality_count(
+        &self,
+        label: &Label,
+        property: &str,
+        value: &PropertyValue,
+    ) -> Option<usize> {
+        let index = self.get_index(label, property)?;
+        let count = index.read().unwrap().count(value);
+        Some(count)
+    }
+
     /// Check if a unique constraint exists
     pub fn has_unique_constraint(&self, label: &Label, property: &str) -> bool {
         let key = PropertyIndexKey {
@@ -132,6 +147,36 @@ impl IndexManager {
             }
         }
         Ok(())
+    }
+
+    /// Are there any unique constraints at all?
+    ///
+    /// The write path checks this first so that graphs without constraints -- the common
+    /// case, and every bulk load -- pay only one lock-free-ish map read per property set
+    /// rather than a per-label lookup.
+    pub fn has_any_unique_constraints(&self) -> bool {
+        !self.unique_constraints.read().unwrap().is_empty()
+    }
+
+    /// The node currently holding `value` for a constrained `label`.`property`, if any.
+    ///
+    /// Distinct from `check_unique_constraint`, which cannot tell "another node holds this"
+    /// from "this same node already holds this" -- the latter must stay legal so that
+    /// re-setting a property to its current value is not a violation.
+    pub fn unique_constraint_holder(
+        &self,
+        label: &Label,
+        property: &str,
+        value: &PropertyValue,
+    ) -> Option<NodeId> {
+        let key = PropertyIndexKey {
+            label: label.clone(),
+            property: property.to_string(),
+        };
+        let constraints = self.unique_constraints.read().unwrap();
+        let index = constraints.get(&key)?;
+        let holders = index.read().unwrap().get(value);
+        holders.first().copied()
     }
 
     /// Insert into unique constraint index

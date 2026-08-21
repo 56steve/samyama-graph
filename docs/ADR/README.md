@@ -51,6 +51,9 @@ Links to related ADRs
 | [014](./ADR-014-explain-profile-queries.md) | EXPLAIN and PROFILE Query Plan Visualization | Implemented | 2026-02-16 |
 | [015](./ADR-015-graph-native-query-planning.md) | Graph-Native Query Planning | Implemented | 2026-03-06 |
 | [016](./ADR-016-billion-node-distributed-architecture.md) | Billion-Node Distributed Architecture | Proposed | 2026-03-23 |
+| … | *ADRs 017–034 are on disk but not yet listed here* | — | — |
+| [035](./ADR-035-multi-hop-query-optimization.md) | Multi-Hop Query Optimization | Proposed | 2026-07-31 |
+| [036](./ADR-036-data-load-time-to-ready-optimization.md) | Data Load and Time-to-Ready Optimization | Proposed | 2026-07-31 |
 
 ## Decision Process
 

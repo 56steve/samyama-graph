@@ -44,6 +44,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[path = "common/missing_data.rs"]
+mod missing_data;
+
 #[derive(Debug)]
 struct Args {
     catalog: PathBuf,
@@ -88,6 +91,9 @@ fn parse_args() -> Args {
             "--out" => { a.out = PathBuf::from(&argv[i + 1]); i += 2; }
             "--export-spec" => { a.export_spec = Some(PathBuf::from(&argv[i + 1])); i += 2; }
             "--export-snapshot" => { a.export_snapshot = Some(PathBuf::from(&argv[i + 1])); i += 2; }
+            // Consumed by `missing_data::skip`, which reads it straight from
+            // `env::args`. Accepted here so the parser does not reject it (#566).
+            "--require-data" => { i += 1; }
             other => { eprintln!("unknown arg: {}", other); std::process::exit(2); }
         }
     }
@@ -99,7 +105,9 @@ fn build_amr_kg(catalog: &std::path::Path)
     -> (GraphStore, Vec<(String, String, String, String)>) // (gene_family, class, subclass, taxa)
 {
     let mut store = GraphStore::new();
-    let f = File::open(catalog).expect("catalog");
+    let f = File::open(catalog).unwrap_or_else(|e| {
+        missing_data::skip("NCBI Reference Gene Catalog", &catalog, &e, "--catalog")
+    });
     let mut header: Vec<String> = Vec::new();
     let mut rows = Vec::new();
 

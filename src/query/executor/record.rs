@@ -40,13 +40,52 @@
 
 use crate::graph::{Edge, Node, NodeId, EdgeId, EdgeType, PropertyValue, GraphStore};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::hash::{Hash, Hasher};
 
 /// A single record flowing through the query pipeline
 #[derive(Debug, Clone)]
 pub struct Record {
-    /// Variable bindings (variable name -> value)
-    bindings: HashMap<String, Value>,
+    /// Variable bindings, in the order they were bound.
+    ///
+    /// A flat vector, not a hash map. A query plan binds a handful of
+    /// variables — three or four is typical, a dozen is a lot — and at that
+    /// size a linear scan comparing short strings beats hashing one.
+    ///
+    /// What a `HashMap<String, Value>` cost, per row:
+    ///
+    /// * a **table allocation** for every record;
+    /// * a **`String` allocation per binding** on every clone, and operators
+    ///   clone a record per output row (`ExpandOperator::next` does exactly
+    ///   that);
+    /// * a **`SipHash` over a variable name** on every read, several times per
+    ///   row — once in the expand, once per property access inside
+    ///   `evaluate_expression`.
+    ///
+    /// Measured on LDBC IC5, whose `Aggregate` consumes 1,678,980 records at
+    /// ~1,275 ns each while its group key accounts for perhaps 200 ns of that
+    /// (#546).
+    ///
+    /// `Arc<str>` rather than `String` is the other half: cloning a record now
+    /// copies a vector of pointer pairs and bumps refcounts, where before it
+    /// allocated a fresh `String` for every variable name on every row.
+    bindings: Vec<(Arc<str>, Value)>,
+    /// Relationships already traversed by the MATCH pattern being matched.
+    ///
+    /// openCypher uses **relationship isomorphism**: one edge may not appear
+    /// twice in a single pattern. Without this, `MATCH (a)-[:R]-(b)-[:R]-(c)`
+    /// over a three-node chain returned 6 rows where Cypher gives 2 — every
+    /// two-hop undirected pattern was inflated by walking an edge back on
+    /// itself (#684).
+    ///
+    /// A `Vec` rather than a set: patterns bind a handful of relationships, so
+    /// a linear scan over a few `u64`s beats hashing, and an **empty `Vec`
+    /// does not allocate** — single-hop patterns, which cannot violate the
+    /// rule, pay only the 24 bytes in the struct and a null clone.
+    ///
+    /// Scoped to one clause. `MATCH (a)-[:R]-(b) MATCH (b)-[:R]-(c)` *may*
+    /// reuse the edge (Neo4j agrees), so a clause boundary clears this.
+    used_edges: Vec<crate::graph::EdgeId>,
 }
 
 /// Value types that can be bound to variables in a query record.
@@ -72,12 +111,22 @@ pub struct Record {
 /// three-valued logic (true/false/null).
 #[derive(Debug, Clone)]
 pub enum Value {
-    /// A fully materialized node
-    Node(NodeId, Node),
+    /// A fully materialized node.
+    ///
+    /// Boxed. `Node` is 128 bytes -- a `HashSet<Label>` and a `PropertyMap`
+    /// held inline, plus id, version and two timestamps -- and carrying it
+    /// inline made `Value` 144 bytes. `Value` is the executor's universal cell,
+    /// so that width was paid by every binding in every record, every hash
+    /// entry holding one, and every sort key.
+    ///
+    /// Late materialization (ADR-012) exists so scans produce `NodeRef` and
+    /// this variant stays rare, which is exactly what makes the indirection
+    /// cheap and the saving broad (#570).
+    Node(NodeId, Box<Node>),
     /// A lazy node reference (no property clone)
     NodeRef(NodeId),
-    /// A fully materialized edge
-    Edge(EdgeId, Edge),
+    /// A fully materialized edge. Boxed, for the same reason as `Node`.
+    Edge(EdgeId, Box<Edge>),
     /// A lazy edge reference (structural data only, no property clone)
     EdgeRef(EdgeId, NodeId, NodeId, EdgeType),
     /// A property value
@@ -87,6 +136,18 @@ pub enum Value {
         nodes: Vec<NodeId>,
         edges: Vec<EdgeId>,
     },
+    /// A list whose elements are themselves `Value`s.
+    ///
+    /// `PropertyValue::Array` cannot hold a node or a relationship, so a list
+    /// of them had nowhere to live: `relationships(p)` degraded its edges to
+    /// integer ids and a variable-length relationship variable was not bound
+    /// at all.
+    List(Vec<Value>),
+    /// A map whose values are themselves `Value`s.
+    ///
+    /// `PropertyValue::Map` cannot hold an entity, and `{key: u}` over a node
+    /// is how the TCK's Delete5 scenarios reach what they delete (#654).
+    Map(std::collections::BTreeMap<String, Value>),
     /// Null
     Null,
 }
@@ -123,6 +184,11 @@ impl Hash for Value {
             Value::Edge(id, _) | Value::EdgeRef(id, ..) => { 1u8.hash(state); id.hash(state); }
             Value::Property(p) => { 2u8.hash(state); p.hash(state); }
             Value::Path { nodes, edges } => { 3u8.hash(state); nodes.hash(state); edges.hash(state); }
+            Value::List(items) => { 5u8.hash(state); items.hash(state); }
+            Value::Map(entries) => {
+                6u8.hash(state);
+                for (k, v) in entries { k.hash(state); v.hash(state); }
+            }
             Value::Null => { 4u8.hash(state); }
         }
     }
@@ -132,44 +198,113 @@ impl Record {
     /// Create a new empty record
     pub fn new() -> Self {
         Self {
-            bindings: HashMap::new(),
+            bindings: Vec::new(),
+            used_edges: Vec::new(),
         }
     }
 
-    /// Bind a variable to a value
-    pub fn bind(&mut self, variable: String, value: Value) {
-        self.bindings.insert(variable, value);
+    /// Clone this record leaving room for `extra` further bindings.
+    ///
+    /// `Vec::clone` allocates *exact* capacity, so a cloned record has
+    /// `len == cap` and the very next `bind` reallocates: allocate, memcpy,
+    /// free. Clone-then-bind is how nearly every operator derives an output row
+    /// from an input row, so nearly every row in every query was paying for
+    /// that. Measured on a 3-binding record: 79.8 ns to clone, and 175.7 ns to
+    /// clone and bind a fourth -- 95.9 ns of the difference being the
+    /// reallocation alone (#562).
+    ///
+    /// Callers that bind a known number of variables should say how many.
+    pub fn clone_with_capacity(&self, extra: usize) -> Record {
+        let mut bindings = Vec::with_capacity(self.bindings.len() + extra);
+        bindings.extend(self.bindings.iter().cloned());
+        Record { bindings, used_edges: self.used_edges.clone() }
+    }
+
+    /// Has this relationship already been traversed by the current pattern?
+    pub fn edge_used(&self, edge: crate::graph::EdgeId) -> bool {
+        self.used_edges.contains(&edge)
+    }
+
+    /// Record a relationship as traversed by the current pattern.
+    pub fn mark_edge_used(&mut self, edge: crate::graph::EdgeId) {
+        self.used_edges.push(edge);
+    }
+
+    /// The relationships already traversed, for a caller that filters
+    /// candidates in a hot loop and wants no allocation.
+    pub fn used_edge_slice(&self) -> &[crate::graph::EdgeId] {
+        &self.used_edges
+    }
+
+    /// Forget the traversed relationships — a new MATCH clause starts fresh,
+    /// because relationship isomorphism is scoped to one clause.
+    pub fn clear_used_edges(&mut self) {
+        self.used_edges.clear();
+    }
+
+    /// Bind a variable to a value, replacing any previous binding.
+    ///
+    /// Accepts anything that converts to `Arc<str>`, so an operator holding
+    /// its variable name as an `Arc<str>` binds with a refcount bump; passing
+    /// a `String` copies once, as inserting into the old map did.
+    pub fn bind(&mut self, variable: impl Into<Arc<str>>, value: Value) {
+        let variable = variable.into();
+        match self.bindings.iter_mut().find(|(name, _)| *name == variable) {
+            Some(slot) => slot.1 = value,
+            None => self.bindings.push((variable, value)),
+        }
     }
 
     /// Get a bound value
     pub fn get(&self, variable: &str) -> Option<&Value> {
-        self.bindings.get(variable)
+        self.bindings
+            .iter()
+            .find(|(name, _)| &**name == variable)
+            .map(|(_, value)| value)
     }
 
-    /// Get all bindings
-    pub fn bindings(&self) -> &HashMap<String, Value> {
+    /// All bindings, in binding order.
+    pub fn bindings(&self) -> &[(Arc<str>, Value)] {
         &self.bindings
+    }
+
+    /// The bound values, without their names.
+    pub fn values(&self) -> impl Iterator<Item = &Value> {
+        self.bindings.iter().map(|(_, value)| value)
     }
 
     /// Check if a variable is bound
     pub fn has(&self, variable: &str) -> bool {
-        self.bindings.contains_key(variable)
+        self.get(variable).is_some()
     }
 
-    /// Merge another record into this one
+    /// Merge another record into this one, `other` winning on a clash.
     pub fn merge(&mut self, other: Record) {
-        self.bindings.extend(other.bindings);
+        for (name, value) in other.bindings {
+            self.bind(name, value);
+        }
     }
 
     /// Clone with only specified variables
     pub fn project(&self, variables: &[String]) -> Record {
         let mut new_record = Record::new();
         for var in variables {
-            if let Some(value) = self.bindings.get(var) {
-                new_record.bind(var.clone(), value.clone());
+            if let Some((name, value)) = self.bindings.iter().find(|(n, _)| &**n == var.as_str()) {
+                new_record.bind(name.clone(), value.clone());
             }
         }
         new_record
+    }
+
+    /// A deterministic key for deduplication: bindings sorted by name.
+    ///
+    /// Sorted because binding *order* is an artefact of how a plan was built,
+    /// not part of a row's identity — two records binding the same values in a
+    /// different order are the same row and must collide.
+    pub fn dedup_key(&self) -> Vec<(Arc<str>, Value)> {
+        let mut key = self.bindings.clone();
+        key.sort_by(|a, b| a.0.cmp(&b.0));
+        key
     }
 }
 
@@ -205,8 +340,15 @@ impl Value {
     }
 
     /// Check if this is null
+    /// Is this value null?
+    ///
+    /// Null has two representations here — the `Value::Null` variant, and a
+    /// `Value::Property(PropertyValue::Null)` produced when a node simply does not carry
+    /// the property being read. They mean the same thing, and treating only the first as
+    /// null is what made `count(x.prop)` count rows rather than non-null values (#358):
+    /// a missing property arrives as the second form and slipped through the check.
     pub fn is_null(&self) -> bool {
-        matches!(self, Value::Null)
+        matches!(self, Value::Null | Value::Property(PropertyValue::Null))
     }
 
     /// Extract NodeId from any node variant (Node or NodeRef)
@@ -260,7 +402,7 @@ impl Value {
         match self {
             Value::NodeRef(id) => {
                 if let Some(node) = store.get_node(id) {
-                    Value::Node(id, node.clone())
+                    Value::Node(id, Box::new(node.clone()))
                 } else {
                     Value::Null
                 }
@@ -275,7 +417,7 @@ impl Value {
         match self {
             Value::EdgeRef(id, ..) => {
                 if let Some(edge) = store.get_edge(id) {
-                    Value::Edge(id, edge.clone())
+                    Value::Edge(id, Box::new(edge.clone()))
                 } else {
                     Value::Null
                 }
@@ -324,6 +466,20 @@ impl Value {
                     PropertyValue::Null
                 }
             }
+            // Map property access: `m.a` where `m` is a map, from a literal, an
+            // `UNWIND` over a list of maps, or a map-valued node property.
+            //
+            // Without this arm `m.a` fell through to `Null` -- and it did so
+            // *silently*, so a query over map values returned confidently wrong
+            // answers rather than failing. Grouping was the sharpest case:
+            // distinct keys collapsed into one `Null` group while the row count
+            // stayed plausible (#571).
+            //
+            // An absent key is still `Null`, which is Cypher's answer for it.
+            Value::Property(PropertyValue::Map(entries)) => entries
+                .get(property)
+                .cloned()
+                .unwrap_or(PropertyValue::Null),
             // Temporal component access: dt.year, dt.month, dur.days, etc.
             Value::Property(PropertyValue::DateTime(millis)) => {
                 use chrono::{Datelike, Timelike, TimeZone};
@@ -415,7 +571,7 @@ mod tests {
         let mut record = Record::new();
         let node = Node::new(NodeId::new(1), Label::new("Person"));
 
-        record.bind("n".to_string(), Value::Node(NodeId::new(1), node));
+        record.bind("n".to_string(), Value::Node(NodeId::new(1), Box::new(node)));
 
         assert!(record.has("n"));
         assert!(record.get("n").is_some());
@@ -451,7 +607,7 @@ mod tests {
 
     #[test]
     fn test_value_types() {
-        let node_val = Value::Node(NodeId::new(1), Node::new(NodeId::new(1), Label::new("Test")));
+        let node_val = Value::Node(NodeId::new(1), Box::new(Node::new(NodeId::new(1), Label::new("Test"))));
         assert!(node_val.as_node().is_some());
         assert!(node_val.as_edge().is_none());
 
@@ -483,7 +639,7 @@ mod tests {
             NodeId::new(20),
             crate::graph::EdgeType::new("KNOWS"),
         );
-        let val = Value::Edge(EdgeId::new(1), edge);
+        let val = Value::Edge(EdgeId::new(1), Box::new(edge));
         let (eid, e) = val.as_edge().unwrap();
         assert_eq!(eid, EdgeId::new(1));
         assert_eq!(e.source, NodeId::new(10));
@@ -498,7 +654,7 @@ mod tests {
     fn test_node_id() {
         // From Node
         let node = Node::new(NodeId::new(5), Label::new("Person"));
-        let val = Value::Node(NodeId::new(5), node);
+        let val = Value::Node(NodeId::new(5), Box::new(node));
         assert_eq!(val.node_id(), Some(NodeId::new(5)));
 
         // From NodeRef
@@ -519,7 +675,7 @@ mod tests {
             NodeId::new(2),
             crate::graph::EdgeType::new("E"),
         );
-        let val = Value::Edge(EdgeId::new(3), edge);
+        let val = Value::Edge(EdgeId::new(3), Box::new(edge));
         assert_eq!(val.edge_id(), Some(EdgeId::new(3)));
 
         // From EdgeRef
@@ -544,7 +700,7 @@ mod tests {
             NodeId::new(20),
             crate::graph::EdgeType::new("E"),
         );
-        let val = Value::Edge(EdgeId::new(1), edge);
+        let val = Value::Edge(EdgeId::new(1), Box::new(edge));
         assert_eq!(val.edge_endpoints(), Some((NodeId::new(10), NodeId::new(20))));
 
         // From EdgeRef
@@ -568,7 +724,7 @@ mod tests {
             NodeId::new(2),
             crate::graph::EdgeType::new("KNOWS"),
         );
-        let val = Value::Edge(EdgeId::new(1), edge);
+        let val = Value::Edge(EdgeId::new(1), Box::new(edge));
         assert_eq!(val.edge_type().unwrap().as_str(), "KNOWS");
 
         let val = Value::EdgeRef(
@@ -585,7 +741,7 @@ mod tests {
     #[test]
     fn test_is_node_is_edge() {
         let node = Node::new(NodeId::new(1), Label::new("A"));
-        assert!(Value::Node(NodeId::new(1), node).is_node());
+        assert!(Value::Node(NodeId::new(1), Box::new(node)).is_node());
         assert!(Value::NodeRef(NodeId::new(1)).is_node());
         assert!(!Value::Null.is_node());
         assert!(!Value::Property(PropertyValue::Integer(1)).is_node());
@@ -594,7 +750,7 @@ mod tests {
             EdgeId::new(1), NodeId::new(1), NodeId::new(2),
             crate::graph::EdgeType::new("E"),
         );
-        assert!(Value::Edge(EdgeId::new(1), edge).is_edge());
+        assert!(Value::Edge(EdgeId::new(1), Box::new(edge)).is_edge());
         assert!(Value::EdgeRef(
             EdgeId::new(1), NodeId::new(1), NodeId::new(2),
             crate::graph::EdgeType::new("E"),
@@ -623,7 +779,7 @@ mod tests {
 
         // Already materialized stays the same
         let node = store.get_node(id).unwrap().clone();
-        let val = Value::Node(id, node).materialize_node(&store);
+        let val = Value::Node(id, Box::new(node)).materialize_node(&store);
         assert!(matches!(val, Value::Node(..)));
 
         // Non-existent NodeRef becomes Null
@@ -677,7 +833,7 @@ mod tests {
 
         // Resolve from Node (materialized)
         let node = store.get_node(id).unwrap().clone();
-        let val = Value::Node(id, node);
+        let val = Value::Node(id, Box::new(node));
         let prop = val.resolve_property("name", &store);
         assert_eq!(prop, PropertyValue::String("Alice".to_string()));
 
@@ -717,7 +873,7 @@ mod tests {
 
         // From Edge
         let edge = store.get_edge(eid).unwrap();
-        let val = Value::Edge(eid, edge);
+        let val = Value::Edge(eid, Box::new(edge));
         let prop = val.resolve_property("since", &store);
         assert_eq!(prop, PropertyValue::Integer(2020));
     }
@@ -783,8 +939,53 @@ mod tests {
 
         let bindings = r.bindings();
         assert_eq!(bindings.len(), 2);
-        assert!(bindings.contains_key("x"));
-        assert!(bindings.contains_key("y"));
+        assert!(r.has("x"));
+        assert!(r.has("y"));
+        // Bindings keep insertion order now, which `dedup_key` normalises
+        // away for identity. Order is observable here and deliberately not
+        // relied on anywhere else.
+        assert_eq!(&*bindings[0].0, "x");
+        assert_eq!(&*bindings[1].0, "y");
+    }
+
+    #[test]
+    fn rebinding_a_variable_replaces_it_rather_than_duplicating() {
+        let mut r = Record::new();
+        r.bind("x".to_string(), Value::Property(PropertyValue::Integer(1)));
+        r.bind("x".to_string(), Value::Property(PropertyValue::Integer(2)));
+        assert_eq!(r.bindings().len(), 1, "a flat vector must not accumulate duplicates");
+        assert_eq!(r.get("x"), Some(&Value::Property(PropertyValue::Integer(2))));
+    }
+
+    #[test]
+    fn the_dedup_key_ignores_binding_order() {
+        // Two records with the same bindings in a different order are the same
+        // row. The previous key was `format!("{:?}", bindings)` over a hash
+        // map, so it depended on iteration order for identity.
+        let mut a = Record::new();
+        a.bind("x".to_string(), Value::Property(PropertyValue::Integer(1)));
+        a.bind("y".to_string(), Value::Property(PropertyValue::Integer(2)));
+
+        let mut b = Record::new();
+        b.bind("y".to_string(), Value::Property(PropertyValue::Integer(2)));
+        b.bind("x".to_string(), Value::Property(PropertyValue::Integer(1)));
+
+        assert_eq!(a.dedup_key(), b.dedup_key());
+    }
+
+    #[test]
+    fn merge_lets_the_incoming_record_win() {
+        let mut a = Record::new();
+        a.bind("x".to_string(), Value::Property(PropertyValue::Integer(1)));
+        a.bind("y".to_string(), Value::Property(PropertyValue::Integer(9)));
+
+        let mut b = Record::new();
+        b.bind("x".to_string(), Value::Property(PropertyValue::Integer(2)));
+
+        a.merge(b);
+        assert_eq!(a.bindings().len(), 2);
+        assert_eq!(a.get("x"), Some(&Value::Property(PropertyValue::Integer(2))));
+        assert_eq!(a.get("y"), Some(&Value::Property(PropertyValue::Integer(9))));
     }
 
     #[test]
@@ -797,7 +998,7 @@ mod tests {
     fn test_value_partial_eq_cross_variant() {
         // Node == NodeRef with same ID
         let node = Node::new(NodeId::new(5), Label::new("A"));
-        let v1 = Value::Node(NodeId::new(5), node.clone());
+        let v1 = Value::Node(NodeId::new(5), Box::new(node.clone()));
         let v2 = Value::NodeRef(NodeId::new(5));
         assert_eq!(v1, v2);
         assert_eq!(v2, v1);
@@ -811,7 +1012,7 @@ mod tests {
             EdgeId::new(1), NodeId::new(1), NodeId::new(2),
             crate::graph::EdgeType::new("E"),
         );
-        let ev1 = Value::Edge(EdgeId::new(1), edge);
+        let ev1 = Value::Edge(EdgeId::new(1), Box::new(edge));
         let ev2 = Value::EdgeRef(
             EdgeId::new(1), NodeId::new(1), NodeId::new(2),
             crate::graph::EdgeType::new("E"),
@@ -843,7 +1044,7 @@ mod tests {
 
         // Node and NodeRef with same ID should hash the same
         let node = Node::new(NodeId::new(5), Label::new("A"));
-        let v1 = Value::Node(NodeId::new(5), node);
+        let v1 = Value::Node(NodeId::new(5), Box::new(node));
         let v2 = Value::NodeRef(NodeId::new(5));
         assert_eq!(hash_value(&v1), hash_value(&v2));
 
@@ -852,7 +1053,7 @@ mod tests {
             EdgeId::new(3), NodeId::new(1), NodeId::new(2),
             crate::graph::EdgeType::new("E"),
         );
-        let ev1 = Value::Edge(EdgeId::new(3), edge);
+        let ev1 = Value::Edge(EdgeId::new(3), Box::new(edge));
         let ev2 = Value::EdgeRef(
             EdgeId::new(3), NodeId::new(1), NodeId::new(2),
             crate::graph::EdgeType::new("E"),
@@ -862,5 +1063,97 @@ mod tests {
         // Different variant types should have different hashes
         assert_ne!(hash_value(&v1), hash_value(&ev1));
         assert_ne!(hash_value(&Value::Null), hash_value(&v1));
+    }
+}
+
+/// One `x.prop` read, with the column located once instead of once per row.
+///
+/// `Value::resolve_property` takes the property name as a `&str` and hashes it
+/// against the store's column index on every call. For an operator looping over
+/// a million rows evaluating the same expression, that is a million hashes to
+/// reach the same column: 37.6 ns per read in scattered order against 22.6 ns
+/// when the column is hoisted out of the loop (#557).
+///
+/// The name is fixed at plan time, so the operator holds one of these per
+/// property expression and the lookup happens once.
+///
+/// Two things it does **not** do, both deliberate:
+///
+/// * it caches only a *found* column. `None` means no column exists **yet** —
+///   a `MERGE` or `SET` later in the same query may create one — so a miss
+///   re-resolves rather than being remembered as absent;
+/// * it keeps the row-storage fallback. A property whose value has no typed
+///   column representation is readable only from the per-node map (#545), and
+///   dropping that path would silently return null for complex types.
+#[derive(Debug, Clone)]
+pub struct PropertyCursor {
+    variable: Arc<str>,
+    property: Arc<str>,
+    node_column: Option<crate::graph::storage::columnar::ColumnId>,
+    edge_column: Option<crate::graph::storage::columnar::ColumnId>,
+}
+
+impl PropertyCursor {
+    pub fn new(variable: impl Into<Arc<str>>, property: impl Into<Arc<str>>) -> Self {
+        Self {
+            variable: variable.into(),
+            property: property.into(),
+            node_column: None,
+            edge_column: None,
+        }
+    }
+
+    /// The value of `variable.property` in `record`.
+    ///
+    /// Equivalent to `record.get(variable).resolve_property(property, store)`,
+    /// which is what it falls back to for anything that is not a node or edge.
+    pub fn read(&mut self, record: &Record, store: &GraphStore) -> PropertyValue {
+        match record.get(&self.variable) {
+            Some(Value::NodeRef(id)) | Some(Value::Node(id, _)) => {
+                let idx = id.as_u64() as usize;
+                let column = match self.node_column {
+                    Some(id) => Some(id),
+                    None => {
+                        let found = store.node_columns.column_id(&self.property);
+                        self.node_column = found;
+                        found
+                    }
+                };
+                if let Some(column) = column {
+                    let value = store.node_columns.get_by_id(column, idx);
+                    if !value.is_null() {
+                        return value;
+                    }
+                }
+                // The column has no value here. Row storage may still.
+                match store.get_node(*id) {
+                    Some(node) => node.get_property(&self.property).cloned().unwrap_or(PropertyValue::Null),
+                    None => PropertyValue::Null,
+                }
+            }
+            Some(Value::EdgeRef(id, ..)) | Some(Value::Edge(id, _)) => {
+                let idx = id.as_u64() as usize;
+                let column = match self.edge_column {
+                    Some(id) => Some(id),
+                    None => {
+                        let found = store.edge_columns.column_id(&self.property);
+                        self.edge_column = found;
+                        found
+                    }
+                };
+                if let Some(column) = column {
+                    let value = store.edge_columns.get_by_id(column, idx);
+                    if !value.is_null() {
+                        return value;
+                    }
+                }
+                match store.get_edge(*id) {
+                    Some(edge) => edge.get_property(&self.property).cloned().unwrap_or(PropertyValue::Null),
+                    None => PropertyValue::Null,
+                }
+            }
+            Some(other) => other.resolve_property(&self.property, store),
+            None => PropertyValue::Null,
+        }
     }
 }

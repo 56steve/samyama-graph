@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use samyama_sdk::{EmbeddedClient, SamyamaClient};
 
-#[path = "bench_setup.rs"]
+#[path = "common/bench_setup.rs"]
 mod bench_setup;
 
 mod ldbc_common;
@@ -57,6 +57,11 @@ struct Params {
     country_y: String,
     tag_name: String,
     tag_class_name: String,
+    /// IC11's employer. This was hard-coded in the query template as
+    /// `"MDLR_Airlines"` -- a substitution parameter that was never
+    /// parameterised, so IC11 returned nothing on any extract but the one it
+    /// was written against (#505).
+    organisation_name: String,
     max_date: i64,
     start_date: i64,
     end_date: i64,
@@ -74,9 +79,30 @@ impl Default for Params {
             country_y: "Pakistan".into(),
             tag_name: "Hamid_Karzai".into(),
             tag_class_name: "MusicalArtist".into(),
+            organisation_name: "MDLR_Airlines".into(),
             max_date: 1354320000000,
             start_date: 1338508800000,
             end_date: 1341100800000,
+        }
+    }
+}
+
+impl From<ldbc_common::params::Derived> for Params {
+    fn from(d: ldbc_common::params::Derived) -> Self {
+        Params {
+            person_id: d.person_id,
+            person2_id: d.person2_id,
+            message_id: d.message_id,
+            post_id: d.post_id,
+            first_name: d.first_name,
+            country_x: d.country_x,
+            country_y: d.country_y,
+            tag_name: d.tag_name,
+            tag_class_name: d.tag_class_name,
+            organisation_name: d.organisation_name,
+            max_date: d.max_date,
+            start_date: d.start_date,
+            end_date: d.end_date,
         }
     }
 }
@@ -99,6 +125,7 @@ impl Params {
             .replace("{{countryY}}", &self.country_y)
             .replace("{{tagName}}", &self.tag_name)
             .replace("{{tagClassName}}", &self.tag_class_name)
+            .replace("{{organisationName}}", &self.organisation_name)
             .replace("{{maxDate}}", &self.max_date.to_string())
             .replace("{{startDate}}", &self.start_date.to_string())
             .replace("{{endDate}}", &self.end_date.to_string())
@@ -350,7 +377,7 @@ LIMIT 10",
             // Friends-of-friends who worked at a company before a given year
             cypher: "\
 MATCH (p:Person {id: {{personId}}})-[:KNOWS*1..2]-(friend:Person)-[wa:WORK_AT]->(org:Organisation)
-WHERE friend.id <> {{personId}} AND org.name = \"MDLR_Airlines\" AND wa.workFrom < 2012
+WHERE friend.id <> {{personId}} AND org.name = \"{{organisationName}}\" AND wa.workFrom < 2012
 RETURN DISTINCT friend.id, friend.firstName, friend.lastName, wa.workFrom, org.name
 ORDER BY wa.workFrom
 LIMIT 10",
@@ -642,10 +669,41 @@ async fn run_benchmark(
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     bench_setup::init();
+    // Opening calibration, before anything else competes for the CPU. Closed
+    // out at the end of the suite so a host that changed speed mid-run says so
+    // rather than being read as a code change (#529).
+    let calibration = bench_setup::report_calibration();
 
     let args: Vec<String> = std::env::args().collect();
 
+    // An unrecognised flag is a hard error, not something to skip past.
+    //
+    // Every option below is read with `args.iter().position(|a| a == "--x")`,
+    // so a misspelling simply does not match and the bench runs with a default
+    // instead. That is how an SF10 run was taken with `--params` (the flag is
+    // `--params-file`): the built-in parameters were used, four reads came back
+    // empty, IC11 answered in 122 ms and the summary said `OK`. A timing taken
+    // against parameters nobody chose is not a measurement, and nothing in the
+    // output said so (#660).
+    const KNOWN: &[&str] = &[
+        "--data-dir", "--deletes", "--derive-params", "--explain", "--params-file",
+        "--profile", "--query", "--runs", "--updates", "--write-params",
+        // cargo passes this to bench targets.
+        "--bench", "--nocapture", "--test-threads", "--color", "--format",
+    ];
+    let unknown: Vec<&String> = args[1..]
+        .iter()
+        .filter(|a| a.starts_with("--") && !KNOWN.contains(&a.as_str()))
+        .collect();
+    if !unknown.is_empty() {
+        eprintln!("unknown option(s): {}", unknown.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" "));
+        eprintln!("known options: {}", KNOWN[..10].join(" "));
+        eprintln!("\nRefusing to run: an ignored flag produces a number measured under\nsettings nobody chose, and the output cannot tell you that happened.");
+        std::process::exit(64);
+    }
+
     let default_dir = "data/ldbc-sf1/social_network-sf1-CsvBasic-LongDateFormatter";
+    let explicit_data_dir = args.iter().any(|a| a == "--data-dir");
     let data_dir = if let Some(pos) = args.iter().position(|a| a == "--data-dir") {
         PathBuf::from(args.get(pos + 1).expect("--data-dir requires a path argument"))
     } else {
@@ -664,25 +722,86 @@ async fn main() -> Result<(), Error> {
         None
     };
 
+    // `--profile` runs each selected query once under PROFILE and prints the
+    // per-operator breakdown instead of a timing table. This is the
+    // `CH-PROFILE-01` deliverable: the gate is "at least 90% of wall-clock
+    // attributed" for IC1/IC6/IC9, and a total by itself attributes nothing.
+    let profile_mode = args.iter().any(|a| a == "--profile");
+    // `--explain` prints the plan **without running the query**. `--profile`
+    // executes, which is useless for exactly the queries most worth looking at:
+    // IC6 times out at SF10, so the one plan you most want to see is the one
+    // PROFILE cannot show you.
+    let explain_mode = args.iter().any(|a| a == "--explain");
+
     let include_updates = args.iter().any(|a| a == "--updates");
     let include_deletes = args.iter().any(|a| a == "--deletes");
 
-    // Substitution parameters: --params-file <json> (per scale factor), else SF1 defaults.
-    let params = if let Some(pos) = args.iter().position(|a| a == "--params-file") {
-        let p = args.get(pos + 1).expect("--params-file requires a path argument");
-        Params::load(p).unwrap_or_else(|e| {
-            eprintln!("ERROR loading params file: {}", e);
-            std::process::exit(1);
-        })
-    } else {
-        Params::default()
-    };
+    // Substitution parameters, in precedence order:
+    //   --derive-params [percentile]  sample them from this dataset (#505)
+    //   --params-file <json>          a set someone already derived
+    //   (neither)                     the built-in defaults, which resolve
+    //                                 against exactly one extract
+    //
+    // `--write-params <path>` dumps whatever was derived, so a run can be
+    // repeated later without re-deriving and the file records its own origin.
+    let derive_percentile: Option<u8> = args.iter().position(|a| a == "--derive-params").map(|pos| {
+        args.get(pos + 1)
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(50)
+    });
+    let write_params: Option<String> = args
+        .iter()
+        .position(|a| a == "--write-params")
+        .map(|pos| args.get(pos + 1).expect("--write-params requires a path").clone());
 
     if !data_dir.exists() {
-        eprintln!("ERROR: Data directory not found: {}", data_dir.display());
-        eprintln!("Download LDBC SF1 data and extract to: {}", default_dir);
-        std::process::exit(1);
+        // An explicitly requested directory that does not exist is a mistake worth failing
+        // on. The *default* dataset simply not being present means this benchmark was not
+        // run, which is not the same as it failing -- a clean host has no LDBC SF1 and
+        // should report a skip, so "run every benchmark" is not permanently red.
+        if explicit_data_dir {
+            eprintln!("ERROR: Data directory not found: {}", data_dir.display());
+            std::process::exit(1);
+        }
+        eprintln!("SKIP: LDBC SF1 dataset not present at {}", data_dir.display());
+        eprintln!("      Download and extract it there, or pass --data-dir PATH.");
+        eprintln!("      Skipping rather than failing: the benchmark did not run, it did not break.");
+        return Ok(());
     }
+
+    // Resolve the parameters now that the dataset is known to be present:
+    // derivation reads the source CSVs, deliberately not the loaded graph, so
+    // the same parameters can be handed to a competitor engine unchanged.
+    let (params, param_provenance): (Params, String) = if let Some(pct) = derive_percentile {
+        let derived = ldbc_common::params::derive(&data_dir, pct).unwrap_or_else(|e| {
+            eprintln!("ERROR deriving parameters: {}", e);
+            std::process::exit(1);
+        });
+        let provenance = derived.provenance.format();
+        if let Some(path) = &write_params {
+            if let Err(e) = std::fs::write(path, derived.to_json()) {
+                eprintln!("WARN: could not write {}: {}", path, e);
+            } else {
+                eprintln!("Wrote derived parameters to {}", path);
+            }
+        }
+        (derived.into(), provenance)
+    } else if let Some(pos) = args.iter().position(|a| a == "--params-file") {
+        let p = args.get(pos + 1).expect("--params-file requires a path argument");
+        let loaded = Params::load(p).unwrap_or_else(|e| {
+            eprintln!("ERROR loading params file: {}", e);
+            std::process::exit(1);
+        });
+        (loaded, format!("Parameter provenance: file {}\n", p))
+    } else {
+        (
+            Params::default(),
+            "Parameter provenance: built-in defaults — these resolve against one \
+             particular extract only.\n  Pass --derive-params to sample them from \
+             the dataset in front of you instead (#505).\n"
+                .to_string(),
+        )
+    };
 
     // ========================================================================
     // Load dataset
@@ -735,9 +854,18 @@ async fn main() -> Result<(), Error> {
 
     eprintln!("Runs per query: {}", runs);
     eprintln!(
-        "Params: personId={} person2Id={} postId={} firstName=\"{}\" tagName=\"{}\"",
-        params.person_id, params.person2_id, params.post_id, params.first_name, params.tag_name
+        "Params: personId={} person2Id={} postId={} messageId={} firstName=\"{}\" tagName=\"{}\"",
+        params.person_id, params.person2_id, params.post_id, params.message_id,
+        params.first_name, params.tag_name
     );
+    eprintln!(
+        "        countryX=\"{}\" countryY=\"{}\" tagClass=\"{}\" org=\"{}\" window=[{}, {}) maxDate={}",
+        params.country_x, params.country_y, params.tag_class_name, params.organisation_name,
+        params.start_date, params.end_date, params.max_date
+    );
+    // A table of timings cannot be read without knowing what it measured, so
+    // the provenance goes above it rather than in a separate artifact (#505).
+    eprint!("{}", param_provenance);
     eprintln!();
 
     // ========================================================================
@@ -775,6 +903,7 @@ async fn main() -> Result<(), Error> {
 
     let mut passed = 0usize;
     let mut errors = 0usize;
+    let mut empty_reads = 0usize;
     let mut last_category = "";
     let bench_start = Instant::now();
 
@@ -796,6 +925,59 @@ async fn main() -> Result<(), Error> {
         eprint!("  Running {}...\r", query.id);
 
         let cypher = params.apply(query.cypher);
+
+
+        if explain_mode {
+            println!("\n================ {} — {} ================", query.id, query.name);
+            println!("{}", cypher);
+            println!();
+            match client.query("default", &format!("EXPLAIN {}", cypher)).await {
+                Ok(batch) => {
+                    for record in &batch.records {
+                        for cell in record {
+                            match cell.as_str() {
+                                Some(text) => println!("{}", text),
+                                None => println!("{}", cell),
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("ERROR: {}", e);
+                    errors += 1;
+                }
+            }
+            continue;
+        }
+
+        if profile_mode {
+            match client.query("default", &format!("PROFILE {}", cypher)).await {
+                Ok(batch) => {
+                    println!("\n================ {} — {} ================", query.id, query.name);
+                    println!("{}", cypher);
+                    println!();
+                    // PROFILE returns a single row whose one column holds the
+                    // annotated plan. Printing the JSON value directly would
+                    // escape every newline and make the tree unreadable, so
+                    // unwrap the string.
+                    for record in &batch.records {
+                        for cell in record {
+                            match cell.as_str() {
+                                Some(text) => println!("{}", text),
+                                None => println!("{}", cell),
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("\n================ {} — {} ================", query.id, query.name);
+                    println!("ERROR: {}", e);
+                    errors += 1;
+                }
+            }
+            continue;
+        }
+
         let result = run_benchmark(&client, query, &cypher, runs).await;
 
         if let Some(ref err) = result.error {
@@ -804,30 +986,63 @@ async fn main() -> Result<(), Error> {
             eprintln!("       {}", err);
             errors += 1;
         } else {
-            println!("{:<6}{:<32}{:>8}{:>12}{:>12}{:>12}  OK",
+            // A read that returns nothing is not a passing benchmark. LDBC's short and
+            // complex reads return rows by construction when their parameters resolve, so
+            // 0 rows means the parameters missed the data -- and a 0.03 ms "OK" for a query
+            // that traversed nothing is the most flattering possible wrong answer. Say so
+            // in the status rather than reporting it as a pass (#449).
+            let empty = result.rows == 0
+                && matches!(query.category, "short" | "complex");
+            println!("{:<6}{:<32}{:>8}{:>12}{:>12}{:>12}  {}",
                 result.id, result.name,
                 result.rows,
                 format_ms(result.min),
                 format_ms(result.median),
-                format_ms(result.max));
-            passed += 1;
+                format_ms(result.max),
+                if empty { "EMPTY" } else { "OK" });
+            if empty { empty_reads += 1; } else { passed += 1; }
         }
     }
 
     let bench_time = bench_start.elapsed();
 
+    if profile_mode {
+        println!();
+        println!("Profiled {} query/queries in {}.", queries.len(), format_duration(bench_time));
+        bench_setup::report_drift(calibration);
+        if errors > 0 {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+
     // ========================================================================
     // Summary
     // ========================================================================
     println!();
-    println!("Summary: {}/{} passed, {} errors (total benchmark time: {})",
-        passed, queries.len(), errors, format_duration(bench_time));
+    println!("Summary: {}/{} passed, {} empty, {} errors (total benchmark time: {})",
+        passed, queries.len(), empty_reads, errors, format_duration(bench_time));
+    if empty_reads > 0 {
+        println!();
+        println!("WARNING: {empty_reads} read(s) returned 0 rows. LDBC reads return rows by");
+        println!("         construction when their parameters resolve, so this almost certainly");
+        println!("         means the substitution parameters do not match this dataset -- ids");
+        println!("         are assigned per `datagen` run and are not portable between extracts.");
+        println!("         Timings above are therefore not measuring traversal. Supply matching");
+        println!("         parameters with --params-file <json>.");
+    }
 
     // Cache stats
     let stats = client.cache_stats();
     println!("AST cache: {} hits, {} misses", stats.hits(), stats.misses());
 
-    if errors > 0 {
+    bench_setup::report_drift(calibration);
+
+    // Any empty read is a configuration failure, not a pass. A run with 17 of 21 reads
+    // returning nothing measured nothing, and exiting 0 on it is how "21/21 passed in 32 ms"
+    // came to look like a result (#449).
+    if errors > 0 || empty_reads > 0 {
         std::process::exit(1);
     }
 

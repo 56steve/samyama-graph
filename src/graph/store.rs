@@ -84,6 +84,7 @@ use super::property::{PropertyMap, PropertyValue};
 use super::types::{EdgeId, EdgeType, Label, NodeId};
 use crate::vector::{VectorIndexManager, DistanceMetric, VectorResult};
 use crate::index::IndexManager;
+use crate::index::hierarchy::HierarchyIndexManager;
 use crate::graph::storage::ColumnStore;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use std::collections::{HashMap, HashSet};
@@ -141,6 +142,9 @@ pub enum GraphError {
 
     #[error("Write conflict: {0}")]
     WriteConflict(String),
+
+    #[error("Constraint violation: {0}")]
+    ConstraintViolation(String),
 }
 
 pub type GraphResult<T> = Result<T, GraphError>;
@@ -198,8 +202,26 @@ pub struct PropertyStats {
     /// Estimated number of distinct values
     pub distinct_count: usize,
     /// Selectivity: probability of matching a random value (1/distinct_count)
+    ///
+    /// This is the uniform-distribution assumption. It is exactly right when
+    /// the data is uniform and wrong in both directions at once when it is
+    /// not -- measured at 30% of values within 2x under heavy skew, with the
+    /// most common value underestimated 5x while the rarest was overestimated
+    /// 20x (`benches/cardinality_accuracy.rs`, #478). `most_common` is what
+    /// corrects the head of the distribution, where that damage concentrates.
     pub selectivity: f64,
+    /// The most frequently observed values and their sampled frequency, as a
+    /// fraction of non-null observations. Bounded to `MAX_MCV` entries.
+    ///
+    /// Empty when a property was never sampled, which is why the value-aware
+    /// estimator falls back rather than assuming absence means rarity.
+    pub most_common: Vec<(PropertyValue, f64)>,
 }
+
+/// How many values to retain per (label, property). Small on purpose: the
+/// point is to capture the head of a skewed distribution, and the tail is what
+/// histograms are for.
+pub const MAX_MCV: usize = 16;
 
 impl GraphStatistics {
     /// Estimate the number of rows from a label scan
@@ -215,12 +237,58 @@ impl GraphStatistics {
         }
     }
 
-    /// Estimate selectivity of an equality filter on a property
+    /// Estimate selectivity of an equality filter on a property.
+    ///
+    /// Value-agnostic, and therefore uniform-assuming. Prefer
+    /// [`Self::estimate_equality_selectivity_for_value`] wherever the compared
+    /// value is known -- which, at the one planner call site, it is.
     pub fn estimate_equality_selectivity(&self, label: &Label, property: &str) -> f64 {
         self.property_stats
             .get(&(label.clone(), property.to_string()))
             .map(|ps| ps.selectivity)
             .unwrap_or(0.1) // Default 10% selectivity
+    }
+
+    /// Estimate selectivity of `property = value`, using the most-common-value
+    /// list when the value is in it.
+    ///
+    /// The uniform estimate is `1/distinct_count` for every value alike. Under
+    /// skew that is wrong in both directions simultaneously -- too low for the
+    /// values that dominate the scan and too high for the ones that barely
+    /// occur -- which inverts the plan ordering rather than merely blurring it.
+    /// An MCV hit answers with the frequency actually observed.
+    ///
+    /// A miss deliberately does **not** assume the value is rare. It could be
+    /// absent from the list because it is genuinely uncommon, or because the
+    /// sample missed it; guessing "rare" on the second case reintroduces the
+    /// under-estimate this exists to remove. Instead the residual mass not
+    /// covered by the MCVs is spread over the remaining distinct values, which
+    /// is the standard treatment and degrades to the old answer when there are
+    /// no MCVs at all.
+    pub fn estimate_equality_selectivity_for_value(
+        &self,
+        label: &Label,
+        property: &str,
+        value: &PropertyValue,
+    ) -> f64 {
+        let Some(ps) = self.property_stats.get(&(label.clone(), property.to_string())) else {
+            return 0.1;
+        };
+        if let Some((_, freq)) = ps.most_common.iter().find(|(v, _)| v == value) {
+            return *freq;
+        }
+        if ps.most_common.is_empty() {
+            return ps.selectivity;
+        }
+        let mcv_mass: f64 = ps.most_common.iter().map(|(_, f)| *f).sum();
+        let remaining_mass = (1.0 - mcv_mass).max(0.0);
+        let remaining_distinct = ps.distinct_count.saturating_sub(ps.most_common.len());
+        if remaining_distinct == 0 {
+            // Every distinct value is in the list and this is not one of them.
+            // Still not zero: the sample may simply not have seen it.
+            return ps.selectivity.min(remaining_mass.max(f64::EPSILON));
+        }
+        remaining_mass / remaining_distinct as f64
     }
 
     /// Format statistics as human-readable text
@@ -567,6 +635,9 @@ pub struct GraphStore {
     /// Property indices manager
     pub property_index: Arc<IndexManager>,
 
+    /// Hierarchy (OEH) index registry — subsumption + index-resident roll-up (ADR-035)
+    pub hierarchy_index: Arc<HierarchyIndexManager>,
+
     /// Columnar storage for node properties
     pub node_columns: ColumnStore,
 
@@ -617,6 +688,7 @@ impl GraphStore {
             edge_type_index: HashMap::new(),
             vector_index: Arc::new(VectorIndexManager::new()),
             property_index: Arc::new(IndexManager::new()),
+            hierarchy_index: Arc::new(HierarchyIndexManager::new()),
             node_columns: ColumnStore::new(),
             edge_columns: ColumnStore::new(),
             index_sender: None,
@@ -648,9 +720,15 @@ impl GraphStore {
             match event {
                 NodeCreated { tenant_id, id, labels, properties } => {
                     for (key, value) in &properties {
-                        if let PropertyValue::Vector(vec) = value {
+                        // A numeric array counts, not only the `Vector`
+                        // variant: a list literal stays a list now (#628), so
+                        // `{embedding: [0.1, 0.2, 0.3]}` arrives as an `Array`
+                        // and matching on `Vector` alone silently indexed
+                        // nothing. The rebuild path already used `to_vector`,
+                        // which is why this only showed up on write.
+                        if let Some(vec) = value.to_vector() {
                             for label in &labels {
-                                let _ = vector_index.add_vector(label.as_str(), key, id, vec);
+                                let _ = vector_index.add_vector(label.as_str(), key, id, &vec);
                             }
                         }
                         for label in &labels {
@@ -667,17 +745,44 @@ impl GraphStore {
                                                 // Trigger Auto-Embed
                                                 let vector_index_clone = Arc::clone(&vector_index);
                                                 let label_str = label.as_str().to_string();
-                                                let key_clone = key.clone();
+                                                // The vector is indexed under the
+                                                // *target* property, not the source text
+                                                // property it was generated from: an index
+                                                // is created on `Person.embedding`, never
+                                                // on `Person.headline`, so indexing under
+                                                // the source key put every vector in an
+                                                // index nobody queried (#310).
+                                                let target_key = config.embedding_property.clone();
                                                 let text_clone = text.clone();
                                                 let config_clone = config.clone();
-                                                
+
                                                 tokio::spawn(async move {
-                                                    if let Ok(pipeline) = crate::embed::EmbedPipeline::new(config_clone) {
-                                                        if let Ok(chunks) = pipeline.process_text(&text_clone).await {
-                                                            for chunk in chunks {
-                                                                let _ = vector_index_clone.add_vector(&label_str, &key_clone, id, &chunk.embedding);
+                                                    match crate::embed::EmbedPipeline::new(config_clone) {
+                                                        Ok(pipeline) => match pipeline.process_text(&text_clone).await {
+                                                            Ok(chunks) => {
+                                                                for chunk in chunks {
+                                                                    if let Err(e) = vector_index_clone.add_vector(
+                                                                        &label_str,
+                                                                        &target_key,
+                                                                        id,
+                                                                        &chunk.embedding,
+                                                                    ) {
+                                                                        tracing::warn!(
+                                                                            "auto-embed: could not index {}.{} for node {}: {}",
+                                                                            label_str, target_key, id.as_u64(), e
+                                                                        );
+                                                                    }
+                                                                }
                                                             }
-                                                        }
+                                                            Err(e) => tracing::warn!(
+                                                                "auto-embed: embedding failed for {}.{}: {}",
+                                                                label_str, target_key, e
+                                                            ),
+                                                        },
+                                                        Err(e) => tracing::warn!(
+                                                            "auto-embed: pipeline unavailable for {}.{}: {}",
+                                                            label_str, target_key, e
+                                                        ),
                                                     }
                                                 });
                                             }
@@ -736,9 +841,9 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
                     for label in &labels {
                         property_index.index_insert(label, &key, new_value.clone(), id);
                     }
-                    if let PropertyValue::Vector(vec) = &new_value {
+                    if let Some(vec) = new_value.to_vector() {
                         for label in &labels {
-                            let _ = vector_index.add_vector(label.as_str(), &key, id, vec);
+                            let _ = vector_index.add_vector(label.as_str(), &key, id, &vec);
                         }
                     }
                     
@@ -751,17 +856,36 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
                                         if keys.contains(&key) {
                                             let vector_index_clone = Arc::clone(&vector_index);
                                             let label_str = label.as_str().to_string();
-                                            let key_clone = key.clone();
+                                            // Index under the target property, not the
+                                            // source text property -- see NodeCreated.
+                                            let target_key = config.embedding_property.clone();
                                             let text_clone = text.clone();
                                             let config_clone = config.clone();
-                                            
+
                                             tokio::spawn(async move {
-                                                if let Ok(pipeline) = crate::embed::EmbedPipeline::new(config_clone) {
-                                                    if let Ok(chunks) = pipeline.process_text(&text_clone).await {
-                                                        if let Some(first) = chunks.first() {
-                                                            let _ = vector_index_clone.add_vector(&label_str, &key_clone, id, &first.embedding);
+                                                match crate::embed::EmbedPipeline::new(config_clone) {
+                                                    Ok(pipeline) => match pipeline.process_text(&text_clone).await {
+                                                        Ok(chunks) => {
+                                                            if let Some(first) = chunks.first() {
+                                                                if let Err(e) = vector_index_clone.add_vector(
+                                                                    &label_str, &target_key, id, &first.embedding,
+                                                                ) {
+                                                                    tracing::warn!(
+                                                                        "auto-embed: could not index {}.{} for node {}: {}",
+                                                                        label_str, target_key, id.as_u64(), e
+                                                                    );
+                                                                }
+                                                            }
                                                         }
-                                                    }
+                                                        Err(e) => tracing::warn!(
+                                                            "auto-embed: embedding failed for {}.{}: {}",
+                                                            label_str, target_key, e
+                                                        ),
+                                                    },
+                                                    Err(e) => tracing::warn!(
+                                                        "auto-embed: pipeline unavailable for {}.{}: {}",
+                                                        label_str, target_key, e
+                                                    ),
                                                 }
                                             });
                                         }
@@ -801,8 +925,8 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
                 }
                 LabelAdded { tenant_id, id, label, properties } => {
                     for (key, value) in properties {
-                        if let PropertyValue::Vector(vec) = &value {
-                            let _ = vector_index.add_vector(label.as_str(), &key, id, vec);
+                        if let Some(vec) = value.to_vector() {
+                            let _ = vector_index.add_vector(label.as_str(), &key, id, &vec);
                         }
                         property_index.index_insert(&label, &key, value.clone(), id);
                         
@@ -814,17 +938,36 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
                                         if keys.contains(&key) {
                                             let vector_index_clone = Arc::clone(&vector_index);
                                             let label_str = label.as_str().to_string();
-                                            let key_clone = key.clone();
+                                            // Index under the target property, not the
+                                            // source text property -- see NodeCreated.
+                                            let target_key = config.embedding_property.clone();
                                             let text_clone = text.clone();
                                             let config_clone = config.clone();
-                                            
+
                                             tokio::spawn(async move {
-                                                if let Ok(pipeline) = crate::embed::EmbedPipeline::new(config_clone) {
-                                                    if let Ok(chunks) = pipeline.process_text(&text_clone).await {
-                                                        if let Some(first) = chunks.first() {
-                                                            let _ = vector_index_clone.add_vector(&label_str, &key_clone, id, &first.embedding);
+                                                match crate::embed::EmbedPipeline::new(config_clone) {
+                                                    Ok(pipeline) => match pipeline.process_text(&text_clone).await {
+                                                        Ok(chunks) => {
+                                                            if let Some(first) = chunks.first() {
+                                                                if let Err(e) = vector_index_clone.add_vector(
+                                                                    &label_str, &target_key, id, &first.embedding,
+                                                                ) {
+                                                                    tracing::warn!(
+                                                                        "auto-embed: could not index {}.{} for node {}: {}",
+                                                                        label_str, target_key, id.as_u64(), e
+                                                                    );
+                                                                }
+                                                            }
                                                         }
-                                                    }
+                                                        Err(e) => tracing::warn!(
+                                                            "auto-embed: embedding failed for {}.{}: {}",
+                                                            label_str, target_key, e
+                                                        ),
+                                                    },
+                                                    Err(e) => tracing::warn!(
+                                                        "auto-embed: pipeline unavailable for {}.{}: {}",
+                                                        label_str, target_key, e
+                                                    ),
                                                 }
                                             });
                                         }
@@ -840,6 +983,20 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
 
     /// Create a node with auto-generated ID and single label
     pub fn create_node(&mut self, label: impl Into<Label>) -> NodeId {
+        self.create_node_with_labels(std::iter::once(label.into()))
+    }
+
+    /// Create a node with exactly the labels given, which may be none.
+    ///
+    /// Every caller building a node from a Cypher pattern went through
+    /// `create_node`, which takes a single label -- so a pattern with no label
+    /// passed `""` and a MERGE pattern with no label passed the invented
+    /// string `"Node"`. Both ended up in the label index and the catalog, so
+    /// an unlabelled node reported a label it did not have and `MATCH
+    /// (n:Node)` matched nodes nobody labelled (#625). Callers that know the
+    /// whole label set should use this.
+    pub fn create_node_with_labels(&mut self, labels: impl IntoIterator<Item = Label>) -> NodeId {
+        let labels: Vec<Label> = labels.into_iter().collect();
         self.invalidate_statistics_cache();
         let node_id_u64 = if let Some(id) = self.free_node_ids.pop() {
             id
@@ -851,18 +1008,16 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
         let node_id = NodeId::new(node_id_u64);
         let idx = node_id_u64 as usize;
 
-        let label = label.into();
-        let mut node = Node::new(node_id, label.clone());
+        let mut node = Node::with_labels(node_id, labels.iter().cloned());
         node.version = self.current_version;
 
-        // Add to label index
-        self.label_index
-            .entry(label.clone())
-            .or_insert_with(HashSet::new)
-            .insert(node_id);
-
-        // Update catalog label count
-        self.catalog.on_label_added(&label);
+        for label in &labels {
+            self.label_index
+                .entry(label.clone())
+                .or_insert_with(HashSet::new)
+                .insert(node_id);
+            self.catalog.on_label_added(label);
+        }
 
         // Ensure storage capacity
         if idx >= self.nodes.len() {
@@ -871,20 +1026,43 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
             self.incoming.resize(idx + 1, Vec::new());
         }
 
-        let event = crate::graph::event::IndexEvent::NodeCreated {
-            tenant_id: "default".to_string(),
-            id: node_id,
-            labels: node.labels.iter().cloned().collect(),
-            properties: node.properties.clone(),
-        };
-
+        // Build the event only where it is actually consumed. A subscriber may
+        // care about a bare node creation, so the sender path always gets one;
+        // the local path only indexes *properties*, and `Node::new` starts with
+        // none, so constructing the event there allocated a tenant String, a
+        // Vec of cloned labels and a properties clone to feed a loop that
+        // iterates zero times (#491).
         if let Some(sender) = &self.index_sender {
-            let _ = sender.send(event);
-        } else {
-            self.handle_index_event(event, None);
+            let _ = sender.send(crate::graph::event::IndexEvent::NodeCreated {
+                tenant_id: "default".to_string(),
+                id: node_id,
+                labels: node.labels.iter().cloned().collect(),
+                properties: node.properties.clone(),
+            });
+        } else if !node.properties.is_empty() {
+            self.handle_index_event(
+                crate::graph::event::IndexEvent::NodeCreated {
+                    tenant_id: "default".to_string(),
+                    id: node_id,
+                    labels: node.labels.iter().cloned().collect(),
+                    properties: node.properties.clone(),
+                },
+                None,
+            );
         }
 
-        self.nodes[idx].push(node);
+        // `Vec` grows 0 -> capacity 4 on first push, and `Node` is 128 bytes, so
+        // the default path allocates 512 B per node for an MVCC version chain
+        // that holds one entry in the overwhelming majority of cases -- 384 B
+        // of it never used. Reserve exactly one; later versions grow normally
+        // from there, which is the rare path (#491).
+        {
+            let versions = &mut self.nodes[idx];
+            if versions.capacity() == 0 {
+                versions.reserve_exact(1);
+            }
+            versions.push(node);
+        }
         node_id
     }
 
@@ -931,20 +1109,40 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
             self.incoming.resize(idx + 1, Vec::new());
         }
 
-        let event = crate::graph::event::IndexEvent::NodeCreated {
-            tenant_id: tenant_id.to_string(),
-            id: node_id,
-            labels: node.labels.iter().cloned().collect(),
-            properties: node.properties.clone(),
-        };
-
+        // Same as `create_node`: the local path only indexes properties, so
+        // building the event for a property-less node allocates to feed a loop
+        // that iterates zero times (#491).
         if let Some(sender) = &self.index_sender {
-            let _ = sender.send(event);
-        } else {
-            self.handle_index_event(event, None);
+            let _ = sender.send(crate::graph::event::IndexEvent::NodeCreated {
+                tenant_id: tenant_id.to_string(),
+                id: node_id,
+                labels: node.labels.iter().cloned().collect(),
+                properties: node.properties.clone(),
+            });
+        } else if !node.properties.is_empty() {
+            self.handle_index_event(
+                crate::graph::event::IndexEvent::NodeCreated {
+                    tenant_id: tenant_id.to_string(),
+                    id: node_id,
+                    labels: node.labels.iter().cloned().collect(),
+                    properties: node.properties.clone(),
+                },
+                None,
+            );
         }
 
-        self.nodes[idx].push(node);
+        // `Vec` grows 0 -> capacity 4 on first push, and `Node` is 128 bytes, so
+        // the default path allocates 512 B per node for an MVCC version chain
+        // that holds one entry in the overwhelming majority of cases -- 384 B
+        // of it never used. Reserve exactly one; later versions grow normally
+        // from there, which is the rare path (#491).
+        {
+            let versions = &mut self.nodes[idx];
+            if versions.capacity() == 0 {
+                versions.reserve_exact(1);
+            }
+            versions.push(node);
+        }
         node_id
     }
 
@@ -1028,14 +1226,26 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
             self.incoming.resize(idx + 1, Vec::new());
         }
 
-        self.nodes[idx].push(node);
+        // `Vec` grows 0 -> capacity 4 on first push, and `Node` is 128 bytes, so
+        // the default path allocates 512 B per node for an MVCC version chain
+        // that holds one entry in the overwhelming majority of cases -- 384 B
+        // of it never used. Reserve exactly one; later versions grow normally
+        // from there, which is the rare path (#491).
+        {
+            let versions = &mut self.nodes[idx];
+            if versions.capacity() == 0 {
+                versions.reserve_exact(1);
+            }
+            versions.push(node);
+        }
         node_id
     }
 
     /// Set a property directly in the columnar store, bypassing the Node's row HashMap.
     pub fn set_column_property(&mut self, node_id: NodeId, key: &str, value: PropertyValue) {
         let idx = node_id.as_u64() as usize;
-        self.node_columns.set_property(idx, key, value);
+        self.node_columns.set_property(idx, key, value.clone());
+        self.update_hierarchies_for_property(node_id, key, &value);
     }
 
     /// Intern an edge type string → u16 index. Returns existing index if already interned.
@@ -1079,41 +1289,98 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
         let val = value.into();
         let idx = node_id.as_u64() as usize;
 
-        // Update columnar storage (always latest)
-        self.node_columns.set_property(idx, &key_str, val.clone());
-
-        // Get access to versions
-        let versions = self.nodes.get_mut(idx).ok_or(GraphError::NodeNotFound(node_id))?;
-        let latest_node = versions.last().ok_or(GraphError::NodeNotFound(node_id))?;
-
-        let old_val;
-        
-        if latest_node.version < self.current_version {
-            // COW: Create new version
-            let mut new_node = latest_node.clone();
-            new_node.version = self.current_version;
-            new_node.updated_at = chrono::Utc::now().timestamp_millis();
-            old_val = new_node.set_property(key_str.clone(), val.clone());
-            versions.push(new_node);
+        // Enforce unique constraints on the write path. The constraint registry, the
+        // per-constraint index and `check_unique_constraint` all existed but nothing ever
+        // called them, so `CREATE CONSTRAINT ... IS UNIQUE` was accepted, listed by
+        // SHOW CONSTRAINTS, and enforced nothing -- a double load silently produced
+        // duplicates. The `has_any_unique_constraints` guard keeps graphs without
+        // constraints (every bulk load) off the per-label path entirely.
+        let constrained_labels: Vec<Label> = if self.property_index.has_any_unique_constraints()
+            && !val.is_null()
+        {
+            let labels: Vec<Label> = match self.get_node(node_id) {
+                Some(node) => node.labels.iter().cloned().collect(),
+                None => Vec::new(),
+            };
+            labels
+                .into_iter()
+                .filter(|l| self.property_index.has_unique_constraint(l, &key_str))
+                .collect()
         } else {
-            // Update in place (same transaction/version)
-            let node = versions.last_mut().unwrap();
-            old_val = node.set_property(key_str.clone(), val.clone());
+            Vec::new()
+        };
+        for label in &constrained_labels {
+            // Re-setting a property to the value this same node already holds is not a
+            // violation; only another node holding it is.
+            if let Some(holder) =
+                self.property_index
+                    .unique_constraint_holder(label, &key_str, &val)
+            {
+                if holder != node_id {
+                    return Err(GraphError::ConstraintViolation(format!(
+                        ":{}({}) already has value {:?} on node {}",
+                        label.as_str(),
+                        key_str,
+                        val,
+                        holder
+                    )));
+                }
+            }
         }
 
-        let event = crate::graph::event::IndexEvent::PropertySet {
-            tenant_id: tenant_id.to_string(),
-            id: node_id,
-            labels: versions.last().unwrap().labels.iter().cloned().collect(),
-            key: key_str,
-            old_value: old_val,
-            new_value: val,
+        // Update columnar storage (always latest)
+        self.node_columns.set_property(idx, &key_str, val.clone());
+        self.update_hierarchies_for_property(node_id, &key_str, &val);
+
+        // Scoped so the mutable borrow of `self.nodes` ends here; the indexing
+        // below needs `&self` and the node's labels at the same time, which is
+        // fine as two shared borrows but not while this one is live.
+        let old_val = {
+            let current_version = self.current_version;
+            let versions = self.nodes.get_mut(idx).ok_or(GraphError::NodeNotFound(node_id))?;
+            let latest_node = versions.last().ok_or(GraphError::NodeNotFound(node_id))?;
+
+            if latest_node.version < current_version {
+                // COW: Create new version
+                let mut new_node = latest_node.clone();
+                new_node.version = current_version;
+                new_node.updated_at = chrono::Utc::now().timestamp_millis();
+                let old = new_node.set_property(key_str.clone(), val.clone());
+                versions.push(new_node);
+                old
+            } else {
+                // Update in place (same transaction/version)
+                let node = versions.last_mut().unwrap();
+                node.set_property(key_str.clone(), val.clone())
+            }
         };
 
+        // Record the new value so subsequent writes can see it. Without this the
+        // constraint index only ever holds what the backfill put there at CREATE
+        // CONSTRAINT time, and nodes added afterwards would not conflict with each other.
+        for label in &constrained_labels {
+            self.property_index
+                .constraint_insert(label, &key_str, val.clone(), node_id);
+        }
+
         if let Some(sender) = &self.index_sender {
-            let _ = sender.send(event);
+            let _ = sender.send(crate::graph::event::IndexEvent::PropertySet {
+                tenant_id: tenant_id.to_string(),
+                id: node_id,
+                labels: self.nodes[idx]
+                    .last()
+                    .map(|n| n.labels.iter().cloned().collect())
+                    .unwrap_or_default(),
+                key: key_str,
+                old_value: old_val,
+                new_value: val,
+            });
         } else {
-            self.handle_index_event(event, None);
+            // No subscriber: index directly from borrowed data rather than
+            // materialising an event only to take it apart again.
+            if let Some(labels) = self.nodes[idx].last().map(|n| &n.labels) {
+                self.apply_property_set(node_id, labels, &key_str, old_val.as_ref(), &val);
+            }
         }
 
         Ok(())
@@ -1207,6 +1474,11 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
             self.handle_index_event(event, None);
         }
 
+        // Clear the columnar row. The id goes on the free list just above and will be
+        // handed to the next create_node, which would otherwise inherit whatever this node
+        // left in each column — deleted values reappearing on new nodes (#364).
+        self.node_columns.clear_row(idx);
+
         // Remove from the versions (breaking historical reads for now, full MVCC is complex)
         // TODO: Implement proper tombstone versions
         let node = self.nodes[idx].pop().unwrap();
@@ -1235,6 +1507,46 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
     /// This is the correct way to add labels to nodes after creation.
     /// Using `node.add_label()` directly will NOT update the label_index,
     /// making the node invisible to `get_nodes_by_label()` queries.
+    /// Remove a label from a node, from the node and from `label_index`.
+    ///
+    /// The counterpart of `add_label_to_node`, and it has to update the index
+    /// for the same reason: `MATCH (n:Label)` reads it, and so does expansion
+    /// filtering since #592. A label removed from the node but left in the
+    /// index makes the node findable by a label it no longer carries.
+    ///
+    /// Removing a label the node does not have is a no-op returning `false`,
+    /// which is Cypher's behaviour and not an error.
+    pub fn remove_label_from_node(
+        &mut self,
+        node_id: NodeId,
+        label: &Label,
+    ) -> GraphResult<bool> {
+        self.invalidate_statistics_cache();
+        let idx = node_id.as_u64() as usize;
+
+        let node = self
+            .nodes
+            .get_mut(idx)
+            .and_then(|v| v.last_mut())
+            .ok_or(GraphError::NodeNotFound(node_id))?;
+        let removed = node.remove_label(label);
+        if !removed {
+            return Ok(false);
+        }
+
+        if let Some(members) = self.label_index.get_mut(label) {
+            members.remove(&node_id);
+            // An empty set is not the same as an absent one to the expansion
+            // filter -- absent means "no node carries this", which is the
+            // answer once the last member goes (#592).
+            if members.is_empty() {
+                self.label_index.remove(label);
+            }
+        }
+
+        Ok(true)
+    }
+
     pub fn add_label_to_node(
         &mut self,
         tenant_id: &str,
@@ -1295,6 +1607,7 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
         let edge_id = EdgeId::new(edge_id_u64);
         let idx = edge_id_u64 as usize;
         let edge_type = edge_type.into();
+        self.invalidate_hierarchies_for_edge_type(&edge_type);
 
         // Unsorted append — O(1) per edge. Sorted at compact_adjacency().
         // Saves ~50% of edge phase time vs sorted insert (no binary search + shift).
@@ -1343,6 +1656,7 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
         let idx = edge_id_u64 as usize;
 
         let edge_type = edge_type.into();
+        self.invalidate_hierarchies_for_edge_type(&edge_type);
         let mut edge = Edge::new(edge_id, source, target, edge_type.clone());
         edge.version = self.current_version;
 
@@ -1371,16 +1685,44 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
         }
         self.edge_type_ids[idx] = type_id;
 
-        // Update edge type index
-        self.edge_type_index
-            .entry(edge_type.clone())
-            .or_insert_with(HashSet::new)
-            .insert(edge_id);
+        // Update edge type index. `get_mut` first so the common case -- a type
+        // already seen, which after the first few edges is every case -- does
+        // not clone the type string just to hand `entry()` a key it will throw
+        // away (#491).
+        match self.edge_type_index.get_mut(&edge_type) {
+            Some(set) => {
+                set.insert(edge_id);
+            }
+            None => {
+                self.edge_type_index
+                    .entry(edge_type.clone())
+                    .or_insert_with(HashSet::new)
+                    .insert(edge_id);
+            }
+        }
 
         // Update catalog triple stats
-        let src_labels: Vec<Label> = self.get_node(source).map(|n| n.labels.iter().cloned().collect()).unwrap_or_default();
-        let tgt_labels: Vec<Label> = self.get_node(target).map(|n| n.labels.iter().cloned().collect()).unwrap_or_default();
-        self.catalog.on_edge_created(source, &src_labels, &edge_type, target, &tgt_labels);
+        // Borrow the label sets straight from the nodes rather than collecting
+        // two `Vec<Label>` per edge. The collect existed only to end the borrow
+        // on `self` before touching `self.catalog`; borrowing the two fields
+        // disjointly does the same thing without cloning a `String` per label
+        // on every single insert (#491).
+        let version = self.current_version;
+        let nodes = &self.nodes;
+        let label_set = |id: NodeId| -> Option<&std::collections::HashSet<Label>> {
+            nodes
+                .get(id.as_u64() as usize)?
+                .iter()
+                .rev()
+                .find(|n| n.version <= version)
+                .map(|n| &n.labels)
+        };
+        static NO_LABELS: std::sync::OnceLock<std::collections::HashSet<Label>> =
+            std::sync::OnceLock::new();
+        let empty = NO_LABELS.get_or_init(std::collections::HashSet::new);
+        let src_labels = label_set(source).unwrap_or(empty);
+        let tgt_labels = label_set(target).unwrap_or(empty);
+        self.catalog.on_edge_created(source, src_labels, &edge_type, target, tgt_labels);
 
         Ok(edge_id)
     }
@@ -1418,6 +1760,7 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
         }
 
         let edge_type = edge_type.into();
+        self.invalidate_hierarchies_for_edge_type(&edge_type);
         let mut edge = Edge::new_with_properties(edge_id, source, target, edge_type.clone(), properties);
         edge.version = self.current_version;
 
@@ -1449,16 +1792,44 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
             self.edge_properties.insert(edge_id, edge.properties.clone());
         }
 
-        // Update edge type index
-        self.edge_type_index
-            .entry(edge_type.clone())
-            .or_insert_with(HashSet::new)
-            .insert(edge_id);
+        // Update edge type index. `get_mut` first so the common case -- a type
+        // already seen, which after the first few edges is every case -- does
+        // not clone the type string just to hand `entry()` a key it will throw
+        // away (#491).
+        match self.edge_type_index.get_mut(&edge_type) {
+            Some(set) => {
+                set.insert(edge_id);
+            }
+            None => {
+                self.edge_type_index
+                    .entry(edge_type.clone())
+                    .or_insert_with(HashSet::new)
+                    .insert(edge_id);
+            }
+        }
 
         // Update catalog triple stats
-        let src_labels: Vec<Label> = self.get_node(source).map(|n| n.labels.iter().cloned().collect()).unwrap_or_default();
-        let tgt_labels: Vec<Label> = self.get_node(target).map(|n| n.labels.iter().cloned().collect()).unwrap_or_default();
-        self.catalog.on_edge_created(source, &src_labels, &edge_type, target, &tgt_labels);
+        // Borrow the label sets straight from the nodes rather than collecting
+        // two `Vec<Label>` per edge. The collect existed only to end the borrow
+        // on `self` before touching `self.catalog`; borrowing the two fields
+        // disjointly does the same thing without cloning a `String` per label
+        // on every single insert (#491).
+        let version = self.current_version;
+        let nodes = &self.nodes;
+        let label_set = |id: NodeId| -> Option<&std::collections::HashSet<Label>> {
+            nodes
+                .get(id.as_u64() as usize)?
+                .iter()
+                .rev()
+                .find(|n| n.version <= version)
+                .map(|n| &n.labels)
+        };
+        static NO_LABELS: std::sync::OnceLock<std::collections::HashSet<Label>> =
+            std::sync::OnceLock::new();
+        let empty = NO_LABELS.get_or_init(std::collections::HashSet::new);
+        let src_labels = label_set(source).unwrap_or(empty);
+        let tgt_labels = label_set(target).unwrap_or(empty);
+        self.catalog.on_edge_created(source, src_labels, &edge_type, target, tgt_labels);
 
         Ok(edge_id)
     }
@@ -1580,6 +1951,7 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
 
         // Reconstruct edge from DS-07c before deletion
         let edge = self.get_edge(id).ok_or(GraphError::EdgeNotFound(id))?;
+        self.invalidate_hierarchies_for_edge_type(&edge.edge_type);
 
         // Collect catalog info
         let src_labels: Vec<Label> = self.get_node(edge.source).map(|n| n.labels.iter().cloned().collect()).unwrap_or_default();
@@ -1660,6 +2032,143 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
 
     /// Get outgoing edge targets with owned EdgeType — works for both full and stub edges.
     /// Uses compact edge_type_ids array (DS-07c) when Edge objects are not available.
+    /// Every property a node has, from wherever it is stored.
+    ///
+    /// A graph built through the API writes both the columnar store and the
+    /// row map on the `Node`; a graph restored from a `.sgsnap` writes only
+    /// the columns, so its row maps are empty. `resolve_property` handles that
+    /// by reading the column first and falling back to the row, and anything
+    /// that reads `node.properties` directly gets nothing on an imported graph
+    /// -- which is what #554 was.
+    ///
+    /// Columns win on a clash, matching `resolve_property`: the column holds
+    /// the current value, the row can hold a superseded one.
+    pub fn node_properties_merged(&self, node_id: NodeId) -> PropertyMap {
+        let idx = node_id.as_u64() as usize;
+        let mut merged: PropertyMap = PropertyMap::new();
+
+        if let Some(node) = self.get_node(node_id) {
+            for (key, value) in &node.properties {
+                merged.insert(key.clone(), value.clone());
+            }
+        }
+        for key in self.node_columns.get_property_keys(idx) {
+            let value = self.node_columns.get_property(idx, &key);
+            if !value.is_null() {
+                merged.insert(key, value);
+            }
+        }
+        merged
+    }
+
+    /// The interned id of an edge type, if the graph has ever seen one.
+    ///
+    /// `None` means no edge in the graph has this type, so a filter on it
+    /// matches nothing — which is the right answer, not an error.
+    pub fn edge_type_id(&self, edge_type: &EdgeType) -> Option<u16> {
+        self.edge_type_to_id.get(edge_type).copied()
+    }
+
+    /// Visit each outgoing neighbour of `node`, without allocating.
+    ///
+    /// `type_ids` is `None` for "any type", or `Some(ids)` for the interned
+    /// ids to accept. `Some(&[])` therefore matches **nothing** -- which is
+    /// the right answer when a caller asked for an edge type the graph has
+    /// never seen, and the reason this is an `Option` rather than a slice
+    /// whose emptiness means "wildcard". Conflating the two makes
+    /// `-[:NO_SUCH_TYPE*1..3]->` follow every edge in the graph.
+    ///
+    /// This exists because `get_outgoing_edge_targets_owned` — which the
+    /// traversal operators used — allocates a `Vec` for the frozen tier, a
+    /// second `Vec` for the result, and **clones an `EdgeType` string per
+    /// edge**, only for the caller to compare that string against a filter and
+    /// usually discard it.
+    ///
+    /// That is paid per *incident* edge, not per matching one, and the
+    /// difference is the whole cost on a real graph: an LDBC `Person` has ~41
+    /// `KNOWS` edges and ~900 other incident edges — inbound `HAS_CREATOR`
+    /// from every post and comment they wrote, `LIKES`, `HAS_MEMBER`,
+    /// `HAS_INTEREST`. Expanding `KNOWS*1..3` from one person enumerated
+    /// roughly 9.3M edges to traverse 404K of them (#520).
+    ///
+    /// `incoming_degree_for_type` already took this approach and says so in its
+    /// own doc comment; this generalises it.
+    pub fn for_each_outgoing_neighbor(
+        &self,
+        node_id: NodeId,
+        type_ids: Option<&[u16]>,
+        mut visit: impl FnMut(NodeId, EdgeId),
+    ) {
+        let idx = node_id.as_u64() as usize;
+        for seg in &self.frozen_outgoing.segments {
+            for &(target, eid) in seg.neighbors(idx) {
+                if self.edge_type_matches(eid, type_ids) {
+                    visit(target, eid);
+                }
+            }
+        }
+        if let Some(entries) = self.outgoing.get(idx) {
+            for &(target, eid) in entries {
+                if self.edge_type_matches(eid, type_ids) {
+                    visit(target, eid);
+                }
+            }
+        }
+    }
+
+    /// Visit each incoming neighbour of `node`, without allocating.
+    /// See [`GraphStore::for_each_outgoing_neighbor`].
+    pub fn for_each_incoming_neighbor(
+        &self,
+        node_id: NodeId,
+        type_ids: Option<&[u16]>,
+        mut visit: impl FnMut(NodeId, EdgeId),
+    ) {
+        let idx = node_id.as_u64() as usize;
+        for seg in &self.frozen_incoming.segments {
+            for &(source, eid) in seg.neighbors(idx) {
+                if self.edge_type_matches(eid, type_ids) {
+                    visit(source, eid);
+                }
+            }
+        }
+        if let Some(entries) = self.incoming.get(idx) {
+            for &(source, eid) in entries {
+                if self.edge_type_matches(eid, type_ids) {
+                    visit(source, eid);
+                }
+            }
+        }
+    }
+
+    /// Compare an edge's interned type against a filter.
+    ///
+    /// `None` accepts every *typed* edge; `Some(ids)` accepts only those ids,
+    /// so `Some(&[])` accepts nothing.
+    ///
+    /// An edge whose type is `EDGE_TYPE_UNSET` is rejected either way. Deleting
+    /// an edge sets its slot to `UNSET`, and the owned-tuple accessors this
+    /// replaced dropped such edges implicitly -- they resolved the type with
+    /// `if let Some(et) = self.get_edge_type(eid)` and skipped the `None`.
+    /// Keeping the exclusion explicit here preserves that, including for the
+    /// wildcard case where a filter-based check would otherwise let a stale
+    /// adjacency entry through.
+    #[inline]
+    fn edge_type_matches(&self, edge_id: EdgeId, type_ids: Option<&[u16]>) -> bool {
+        let id = self
+            .edge_type_ids
+            .get(edge_id.as_u64() as usize)
+            .copied()
+            .unwrap_or(Self::EDGE_TYPE_UNSET);
+        if id == Self::EDGE_TYPE_UNSET {
+            return false;
+        }
+        match type_ids {
+            None => true,
+            Some(ids) => ids.contains(&id),
+        }
+    }
+
     pub fn get_outgoing_edge_targets_owned(&self, node_id: NodeId) -> Vec<(EdgeId, NodeId, NodeId, EdgeType)> {
         let src_idx = node_id.as_u64() as usize;
         let mut result = Vec::new();
@@ -1871,6 +2380,44 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
     }
 
     /// Get all nodes with a specific label
+    /// Remove one property of a node from **both** stores.
+    ///
+    /// A node's properties live in the columnar store and in the per-node row
+    /// map, and reads consult the column first. So removing from one alone
+    /// leaves the value readable, which is what `REMOVE n.prop` was doing
+    /// (#594). Anything that removes a property has to go through here.
+    pub fn remove_node_property(&mut self, node_id: NodeId, key: &str) {
+        self.node_columns.remove_property(node_id.as_u64() as usize, key);
+        if let Some(node) = self.get_node_mut(node_id) {
+            node.remove_property(key);
+        }
+        self.invalidate_statistics_cache();
+    }
+
+    /// Remove one property of an edge from both stores. See
+    /// `remove_node_property`.
+    pub fn remove_edge_property(&mut self, edge_id: EdgeId, key: &str) {
+        self.edge_columns.remove_property(edge_id.as_u64() as usize, key);
+        if let Some(props) = self.get_edge_properties_mut(edge_id) {
+            props.remove(key);
+        }
+        self.invalidate_statistics_cache();
+    }
+
+    /// The set of nodes carrying a label, for membership tests.
+    ///
+    /// Exists so a caller testing many nodes against the same label resolves
+    /// the set once and then probes by `NodeId`. The alternative --
+    /// `get_node(id).has_label(label)` -- costs a `Vec` index, a version-chain
+    /// walk, a 128-byte `Node`, and a `HashSet<Label>` probe that hashes a
+    /// *string*, all per node tested. `ExpandOperator` was doing that once per
+    /// edge visited, and it was 26.7% of a profiled LDBC IC9 run (#592).
+    ///
+    /// `None` means no node carries the label, which matches nothing.
+    pub fn nodes_with_label(&self, label: &Label) -> Option<&HashSet<NodeId>> {
+        self.label_index.get(label)
+    }
+
     pub fn get_nodes_by_label(&self, label: &Label) -> Vec<&Node> {
         self.label_index
             .get(label)
@@ -1992,6 +2539,45 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
     }
 
     /// Invalidate the cached statistics. Called from every mutation path.
+    /// Mark every hierarchy index built on `edge_type` stale (ADR-035 §6).
+    ///
+    /// OEH is a static index: a write to the covering relation invalidates it. The stale
+    /// index is then invisible to the planner, so the query falls back to variable-length
+    /// expansion and stays correct — a wrong-but-fast answer is the one outcome that is
+    /// never acceptable here. The `is_empty` guard keeps this off the hot write path for
+    /// the overwhelmingly common case of a store with no hierarchy declared.
+    #[inline]
+    pub fn invalidate_hierarchies_for_edge_type(&self, edge_type: &EdgeType) {
+        if !self.hierarchy_index.is_empty() {
+            self.hierarchy_index.mark_stale_for_edge_type(edge_type);
+        }
+    }
+
+    /// Mark every hierarchy whose declared measure is `property` stale.
+    #[inline]
+    pub fn invalidate_hierarchies_for_property(&self, property: &str) {
+        if !self.hierarchy_index.is_empty() {
+            self.hierarchy_index.mark_stale_for_property(property);
+        }
+    }
+
+    /// Apply a measure write to any hierarchy that declares `property`, in place.
+    ///
+    /// Only the value changes, not the shape of the poset, so the index absorbs it in
+    /// O(log n) rather than being invalidated (ADR-035 §6, #351). Falls back to marking
+    /// stale for any hierarchy that cannot take the update.
+    #[inline]
+    pub fn update_hierarchies_for_property(
+        &self,
+        node_id: NodeId,
+        property: &str,
+        value: &PropertyValue,
+    ) {
+        if !self.hierarchy_index.is_empty() {
+            self.hierarchy_index.update_measure(node_id, property, value);
+        }
+    }
+
     pub fn invalidate_statistics_cache(&self) {
         *self.statistics_cache.write().unwrap() = None;
     }
@@ -2006,6 +2592,47 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
     /// pathological plans on snapshot-imported graphs.
     ///
     /// Snapshot import calls this after `compact_adjacency()`.
+    /// Finish a bulk load: compact adjacency and rebuild everything the stub
+    /// inserts deliberately skipped.
+    ///
+    /// `create_node_stub` and `create_edge_stub` are fast because they omit
+    /// index and statistics maintenance. That is a good trade only if the
+    /// omitted work is done once at the end, and the failure mode when it is
+    /// not is silent: the data is all present and correct, and only the
+    /// planner is wrong.
+    ///
+    /// That has now happened twice. The edge-type index was missing after
+    /// import until someone noticed `OPTIONAL MATCH` falling back to
+    /// `NodeScan(all)` and timing out; the catalog's triple statistics were
+    /// missing until `estimate_expand_out` was found returning its "1 edge per
+    /// node" default on every imported graph. Both were a rebuild call nobody
+    /// had added to a list that was not written down anywhere.
+    ///
+    /// So the list lives here, and callers take all of it or none. Each step
+    /// no-ops on an empty store, so this is safe to call unconditionally.
+    pub fn finish_bulk_load(&mut self) {
+        self.compact_adjacency();
+        self.rebuild_edge_type_index();
+        self.rebuild_catalog();
+        self.rebuild_vector_index();
+    }
+
+    /// Recompute the catalog from the current store contents.
+    ///
+    /// `create_edge_stub` skips `catalog.on_edge_created` for speed, so a
+    /// bulk-loaded graph has label counts (the node stub does maintain those)
+    /// and **no triple statistics at all**. `estimate_expand_out` then falls
+    /// back to "assume 1 edge per node" -- a 20x under-estimate on a graph
+    /// where each node has 20 outgoing edges, and worse as degree rises.
+    ///
+    /// That is the #303 failure mode in a different statistic: a plan chosen
+    /// from statistics that were never computed. Rebuild after any bulk load.
+    pub fn rebuild_catalog(&mut self) {
+        // The immutable borrow for the scan ends before the assignment.
+        let catalog = GraphCatalog::recompute_full(self);
+        self.catalog = catalog;
+    }
+
     pub fn rebuild_edge_type_index(&mut self) {
         self.edge_type_index.clear();
         let len = self.edge_type_ids.len();
@@ -2061,18 +2688,17 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
                 // in the column store (frozen by DS-07 compaction, which clears inline
                 // props). Read inline first, fall back to columnar — the union covers
                 // both tiers, so large labels (e.g. Problem) are no longer left empty.
+                // Accept a numeric array as well as a Vector: an embedding written with
+                // whole numbers (`[1, 0, 0]`) is a list of integers, not a float vector.
                 let inline = self
                     .get_node(nid)
-                    .and_then(|n| match n.get_property(&key.property_key) {
-                        Some(crate::graph::property::PropertyValue::Vector(v)) => Some(v.clone()),
-                        _ => None,
-                    });
+                    .and_then(|n| n.get_property(&key.property_key).and_then(|p| p.to_vector()));
                 let vec = match inline {
                     Some(v) => Some(v),
-                    None => match self.node_columns.get_property(nid.as_u64() as usize, &key.property_key) {
-                        crate::graph::property::PropertyValue::Vector(v) => Some(v),
-                        _ => None,
-                    },
+                    None => self
+                        .node_columns
+                        .get_property(nid.as_u64() as usize, &key.property_key)
+                        .to_vector(),
                 };
                 if let Some(vec) = vec {
                     vectors.push((nid, vec));
@@ -2083,6 +2709,25 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
                 &key.property_key,
                 &vectors,
             );
+        }
+    }
+
+    /// A property that should be treated as an embedding when *registering* a
+    /// vector index: all-numeric, non-empty, and carrying at least one float.
+    ///
+    /// Deliberately narrower than `PropertyValue::to_vector`, which any write
+    /// path may use because it can only fill an index someone already asked
+    /// for. See the call site for why the two differ.
+    fn embedding_candidate(v: &PropertyValue) -> Option<Vec<f32>> {
+        match v {
+            PropertyValue::Vector(vec) if !vec.is_empty() => Some(vec.clone()),
+            PropertyValue::Array(items)
+                if !items.is_empty()
+                    && items.iter().any(|i| matches!(i, PropertyValue::Float(_))) =>
+            {
+                v.to_vector()
+            }
+            _ => None,
         }
     }
 
@@ -2100,7 +2745,18 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
                 continue;
             }
             for (k, v) in node.properties.iter() {
-                if let PropertyValue::Vector(vec) = v {
+                // Discovery *registers* indices, so it must not treat every
+                // numeric list as an embedding -- `{scores: [1, 2, 3]}` would
+                // get an HNSW index built over it. The rule is the one that was
+                // in force before list literals stopped being coerced to
+                // vectors (#628): all-numeric, non-empty, and containing at
+                // least one float. That keeps exactly the set of properties
+                // that used to arrive here as `Vector`, while an embedding
+                // written as a list literal -- now an `Array` -- is still
+                // found. The *write* paths are deliberately more permissive:
+                // they only fill an index that already exists.
+                if let Some(vec) = Self::embedding_candidate(v) {
+                    let vec = &vec;
                     // Use the MAX length seen for this (label, property): a stray
                     // empty/short embedding must not set the index dimension and
                     // cause every real vector to be skipped on rebuild.
@@ -2152,11 +2808,23 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
             let sample_size = node_ids.len().min(1000);
             let mut property_presence: HashMap<String, usize> = HashMap::new();
             let mut property_distinct: HashMap<String, HashSet<u64>> = HashMap::new();
+            // Observed counts per value, keyed by hash with one representative
+            // value retained, so the most common values can be reported without
+            // holding every distinct value seen.
+            let mut property_values: HashMap<String, HashMap<u64, (PropertyValue, usize)>> =
+                HashMap::new();
 
             for (i, &node_id) in node_ids.iter().enumerate() {
                 if i >= sample_size { break; }
-                if let Some(node) = self.get_node(node_id) {
-                    for (key, val) in &node.properties {
+                // Read the merged view, not `node.properties` alone. A snapshot import
+                // populates only the columnar store, so sampling row storage found *no*
+                // properties at all and produced zero statistics -- leaving every
+                // selectivity estimate on the 10% default. On a large label that made an
+                // index lookup look more expensive than scanning a smaller label, and the
+                // planner anchored on the wrong end of the pattern and scanned it (#303).
+                {
+                    let props = self.node_properties_full(node_id);
+                    for (key, val) in &props {
                         *property_presence.entry(key.clone()).or_insert(0) += 1;
 
                         let hash = {
@@ -2166,6 +2834,15 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
                             hasher.finish()
                         };
                         property_distinct.entry(key.clone()).or_default().insert(hash);
+
+                        let counts = property_values.entry(key.clone()).or_default();
+                        // Bound the working set: once enough distinct values
+                        // have been seen to pick a head from, stop adding new
+                        // ones and only keep counting the ones already tracked.
+                        if counts.len() < MAX_MCV * 8 || counts.contains_key(&hash) {
+                            let slot = counts.entry(hash).or_insert_with(|| (val.clone(), 0));
+                            slot.1 += 1;
+                        }
                     }
                 }
             }
@@ -2173,10 +2850,28 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
             for (prop, count) in &property_presence {
                 let distinct = property_distinct.get(prop).map(|s| s.len()).unwrap_or(0);
                 let selectivity = if distinct > 0 { 1.0 / distinct as f64 } else { 1.0 };
+
+                // Most common values, as a fraction of the non-null
+                // observations for this property.
+                let mut most_common: Vec<(PropertyValue, f64)> = Vec::new();
+                if let Some(counts) = property_values.get(prop) {
+                    let observed = *count as f64;
+                    if observed > 0.0 {
+                        let mut ranked: Vec<&(PropertyValue, usize)> = counts.values().collect();
+                        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+                        most_common = ranked
+                            .into_iter()
+                            .take(MAX_MCV)
+                            .map(|(v, c)| (v.clone(), *c as f64 / observed))
+                            .collect();
+                    }
+                }
+
                 property_stats.insert((label.clone(), prop.clone()), PropertyStats {
                     null_fraction: 1.0 - (*count as f64 / sample_size as f64),
                     distinct_count: distinct,
                     selectivity,
+                    most_common,
                 });
             }
         }
@@ -2550,6 +3245,7 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
         self.edge_type_index.clear();
         self.vector_index = Arc::new(VectorIndexManager::new());
         self.property_index = Arc::new(IndexManager::new());
+        self.hierarchy_index = Arc::new(HierarchyIndexManager::new());
         self.node_columns = ColumnStore::new();
         self.edge_columns = ColumnStore::new();
         self.next_node_id = 1;
@@ -2561,14 +3257,44 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
     // Event Handling
     // ============================================================
 
+    /// The `PropertySet` index update, taking borrowed arguments.
+    ///
+    /// `handle_index_event` needs an owned `IndexEvent` because the same type
+    /// crosses a channel to any subscriber. On the local path there is no
+    /// channel, and building one cost a tenant `String` the handler discards
+    /// (`tenant_id: _`), a `Vec<Label>` of cloned label strings, and clones of
+    /// the key and value -- per property set, on every bulk load (#491).
+    fn apply_property_set(
+        &self,
+        id: NodeId,
+        labels: &std::collections::HashSet<Label>,
+        key: &str,
+        old_value: Option<&PropertyValue>,
+        new_value: &PropertyValue,
+    ) {
+        if let Some(old) = old_value {
+            for label in labels {
+                self.property_index.index_remove(label, key, old, id);
+            }
+        }
+        for label in labels {
+            self.property_index.index_insert(label, key, new_value.clone(), id);
+        }
+        if let Some(vec) = new_value.to_vector() {
+            for label in labels {
+                let _ = self.vector_index.add_vector(label.as_str(), key, id, &vec);
+            }
+        }
+    }
+
     pub fn handle_index_event(&self, event: crate::graph::event::IndexEvent, _tenant_manager: Option<Arc<crate::persistence::TenantManager>>) {
         use crate::graph::event::IndexEvent::*;
         match event {
             NodeCreated { tenant_id: _, id, labels, properties } => {
                 for (key, value) in properties {
-                    if let PropertyValue::Vector(vec) = &value {
+                    if let Some(vec) = value.to_vector() {
                         for label in &labels {
-                            let _ = self.vector_index.add_vector(label.as_str(), &key, id, vec);
+                            let _ = self.vector_index.add_vector(label.as_str(), &key, id, &vec);
                         }
                     }
                     for label in &labels {
@@ -2592,16 +3318,16 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
                 for label in &labels {
                     self.property_index.index_insert(label, &key, new_value.clone(), id);
                 }
-                if let PropertyValue::Vector(vec) = &new_value {
+                if let Some(vec) = new_value.to_vector() {
                     for label in &labels {
-                        let _ = self.vector_index.add_vector(label.as_str(), &key, id, vec);
+                        let _ = self.vector_index.add_vector(label.as_str(), &key, id, &vec);
                     }
                 }
             }
             LabelAdded { tenant_id: _, id, label, properties } => {
                 for (key, value) in properties {
-                    if let PropertyValue::Vector(vec) = &value {
-                        let _ = self.vector_index.add_vector(label.as_str(), &key, id, vec);
+                    if let Some(vec) = value.to_vector() {
+                        let _ = self.vector_index.add_vector(label.as_str(), &key, id, &vec);
                     }
                     self.property_index.index_insert(&label, &key, value.clone(), id);
                 }
@@ -2687,7 +3413,18 @@ NodeDeleted { tenant_id: _, id, labels, properties } => {
         }
 
         // Insert the node
-        self.nodes[idx].push(node);
+        // `Vec` grows 0 -> capacity 4 on first push, and `Node` is 128 bytes, so
+        // the default path allocates 512 B per node for an MVCC version chain
+        // that holds one entry in the overwhelming majority of cases -- 384 B
+        // of it never used. Reserve exactly one; later versions grow normally
+        // from there, which is the rare path (#491).
+        {
+            let versions = &mut self.nodes[idx];
+            if versions.capacity() == 0 {
+                versions.reserve_exact(1);
+            }
+            versions.push(node);
+        }
 
         // Update next_node_id to be higher than any recovered node
         if node_id.as_u64() >= self.next_node_id {

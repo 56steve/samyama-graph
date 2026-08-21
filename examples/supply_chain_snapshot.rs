@@ -19,6 +19,9 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::Instant;
 
+#[path = "common/missing_data.rs"]
+mod missing_data;
+
 fn arg(argv: &[String], name: &str) -> Option<String> {
     argv.iter().position(|a| a == name).and_then(|i| argv.get(i + 1)).cloned()
 }
@@ -35,7 +38,12 @@ fn main() {
     eprintln!("spec : {}", spec_path.display());
 
     let mut s = String::new();
-    File::open(&nodes_path).expect("nodes").read_to_string(&mut s).unwrap();
+    File::open(&nodes_path)
+        .unwrap_or_else(|e| {
+            missing_data::skip("supply-chain nodes file", &nodes_path, &e, "--nodes")
+        })
+        .read_to_string(&mut s)
+        .unwrap();
     let nodes_json: serde_json::Value = serde_json::from_str(&s).expect("nodes json");
     s.clear();
     File::open(&spec_path).expect("spec").read_to_string(&mut s).unwrap();

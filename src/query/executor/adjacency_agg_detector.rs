@@ -195,6 +195,18 @@ pub fn detect(query: &Query, store: &GraphStore) -> Option<AdjacencyAggPattern> 
 
     let (count_alias, count_arg_var, count_distinct) = count_info?;
 
+    // An aggregate with no grouping key is not a per-node degree.
+    //
+    // `MATCH (a)-[:R]->(b) RETURN count(b)` projects only the aggregate, so openCypher
+    // groups on nothing and the answer is a single scalar: the number of matched rows.
+    // `AdjacencyCountAggregateOperator` emits one record *per grouped node*, which for an
+    // ungrouped query is one row per `a` carrying its out-degree — the right numbers
+    // attached to the wrong question (#301). The generic Aggregate path answers this
+    // correctly, so decline and let it.
+    if group_by_items.is_empty() {
+        return None;
+    }
+
     // count(DISTINCT neighbor) is now supported via the operator's
     // with_count_distinct mode (per-group FxHashSet<NodeId> dedup,
     // handles parallel edges + same-neighbor-across-grouped-nodes).
@@ -517,6 +529,19 @@ pub fn detect_with_binding(query: &Query) -> Option<AdjacencyAggWithBindingPatte
     }
 
     let (count_alias, count_arg_var, count_distinct) = count_info?;
+
+    // An aggregate with no grouping key is not a per-node degree.
+    //
+    // `MATCH (a)-[:R]->(b) RETURN count(b)` projects only the aggregate, so openCypher
+    // groups on nothing and the answer is a single scalar: the number of matched rows.
+    // `AdjacencyCountAggregateOperator` emits one record *per grouped node*, which for an
+    // ungrouped query is one row per `a` carrying its out-degree — the right numbers
+    // attached to the wrong question (#301). The generic Aggregate path answers this
+    // correctly, so decline and let it.
+    if group_by_items.is_empty() {
+        return None;
+    }
+
     if count_arg_var != neighbor_var {
         return None;
     }

@@ -1,5 +1,6 @@
 //! HTTP handlers for the Visualizer API
 
+use axum::http::StatusCode;
 use axum::{
     extract::{Query, State, Json, Multipart},
     response::IntoResponse,
@@ -33,10 +34,60 @@ pub struct QueryResponse {
 }
 
 /// Handler for Cypher queries
+/// Merge row-storage and columnar properties for every node in `batch`.
+///
+/// A snapshot import populates only the columnar store, so serializing `node.properties`
+/// directly reported imported nodes as having no properties -- `"properties": {}` -- even
+/// while `n.name` returned a value (#333). Resolving only the nodes in one result keeps
+/// late materialization intact; materializing on every scan would not.
+///
+/// Synchronous, and called while the store guard is already held: a `RecordBatch` is not
+/// `Send`, so awaiting anything after the query has run would make the handler's future
+/// non-`Send`.
+fn merged_node_properties(
+    batch: &crate::query::RecordBatch,
+    store: &crate::graph::GraphStore,
+) -> HashMap<u64, HashMap<String, PropertyValue>> {
+    batch
+        .records
+        .iter()
+        .flat_map(|r| r.values())
+        .filter_map(|v| match v {
+            Value::Node(id, _) => Some(*id),
+            Value::NodeRef(id) => Some(*id),
+            _ => None,
+        })
+        .map(|id| (id.as_u64(), store.node_properties_full(id)))
+        .collect()
+}
+
 pub async fn query_handler(
     State(state): State<AppState>,
     Json(payload): Json<QueryRequest>,
 ) -> impl IntoResponse {
+    // OSS serves exactly one graph. The `graph` argument used to be accepted and then
+    // ignored: every read and write landed in the same store, so two datasets loaded into
+    // what looked like separate graphs silently merged, and the merge was only discoverable
+    // by noticing the row counts were wrong. Rejecting the argument turns that into a loud,
+    // actionable failure at the first query rather than silent corruption of a loaded
+    // dataset. See #366.
+    if payload.graph != default_graph() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "This build serves a single graph ('{}'); the requested graph '{}' does not \
+                     exist and the argument cannot be honoured. Previously it was ignored and \
+                     the query silently ran against '{}', merging datasets. Omit the argument, \
+                     or use a separate data directory per dataset.",
+                    default_graph(), payload.graph, default_graph()
+                ),
+                "graph": payload.graph,
+            })),
+        )
+            .into_response();
+    }
+
     // Check if query is write or read
     let query_upper = payload.query.trim().to_uppercase();
     let is_write = query_upper.starts_with("CREATE") ||
@@ -50,12 +101,22 @@ pub async fn query_handler(
                      query_upper.ends_with(" CREATE") || query_upper.ends_with(" SET") ||
                      query_upper.ends_with(" DELETE") || query_upper.ends_with(" MERGE")));
 
-    let result = if is_write {
+    let (result, full_props) = if is_write {
         let mut store_guard = state.store.write().await;
-        state.engine.execute_mut(&payload.query, &mut *store_guard, &payload.graph)
+        let result = state.engine.execute_mut(&payload.query, &mut *store_guard, &payload.graph);
+        let props = result
+            .as_ref()
+            .map(|b| merged_node_properties(b, &store_guard))
+            .unwrap_or_default();
+        (result, props)
     } else {
         let store_guard = state.store.read().await;
-        state.engine.execute(&payload.query, &*store_guard)
+        let result = state.engine.execute(&payload.query, &*store_guard);
+        let props = result
+            .as_ref()
+            .map(|b| merged_node_properties(b, &store_guard))
+            .unwrap_or_default();
+        (result, props)
     };
 
     match result {
@@ -64,6 +125,13 @@ pub async fn query_handler(
             let mut edges = HashMap::new();
             let mut records = Vec::new();
 
+            // Properties live in row storage and in the columnar store; a snapshot import
+            // populates only the latter, so serializing `node.properties` alone reported
+            // imported nodes as having none -- `"properties": {}` -- while `n.name`
+            // returned a value (#333). Resolve the merged view for the nodes actually in
+            // this result, rather than materializing it on every scan, which would defeat
+            // late materialization.
+
             for record in &batch.records {
                 let mut row = Vec::new();
                 for col in &batch.columns {
@@ -71,10 +139,30 @@ pub async fn query_handler(
                     
                     // Extract graph elements for visualization
                     match val {
+                        Value::Map(entries) => {
+                            row.push(json!(entries
+                                .iter()
+                                .map(|(k, v)| (k.clone(), format!("{v:?}")))
+                                .collect::<std::collections::BTreeMap<_, _>>()));
+                        }
+                        Value::List(items) => {
+                            row.push(serde_json::Value::Array(
+                                items.iter().map(|i| json!(format!("{i:?}"))).collect(),
+                            ));
+                        }
                         Value::Node(id, node) => {
                             let mut properties = serde_json::Map::new();
-                            for (k, v) in &node.properties {
-                                properties.insert(k.clone(), v.to_json());
+                            if let Some(merged) = full_props.get(&id.as_u64()) {
+                                for (k, v) in merged {
+                                    properties.insert(k.clone(), v.to_json());
+                                }
+                            }
+                            // fall back to whatever the value itself carries if the node is
+                            // no longer in the store (e.g. one returned by a DELETE)
+                            if properties.is_empty() {
+                                for (k, v) in &node.properties {
+                                    properties.insert(k.clone(), v.to_json());
+                                }
                             }
                             let node_json = json!({
                                 "id": id.as_u64().to_string(),
@@ -193,8 +281,12 @@ pub async fn schema_handler(
             .label_index_ids(label)
             .and_then(|ids| ids.iter().next())
         {
-            if let Some(node) = store_guard.get_node(sample_id) {
-                for (key, val) in &node.properties {
+            // Merged, not `node.properties`: a snapshot-imported graph keeps
+            // its properties in the columnar store and its row maps are
+            // empty, so reading the row reported "this label has no
+            // properties" for every published `.sgsnap` (#554).
+            if store_guard.get_node(sample_id).is_some() {
+                for (key, val) in &store_guard.node_properties_merged(sample_id) {
                     let prop_type = match val {
                         PropertyValue::String(_) => "String",
                         PropertyValue::Integer(_) => "Integer",
@@ -330,9 +422,12 @@ pub async fn sample_handler(
             if i % stride == 0 {
                 sampled_ids.insert(node.id);
 
-                // Build node JSON with all properties
+                // Merged, not `node.properties`: an imported graph's row
+                // maps are empty and every node came back with `{}` and a
+                // numeric name (#554).
+                let merged = store_guard.node_properties_merged(node.id);
                 let mut props = serde_json::Map::new();
-                for (k, v) in &node.properties {
+                for (k, v) in &merged {
                     props.insert(k.clone(), match v {
                         PropertyValue::String(s) => json!(s),
                         PropertyValue::Integer(i) => json!(i),
@@ -344,10 +439,10 @@ pub async fn sample_handler(
                 }
 
                 // Determine node name (first string property, or id)
-                let name = node.properties.iter()
-                    .find(|(k, _)| k.as_str() == "name" || k.as_str() == "title" || k.as_str() == "label")
-                    .and_then(|(_, v)| match v {
-                        PropertyValue::String(s) => Some(s.clone()),
+                let name = ["name", "title", "label"]
+                    .iter()
+                    .find_map(|k| match merged.get(*k) {
+                        Some(PropertyValue::String(s)) => Some(s.clone()),
                         _ => None,
                     })
                     .unwrap_or_else(|| format!("{}", node.id.as_u64()));
@@ -732,6 +827,111 @@ mod tests {
             .route("/api/status", get(status_handler))
             .with_state(state.clone());
         (app, state)
+    }
+
+    /// A graph whose properties live only in the columnar store, as every
+    /// snapshot-imported graph's do.
+    ///
+    /// Built by exporting and re-importing rather than by poking the store
+    /// directly, so the fixture is the real thing: `import_tenant` writes
+    /// columns and leaves `Node.properties` empty.
+    fn imported_graph() -> GraphStore {
+        use crate::graph::PropertyValue;
+        let mut built = GraphStore::new();
+        for i in 0..5 {
+            let id = built.create_node("Person");
+            let _ = built.set_node_property(
+                "default",
+                id,
+                "name".to_string(),
+                PropertyValue::String(format!("p{i}")),
+            );
+            let _ = built.set_node_property(
+                "default",
+                id,
+                "age".to_string(),
+                PropertyValue::Integer(i),
+            );
+        }
+
+        let mut bytes = Vec::new();
+        crate::snapshot::export_tenant(&built, &mut bytes).expect("export");
+        let mut restored = GraphStore::new();
+        crate::snapshot::import_tenant(&mut restored, bytes.as_slice()).expect("import");
+
+        // The premise of the test: the row maps really are empty.
+        let first = restored.get_node(crate::graph::NodeId::new(1)).expect("node 1");
+        assert!(
+            first.properties.is_empty(),
+            "fixture is wrong: an imported graph should keep properties in columns only"
+        );
+        restored
+    }
+
+    #[tokio::test]
+    async fn schema_lists_properties_of_an_imported_graph() {
+        // Reading `node.properties` here reported "this label has no
+        // properties" for every published .sgsnap (#554).
+        let state = AppState {
+            store: Arc::new(RwLock::new(imported_graph())),
+            engine: Arc::new(QueryEngine::new()),
+            data_path: None,
+            tenant_manager: None,
+            embed_pipeline: None,
+            embed_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        };
+        let app = Router::new()
+            .route("/api/schema", get(schema_handler))
+            .with_state(state);
+
+        let response = app
+            .oneshot(Request::builder().uri("/api/schema").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let person = json["node_types"]
+            .as_array()
+            .and_then(|types| types.iter().find(|t| t["label"] == "Person"))
+            .expect("Person label in schema");
+        let props = person["properties"].as_object().expect("properties object");
+
+        assert_eq!(props.get("name").and_then(|v| v.as_str()), Some("String"), "{json}");
+        assert_eq!(props.get("age").and_then(|v| v.as_str()), Some("Integer"), "{json}");
+    }
+
+    #[test]
+    fn merged_properties_prefer_the_column_over_the_row() {
+        use crate::graph::PropertyValue;
+        // The column holds the current value; the row can hold a superseded
+        // one, so the column wins -- the same order `resolve_property` uses.
+        let mut store = GraphStore::new();
+        let id = store.create_node("N");
+        if let Some(node) = store.get_node_mut(id) {
+            node.set_property("k", PropertyValue::Integer(1));
+            node.set_property("row_only", PropertyValue::Integer(9));
+        }
+        store.set_column_property(id, "k", PropertyValue::Integer(2));
+
+        let merged = store.node_properties_merged(id);
+        assert_eq!(merged.get("k"), Some(&PropertyValue::Integer(2)), "column wins");
+        assert_eq!(
+            merged.get("row_only"),
+            Some(&PropertyValue::Integer(9)),
+            "a row-only property is still returned"
+        );
+    }
+
+    #[test]
+    fn merged_properties_of_an_imported_graph_are_not_empty() {
+        use crate::graph::PropertyValue;
+        let store = imported_graph();
+        let merged = store.node_properties_merged(crate::graph::NodeId::new(1));
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        assert_eq!(merged.get("name"), Some(&PropertyValue::String("p0".to_string())));
+        assert_eq!(merged.get("age"), Some(&PropertyValue::Integer(0)));
     }
 
     /// Helper: send a POST /api/query with the given body and return (status, json).
@@ -1242,13 +1442,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_query_handler_explicit_graph_param() {
-        // When graph field is sent, should use that graph
+    async fn test_query_handler_rejects_non_default_graph() {
+        // This previously asserted OK, on the belief that the graph argument selected a
+        // graph. It never did -- the query ran against the single default store, so two
+        // datasets loaded into different graph names merged with no error (#366). A build
+        // that serves one graph must refuse the argument rather than quietly ignore it.
+        let (app, _state) = test_app();
+
+        let (status, json) = post_query(
+            app,
+            r#"{"query": "MATCH (n) RETURN n", "graph": "test_graph"}"#,
+        ).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["graph"], "test_graph");
+        assert!(
+            json["error"].as_str().unwrap_or_default().contains("single graph"),
+            "error should explain why: {json:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_query_handler_accepts_default_graph_explicitly() {
         let (app, _state) = test_app();
 
         let (status, _json) = post_query(
             app,
-            r#"{"query": "MATCH (n) RETURN n", "graph": "test_graph"}"#,
+            r#"{"query": "MATCH (n) RETURN n", "graph": "default"}"#,
         ).await;
 
         assert_eq!(status, StatusCode::OK);

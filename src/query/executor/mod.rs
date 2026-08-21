@@ -78,11 +78,14 @@
 
 pub mod adjacency_agg_detector;
 pub mod cost_model;
+pub mod hierarchy_detector;
+pub mod hierarchy_ops;
 pub mod semi_join_detector;
 pub mod leapfrog;
 pub mod logical_optimizer;
 pub mod logical_plan;
 pub mod operator;
+pub mod profile;
 pub mod physical_planner;
 pub mod plan_enumerator;
 pub mod planner;
@@ -91,7 +94,7 @@ pub mod record;
 // Export operators - added CreateNodeOperator, CreateEdgeOperator, CartesianProductOperator for CREATE support
 pub use operator::{PhysicalOperator, OperatorBox, OperatorDescription, CreateNodeOperator, CreateEdgeOperator, MatchCreateEdgeOperator, CartesianProductOperator};
 pub use planner::{QueryPlanner, ExecutionPlan, PlannerConfig};
-pub use record::{Record, RecordBatch, Value};
+pub use record::{PropertyCursor, Record, RecordBatch, Value};
 
 use crate::graph::GraphStore;
 use crate::query::ast::Query;
@@ -165,7 +168,146 @@ impl<'a> QueryExecutor<'a> {
         self
     }
 
+    /// Execute a `CALL { ... }` subquery and apply the enclosing query to its rows.
+    ///
+    /// The subquery is parsed into its own `Query` but was never executed -- it
+    /// only ever appeared as a "bail out of this optimisation" flag in the
+    /// detectors -- so `CALL { RETURN 1 AS n } RETURN n` failed with
+    /// `Variable not found: n` (#458). An unsupported construct must raise a
+    /// typed error, not blame the user's variable names.
+    ///
+    /// Only the leading, non-correlated form reaches here: the grammar puts
+    /// `CALL` at the start of a statement, so the importing form
+    /// (`MATCH (x) CALL { WITH x ... }`) still fails at parse time. Shapes that
+    /// cannot be evaluated correctly return an error rather than a partial
+    /// answer -- a wrong row is worse than a refusal.
+    fn execute_call_subquery(&self, query: &Query, inner: &Query) -> ExecutionResult<RecordBatch> {
+        // Planning tells us whether the subquery writes. Say so plainly -- the
+        // read-only-executor message underneath is about internals the caller
+        // did not choose and cannot act on.
+        if self.planner.plan(inner, self.store).map(|p| p.is_write).unwrap_or(false) {
+            return Err(ExecutionError::RuntimeError(
+                "writes inside a CALL {} subquery are not supported".to_string(),
+            ));
+        }
+
+        let inner_batch = self.execute(inner)?;
+
+        // A subquery combined with further pattern matching would need a proper
+        // join against the outer pattern; refuse rather than guess.
+        if !query.match_clauses.is_empty() {
+            return Err(ExecutionError::RuntimeError(
+                "CALL {} subquery followed by MATCH is not supported".to_string(),
+            ));
+        }
+
+        // `CALL { ... }` with nothing after it yields the subquery's own rows.
+        let Some(return_clause) = &query.return_clause else {
+            return Ok(inner_batch);
+        };
+
+        let mut root: OperatorBox = Box::new(operator::MaterializedOperator::new(inner_batch.records));
+
+        if let Some(where_clause) = &query.where_clause {
+            root = Box::new(operator::FilterOperator::new(root, where_clause.predicate.clone()));
+        }
+
+        let projections: Vec<(crate::query::ast::Expression, String)> = return_clause
+            .items
+            .iter()
+            .map(|item| {
+                let alias = item.alias.clone().unwrap_or_else(|| match &item.expression {
+                    crate::query::ast::Expression::Variable(v) => v.clone(),
+                    crate::query::ast::Expression::Property { variable, property } => {
+                        format!("{variable}.{property}")
+                    }
+                    other => format!("{other:?}"),
+                });
+                (item.expression.clone(), alias)
+            })
+            .collect();
+        let columns: Vec<String> = projections.iter().map(|(_, alias)| alias.clone()).collect();
+        root = Box::new(operator::ProjectOperator::new(root, projections));
+
+        let mut records = Vec::new();
+        loop {
+            match root.next(self.store)? {
+                Some(r) => records.push(r),
+                None => break,
+            }
+        }
+
+        if return_clause.distinct {
+            // `dedup_key` sorts by variable name. The previous key was
+            // `format!("{:?}", r.bindings())` over a hash map, so it depended
+            // on iteration order for its identity -- two records binding the
+            // same values could hash to different strings, and did not
+            // deduplicate. It also formatted a string per row.
+            let mut seen = std::collections::HashSet::new();
+            records.retain(|r| seen.insert(r.dedup_key()));
+        }
+
+        Ok(RecordBatch { records, columns })
+    }
+
     /// Execute a read-only query and return results
+    /// One dedup key per record, built from the batch's own column order.
+    fn union_keys(batch: &RecordBatch) -> Vec<Vec<String>> {
+        batch
+            .records
+            .iter()
+            .map(|r| batch.columns.iter().map(|c| format!("{:?}", r.get(c))).collect())
+            .collect()
+    }
+
+    /// Run every branch of a UNION and concatenate the results.
+    ///
+    /// `UNION` deduplicates across the combined result; `UNION ALL` does not.
+    /// openCypher forbids mixing the two in one query and the validator
+    /// rejects that already, so the flavour is read from the first branch.
+    ///
+    /// Column names come from the leading branch: the validator has already
+    /// established that every branch agrees on them, so binding by the first
+    /// branch's names is well-defined.
+    fn execute_union(&self, query: &Query) -> ExecutionResult<RecordBatch> {
+        let mut head = query.clone();
+        let branches = std::mem::take(&mut head.union_queries);
+        let union_all = branches.first().map(|(_, all)| *all).unwrap_or(false);
+
+        // The dedup key is *positional*: each branch's row is keyed by its own
+        // columns in order, not by the leading branch's names. Keying by name
+        // silently mangles a query whose branches project different aliases —
+        // the later branch's rows all look up missing names, key identically,
+        // and collapse into one row rather than deduplicating against the
+        // first branch. Position is what "the same columns" means once the
+        // validator has established the branches line up.
+        let mut batch = self.execute(&head)?;
+        let mut keys: Vec<Vec<String>> = Vec::new();
+        if !union_all {
+            keys.extend(Self::union_keys(&batch));
+        }
+
+        for (branch, _) in &branches {
+            let mut next = self.execute(branch)?;
+            if !union_all {
+                keys.extend(Self::union_keys(&next));
+            }
+            batch.records.append(&mut next.records);
+        }
+
+        if !union_all {
+            // First-seen order, so the result does not depend on hash order.
+            let mut seen: std::collections::HashSet<&Vec<String>> = std::collections::HashSet::new();
+            let mut keep: Vec<bool> = Vec::with_capacity(keys.len());
+            for k in &keys {
+                keep.push(seen.insert(k));
+            }
+            let mut it = keep.into_iter();
+            batch.records.retain(|_| it.next().unwrap_or(true));
+        }
+        Ok(batch)
+    }
+
     pub fn execute(&self, query: &Query) -> ExecutionResult<RecordBatch> {
         // Substitute parameters if any
         let query = if !self.params.is_empty() || !query.params.is_empty() {
@@ -178,6 +320,21 @@ impl<'a> QueryExecutor<'a> {
             query.clone()
         };
         let query = &query;
+
+        if let Some(inner) = &query.call_subquery {
+            return self.execute_call_subquery(query, inner);
+        }
+
+        // UNION / UNION ALL.
+        //
+        // The parser fills `query.union_queries` and the validator checks the
+        // branches agree on column names, but nothing executed them: every
+        // branch after the first was discarded, so `RETURN 1 UNION RETURN 2`
+        // answered `1`. EXPLAIN is deliberately left to the first branch —
+        // describing one branch is more useful than refusing.
+        if !query.union_queries.is_empty() && !query.explain {
+            return self.execute_union(query);
+        }
 
         // Plan the query
         let plan = self.planner.plan(query, self.store)?;
@@ -194,19 +351,44 @@ impl<'a> QueryExecutor<'a> {
             ));
         }
 
-        // Handle PROFILE - execute query and return plan + timing info (like EXPLAIN)
+        // Handle PROFILE - execute the query and attribute the wall-clock to
+        // the operators that spent it (`CH-PROFILE-01`).
+        //
+        // The plan is built and run twice: once with every node wrapped, to
+        // get the breakdown, and once plain, to get a total that instrumenting
+        // did not inflate. Reporting only the instrumented total would
+        // overstate the query's real cost; reporting only the plain one would
+        // leave the breakdown unattributable.
+        //
+        // Instrumented first, plain second, deliberately: the second run reads
+        // a warm cache, so the reported instrumentation overhead is if
+        // anything too high. Flattering our own tooling in a measurement whose
+        // whole purpose is to decide what to optimise is the failure mode
+        // worth designing against.
         if query.profile {
             use crate::graph::PropertyValue;
 
             let plan_text = plan.root.describe().format(0);
-            let start = std::time::Instant::now();
-            let result = self.execute_plan(plan)?;
-            let elapsed = start.elapsed();
+
+            let mut instrumented = plan;
+            let nodes = profile::instrument(&mut instrumented.root);
+            let profiled_start = std::time::Instant::now();
+            let _ = self.execute_plan(instrumented)?;
+            let profiled_elapsed = profiled_start.elapsed();
+
+            let plain_plan = self.planner.plan(query, self.store)?;
+            let plain_start = std::time::Instant::now();
+            let result = self.execute_plan(plain_plan)?;
+            let plain_elapsed = plain_start.elapsed();
 
             let stats = self.store.statistics();
             let profile_text = format!(
-                "{}\n\n--- Profile ---\nRows: {}, Execution time: {:.3}ms\n\n--- Statistics ---\n{}",
-                plan_text, result.records.len(), elapsed.as_secs_f64() * 1000.0, stats.format()
+                "{}\n\n--- Profile ---\nRows: {}, Execution time: {:.3}ms\n\n{}\n--- Statistics ---\n{}",
+                plan_text,
+                result.records.len(),
+                plain_elapsed.as_secs_f64() * 1000.0,
+                profile::report(&nodes, profiled_elapsed, Some(plain_elapsed)),
+                stats.format()
             );
 
             let mut record = Record::new();
@@ -347,6 +529,14 @@ impl<'a> MutQueryExecutor<'a> {
         };
         let query = &query;
 
+        // A read-only `CALL {}` subquery goes through the same path as on the
+        // read executor. HTTP and RESP route every statement through here, so
+        // without this the fix would be invisible to almost every caller.
+        if let Some(inner) = &query.call_subquery {
+            let store_ref: &GraphStore = self.store;
+            return QueryExecutor::new(store_ref).execute_call_subquery(query, inner);
+        }
+
         // Plan the query (need immutable borrow temporarily)
         let plan = {
             let store_ref: &GraphStore = self.store;
@@ -359,8 +549,37 @@ impl<'a> MutQueryExecutor<'a> {
             return Ok(QueryExecutor::explain_plan_with_stats(&plan, Some(store_ref)));
         }
 
-        // Execute the plan with mutable access
-        self.execute_plan_mut(plan)
+        // Execute the plan with mutable access.
+        //
+        // A write statement with no RETURN produces **no rows**. `CREATE ()`
+        // returns an empty result and one new node; it does not return the
+        // node. We were emitting a row per created entity, so 34 TCK
+        // scenarios whose whole assertion is "the result should be empty"
+        // failed while the side effect was perfectly correct.
+        //
+        // The plan is still driven to exhaustion — the rows are what is
+        // discarded, not the work. Discarding earlier would skip the writes.
+        let batch = self.execute_plan_mut(plan)?;
+        // Scoped to **data writes**, not to "any query without a RETURN".
+        // Two neighbours produce rows with no RETURN and must keep doing so:
+        // `CALL … YIELD` yields its results, and DDL such as
+        // `CREATE HIERARCHY INDEX …` reports the encoding it chose. Widening
+        // the rule to every RETURN-less query broke both, which is why it is
+        // written as the narrow thing it actually is.
+        let is_data_write = query.create_clause.is_some()
+            || query.merge_clause.is_some()
+            || !query.set_clauses.is_empty()
+            || !query.remove_clauses.is_empty()
+            || query.delete_clause.is_some()
+            // A clause-pipeline query keeps its writes in `clauses`; the
+            // by-kind fields above are empty for it by construction, so
+            // reading only those would let `CREATE (a) WITH a CREATE (b)`
+            // return a row where `CREATE (a), (b)` correctly returns none.
+            || query.clauses.iter().any(|c| c.is_write());
+        if is_data_write && query.return_clause.is_none() && query.call_clause.is_none() {
+            return Ok(RecordBatch { records: Vec::new(), columns: Vec::new() });
+        }
+        Ok(batch)
     }
 
     fn execute_plan_mut(&mut self, mut plan: ExecutionPlan) -> ExecutionResult<RecordBatch> {
@@ -419,6 +638,19 @@ fn substitute_params(query: &mut Query, params: &HashMap<String, crate::graph::P
 fn substitute_expr(expr: &mut crate::query::ast::Expression, params: &HashMap<String, crate::graph::PropertyValue>) -> ExecutionResult<()> {
     use crate::query::ast::Expression;
     match expr {
+        // Recursed into, not skipped: a parameter inside a collection literal
+        // is still a parameter, and leaving it unsubstituted makes `$x` a
+        // missing variable at evaluation time (#654).
+        Expression::ListExpr(items) => {
+            for e in items.iter_mut() {
+                substitute_expr(e, params);
+            }
+        }
+        Expression::MapExpr(entries) => {
+            for (_, e) in entries.iter_mut() {
+                substitute_expr(e, params);
+            }
+        }
         Expression::Parameter(name) => {
             if let Some(val) = params.get(name.as_str()) {
                 *expr = Expression::Literal(val.clone());
@@ -647,7 +879,11 @@ mod tests {
         let result = executor.execute(&query);
         assert!(result.is_ok(), "MERGE create failed: {:?}", result.err());
         let batch = result.unwrap();
-        assert_eq!(batch.records.len(), 1);
+        // A data write with no RETURN yields no rows — the side effect is the
+        // point. This asserted 1 row and was pinning the older behaviour; 34
+        // TCK scenarios whose entire assertion is "the result should be empty"
+        // were failing against it while the write itself was correct.
+        assert_eq!(batch.records.len(), 0, "MERGE without RETURN returns no rows");
 
         // Verify node was created
         let nodes = store.get_nodes_by_label(&Label::new("Person"));
@@ -2264,7 +2500,8 @@ mod tests {
         let query = parse_query("MATCH (n:Person) RETURN n.name UNION ALL MATCH (m:Person) RETURN m.name").unwrap();
         let executor = QueryExecutor::new(&store);
         let result = executor.execute(&query).unwrap();
-        assert!(result.records.len() >= 2, "Expected at least 2 records from UNION ALL, got {}", result.records.len());
+        assert_eq!(result.records.len(), 4,
+            "UNION ALL over 2 Person nodes is 4 rows; >= 2 cannot tell a working UNION from one that ran only the first branch");
     }
 
     // ========== Batch 5: OPTIONAL MATCH ==========
@@ -2808,7 +3045,8 @@ mod tests {
         let executor = QueryExecutor::new(&store);
         let result = executor.execute(&query).unwrap();
         // UNION should deduplicate: Alice, Bob appear in both halves -> 2 unique results
-        assert!(result.records.len() >= 2, "UNION should return at least 2 results, got {}", result.records.len());
+        assert_eq!(result.records.len(), 2,
+            "UNION deduplicates to 2 here; the old >= 2 also passed when no branch after the first ran");
     }
 
     #[test]
@@ -5466,7 +5704,8 @@ mod tests {
         let q = parse_query("MATCH (n:Person) RETURN n.name UNION ALL MATCH (m:Person) RETURN m.name").unwrap();
         let result = QueryExecutor::new(&store).execute(&q).unwrap();
         // UNION ALL should return at least 2 records
-        assert!(result.records.len() >= 2, "UNION ALL should return at least 2 records, got {}", result.records.len());
+        assert_eq!(result.records.len(), 4,
+            "UNION ALL over 2 Person nodes is 4 rows, not 2");
     }
 
     // --- 4. UNWIND ---
@@ -5703,20 +5942,32 @@ mod tests {
 
     #[test]
     fn test_cov_tointeger_bad() {
+        // Null, not an error: Cypher's `toInteger` yields null for a string it
+        // cannot parse, and erroring made the function unusable for checking
+        // whether input is a number at all (#606).
         let mut store = GraphStore::new();
         let id = store.create_node("I");
         store.set_node_property("default", id, "v", "bad").unwrap();
         let q = parse_query("MATCH (n:I) RETURN toInteger(n.v) AS i").unwrap();
-        assert!(QueryExecutor::new(&store).execute(&q).is_err());
+        let batch = QueryExecutor::new(&store).execute(&q).expect("must not fail the query");
+        assert_eq!(
+            batch.records[0].get("i"),
+            Some(&Value::Property(PropertyValue::Null))
+        );
     }
 
     #[test]
     fn test_cov_tofloat_bad() {
+        // See `test_cov_tointeger_bad` (#606).
         let mut store = GraphStore::new();
         let id = store.create_node("I");
         store.set_node_property("default", id, "v", "xyz").unwrap();
         let q = parse_query("MATCH (n:I) RETURN toFloat(n.v) AS f").unwrap();
-        assert!(QueryExecutor::new(&store).execute(&q).is_err());
+        let batch = QueryExecutor::new(&store).execute(&q).expect("must not fail the query");
+        assert_eq!(
+            batch.records[0].get("f"),
+            Some(&Value::Property(PropertyValue::Null))
+        );
     }
 
     // --- 10. Math: log, exp, rand ---

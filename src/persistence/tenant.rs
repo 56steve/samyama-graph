@@ -20,6 +20,10 @@ pub enum TenantError {
     #[error("Tenant not found: {0}")]
     NotFound(String),
 
+    /// Embed configuration is internally inconsistent
+    #[error("invalid embed config: {0}")]
+    InvalidEmbedConfig(String),
+
     /// Quota exceeded
     #[error("Quota exceeded for tenant {tenant}: {resource}")]
     QuotaExceeded {
@@ -269,8 +273,72 @@ pub struct AutoEmbedConfig {
     pub chunk_overlap: usize,
     /// Vector dimension size
     pub vector_dimension: usize,
-    /// Embedding policies: Label -> `Vec<PropertyKey>`
+    /// Embedding policies: Label -> `Vec<PropertyKey>` (the *source* text properties)
     pub embedding_policies: HashMap<String, Vec<String>>,
+    /// Property the generated embedding is indexed under. Defaults to `embedding`.
+    ///
+    /// Auto-embed used to index the vector under the *source* property (`headline`), while
+    /// users naturally create their vector index on the property the embedding is called
+    /// (`embedding`) -- so the vectors landed in an index nobody queried, and search
+    /// returned nothing (#310). Naming the target explicitly removes the guess.
+    #[serde(default = "default_embedding_property")]
+    pub embedding_property: String,
+}
+
+fn default_embedding_property() -> String {
+    "embedding".to_string()
+}
+
+/// Native output dimension of the embedding models we can recognise.
+///
+/// An embedding model has exactly one output dimension, but `vector_dimension` is set by
+/// hand and independently of `embedding_model`. When the two disagree the mismatch used to
+/// surface far downstream -- as a bare `DimensionMismatch` at insert time, per vector, or
+/// (once auto-embed was routed correctly) as a log line saying every embedding had been
+/// dropped. Recognising the common models lets the contradiction be caught when the config
+/// is set, which is the only point at which it can be fixed cheaply.
+///
+/// Unknown models are not rejected: this is a convenience check, not a whitelist, and
+/// self-hosted or fine-tuned models are legitimate.
+pub fn native_dimension_for_model(model: &str) -> Option<usize> {
+    let normalized = model.trim().to_ascii_lowercase();
+    let name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    let base = name.split(':').next().unwrap_or(name);
+    Some(match base {
+        "text-embedding-3-small" | "text-embedding-ada-002" => 1536,
+        "text-embedding-3-large" => 3072,
+        "nomic-embed-text" => 768,
+        "mxbai-embed-large" => 1024,
+        "all-minilm-l6-v2" | "all-minilm" => 384,
+        "embed-english-v3.0" => 1024,
+        "text-embedding-004" | "embedding-001" => 768,
+        "mock" => 64,
+        _ => return None,
+    })
+}
+
+impl AutoEmbedConfig {
+    /// Check the configuration is internally consistent before it is stored.
+    ///
+    /// Only catches what is knowable at config time: a declared dimension that contradicts
+    /// the model's own. Vectors from *different* models are not comparable even at equal
+    /// dimensions, which this cannot detect -- see #275 for the index-provenance half.
+    pub fn validate(&self) -> Result<(), TenantError> {
+        if self.vector_dimension == 0 {
+            return Err(TenantError::InvalidEmbedConfig(
+                "vector_dimension must be greater than zero".to_string(),
+            ));
+        }
+        if let Some(native) = native_dimension_for_model(&self.embedding_model) {
+            if native != self.vector_dimension {
+                return Err(TenantError::InvalidEmbedConfig(format!(
+                    "model `{}` produces {}-dimensional vectors but vector_dimension is {}; every embedding would be rejected at insert time",
+                    self.embedding_model, native, self.vector_dimension
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Tenant manager - manages all tenants and their resources
@@ -464,6 +532,12 @@ impl TenantManager {
         let tenant = tenants.get_mut(tenant_id)
             .ok_or_else(|| TenantError::NotFound(tenant_id.to_string()))?;
 
+        // Reject a config that cannot work, rather than accepting it and dropping every
+        // embedding it produces.
+        if let Some(cfg) = &config {
+            cfg.validate()?;
+        }
+
         tenant.embed_config = config;
 
         info!("Updated Auto-Embed config for tenant: {}", tenant_id);
@@ -646,6 +720,7 @@ mod tests {
             chunk_overlap: 64,
             vector_dimension: 1536,
             embedding_policies: HashMap::from([("Document".to_string(), vec!["content".to_string()])]),
+            embedding_property: "embedding".to_string(),
         };
 
         manager.update_embed_config("tenant1", Some(embed_config)).unwrap();
@@ -1037,6 +1112,7 @@ mod tests {
             chunk_overlap: 32,
             vector_dimension: 1536,
             embedding_policies: HashMap::new(),
+            embedding_property: "embedding".to_string(),
         };
         let result = manager.update_embed_config("ghost", Some(config));
         assert!(result.is_err());
@@ -1063,6 +1139,7 @@ mod tests {
             chunk_overlap: 32,
             vector_dimension: 768,
             embedding_policies: HashMap::new(),
+            embedding_property: "embedding".to_string(),
         };
         manager.update_embed_config("t1", Some(config)).unwrap();
         assert!(manager.get_tenant("t1").unwrap().embed_config.is_some());
@@ -1185,6 +1262,7 @@ mod tests {
             embedding_policies: HashMap::from([
                 ("Document".to_string(), vec!["content".to_string(), "title".to_string()]),
             ]),
+            embedding_property: "embedding".to_string(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: AutoEmbedConfig = serde_json::from_str(&json).unwrap();
@@ -1331,6 +1409,7 @@ mod tests {
             chunk_overlap: 128,
             vector_dimension: 768,
             embedding_policies: policies,
+            embedding_property: "embedding".to_string(),
         };
 
         assert_eq!(config.provider, LLMProvider::Ollama);
@@ -1462,6 +1541,7 @@ mod tests {
             chunk_overlap: 32,
             vector_dimension: 1536,
             embedding_policies: HashMap::new(),
+            embedding_property: "embedding".to_string(),
         });
         tenant.nlq_config = Some(NLQConfig {
             enabled: true,

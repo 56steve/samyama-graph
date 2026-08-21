@@ -7,6 +7,24 @@ use crate::graph::catalog::GraphCatalog;
 use crate::graph::types::Label;
 use super::logical_plan::{LogicalPlanNode, ExpandDirection};
 
+/// Cost of an index-resident hierarchy roll-up (ADR-035).
+///
+/// The plan produces exactly one row and reads a Fenwick range (O(log n)) or a bounded
+/// number of per-chain suffixes. It is priced just under a property-index lookup (10.0)
+/// because it does strictly less work than one: no key comparison, no node materialization.
+/// The point of an explicit constant is that the planner *compares* it against the
+/// expansion plan rather than overriding — an expansion that is genuinely cheaper (a
+/// two-node subtree) is still allowed to win.
+pub const HIERARCHY_ROLLUP_COST: f64 = 5.0;
+
+/// Cost of enumerating a subtree from the hierarchy index.
+///
+/// Reading the descendant set costs one output row per descendant with no per-edge work
+/// and no visited-set, so it is priced like a small scan rather than an expansion. The
+/// planner has no per-subtree cardinality here; the constant deliberately sits below a
+/// label scan, which is what the expansion alternative degenerates into.
+pub const HIERARCHY_DESCENDANT_SCAN_COST: f64 = 25.0;
+
 /// Estimate the cost (cardinality) of a logical plan using the catalog.
 ///
 /// The cost model is multiplicative:

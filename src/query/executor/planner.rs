@@ -62,7 +62,7 @@ use std::sync::Mutex;
 use crate::query::executor::{
     ExecutionError, ExecutionResult, OperatorBox,
     // Added CreateNodeOperator and CreateNodesAndEdgesOperator for CREATE statement support
-    operator::{NodeScanOperator, FilterOperator, ExpandOperator, ProjectOperator, LimitOperator, SkipOperator, CreateNodeOperator, CreateNodesAndEdgesOperator, CartesianProductOperator, VectorSearchOperator, JoinOperator, LeftOuterJoinOperator, CreateVectorIndexOperator, CreateIndexOperator, CompositeCreateIndexOperator, CreateConstraintOperator, DropIndexOperator, ShowIndexesOperator, ShowConstraintsOperator, ShowLabelsOperator, ShowRelationshipTypesOperator, ShowPropertyKeysOperator, SchemaVisualizationOperator, AlgorithmOperator, IndexScanOperator, AggregateOperator, AggregateType, AggregateFunction, SortOperator, DeleteOperator, SetPropertyOperator, RemovePropertyOperator, UnwindOperator, MergeOperator, ForeachOperator, ShortestPathOperator, VarLengthExpandOperator, WithBarrierOperator, LabelCountOperator, EdgeTypeCountOperator},
+    operator::{NodeScanOperator, NodeByIdOperator, FilterOperator, ExpandOperator, ProjectOperator, LimitOperator, SkipOperator, CreateNodeOperator, CreateNodesAndEdgesOperator, CartesianProductOperator, VectorSearchOperator, JoinOperator, LeftOuterJoinOperator, CreateVectorIndexOperator, CreateIndexOperator, CompositeCreateIndexOperator, CreateConstraintOperator, DropIndexOperator, ShowIndexesOperator, ShowConstraintsOperator, DistinctOperator, ShowLabelsOperator, ShowRelationshipTypesOperator, ShowPropertyKeysOperator, SchemaVisualizationOperator, AlgorithmOperator, IndexScanOperator, AggregateOperator, AggregateType, AggregateFunction, AlgorithmOperator as _AlgoOp, SortOperator, DeleteOperator, SetPropertyOperator, RemovePropertyOperator, LabelMutationOperator, UnwindOperator, MergeOperator, ForeachOperator, ShortestPathOperator, VarLengthExpandOperator, WithBarrierOperator, LabelCountOperator, EdgeTypeCountOperator, EdgeCountOperator},
 };
 use crate::graph::EdgeType;  // Added for CREATE edge support
 use std::collections::{HashMap, HashSet};  // Added for CREATE properties and JOIN logic
@@ -87,6 +87,46 @@ thread_local! {
 /// Returns the rewritten expression and the list of extracted aggregates.
 /// This enables expressions like `round(sum(b.runs) * 100 / sum(b.balls))` where
 /// aggregate calls are nested inside arithmetic or scalar function calls.
+/// Rewrite an `ORDER BY` expression so it refers to the projection's aliases.
+///
+/// Cypher lets a sort key be written either as the alias or as a repeat of the
+/// projected expression:
+///
+/// ```cypher
+/// WITH a.num2 % 3 AS mod, sum(a.num) AS total ORDER BY sum(a.num)   -- this
+/// WITH a.num2 % 3 AS mod, sum(a.num) AS total ORDER BY total        -- and this
+/// ```
+///
+/// are the same query. The second worked; the first did not, and failed in the
+/// worst available way. After the aggregation barrier the rows hold `mod` and
+/// `total` — there is no `a` to evaluate `sum(a.num)` against — so the sort key
+/// evaluated to null for every row, the sort became a no-op, and any `LIMIT`
+/// then took an arbitrary prefix of whatever order the group hash map happened
+/// to produce. Not a stable wrong answer: the same query over the same data
+/// returned **five different results across 100 runs**, of which 36 were right.
+///
+/// The rewrite is by structural equality against the projected expressions,
+/// recursing through compound keys so `ORDER BY sum(x) + 1` resolves too. An
+/// expression that matches nothing is left alone — it may legitimately name a
+/// grouping key that is still in scope, and rewriting it would break that.
+fn rewrite_sort_key(expr: &Expression, projections: &[(Expression, String)]) -> Expression {
+    if let Some((_, alias)) = projections.iter().find(|(projected, _)| projected == expr) {
+        return Expression::Variable(alias.clone());
+    }
+    match expr {
+        Expression::Binary { left, op, right } => Expression::Binary {
+            left: Box::new(rewrite_sort_key(left, projections)),
+            op: op.clone(),
+            right: Box::new(rewrite_sort_key(right, projections)),
+        },
+        Expression::Unary { op, expr } => Expression::Unary {
+            op: op.clone(),
+            expr: Box::new(rewrite_sort_key(expr, projections)),
+        },
+        other => other.clone(),
+    }
+}
+
 fn extract_nested_aggregates(
     expr: &Expression,
     counter: &mut usize,
@@ -167,6 +207,34 @@ fn extract_agg_inner(
                 else_result: else_result.as_ref().map(|e| Box::new(extract_agg_inner(e, counter, aggs))),
             }
         }
+        // An aggregate can appear inside a collection literal or a
+        // comprehension's source: `[v IN collect(a.n) | v]`,
+        // `{k: collect(a)}`. Not recursing here left those to the scalar
+        // evaluator, which has no aggregate handling, so they failed with
+        // "Unknown function: collect" — an error naming one of Cypher's most
+        // ordinary functions (#670).
+        //
+        // Only the *source* of a comprehension is rewritten. Its body runs
+        // once per element with the loop variable bound, so an aggregate there
+        // is a different question and is left alone rather than silently
+        // hoisted out of the loop.
+        Expression::ListExpr(items) => Expression::ListExpr(
+            items.iter().map(|e| extract_agg_inner(e, counter, aggs)).collect(),
+        ),
+        Expression::MapExpr(entries) => Expression::MapExpr(
+            entries
+                .iter()
+                .map(|(k, e)| (k.clone(), extract_agg_inner(e, counter, aggs)))
+                .collect(),
+        ),
+        Expression::ListComprehension { variable, list_expr, filter, map_expr } => {
+            Expression::ListComprehension {
+                variable: variable.clone(),
+                list_expr: Box::new(extract_agg_inner(list_expr, counter, aggs)),
+                filter: filter.clone(),
+                map_expr: map_expr.clone(),
+            }
+        }
         // Leaf expressions and others — no aggregates possible
         other => other.clone(),
     }
@@ -174,6 +242,111 @@ fn extract_agg_inner(
 
 /// An execution plan: a tree of physical operators ready to execute.
 ///
+/// Where the sort sits relative to the projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortPosition {
+    /// Sort runs before `ProjectOperator`, so only the source variables are bound.
+    BeforeProjection,
+    /// Sort runs after `ProjectOperator`, so only the projected aliases are bound.
+    AfterProjection,
+}
+
+/// Rewrite an `ORDER BY` key so it resolves where the sort actually runs.
+///
+/// openCypher lets `ORDER BY` name either a projected alias or an expression over the
+/// variables still in scope. The planner places the sort on one side of the projection or
+/// the other depending on whether the query aggregates, and `ProjectOperator` builds a
+/// *fresh* record containing only the projected aliases. So at the point the sort runs,
+/// exactly one of those two spellings is bound and the other evaluates to null for every
+/// row — which sorts nothing, silently. That is one defect wearing two faces: the alias
+/// form was dead on plain projections (#356) and the expression form was dead on
+/// aggregates (#345).
+///
+/// Moving the sort would only swap which spelling breaks. Instead the key is translated
+/// into whichever form is bound where it lands:
+///
+/// - [`SortPosition::BeforeProjection`] — an alias is replaced by the expression it was
+///   defined as, so `RETURN p.salary AS v ORDER BY v` sorts on `p.salary`.
+/// - [`SortPosition::AfterProjection`] — an expression matching a projected item is
+///   replaced by that item's alias, so `RETURN sum(p.x) AS v ORDER BY sum(p.x)` sorts on
+///   the already-computed `v` rather than re-deriving an aggregate over discarded rows.
+///
+/// A key that matches nothing is returned unchanged: it may legitimately reference a
+/// variable that is still in scope, and rewriting it would be worse than leaving it.
+/// Replace RETURN aliases in a sort key with the expressions they name.
+///
+/// A sort placed *below* the projection sees the pre-projection record, where
+/// the alias does not exist yet — only the expression behind it does. Handling
+/// the bare `ORDER BY alias` case but not `ORDER BY alias.property` made this
+/// silently wrong:
+///
+/// ```cypher
+/// MATCH (a)-[r]->(b) RETURN r AS rel ORDER BY rel.id DESC
+/// ```
+///
+/// `rel` was unbound at sort time, so the key was null on every row, the sort
+/// was a no-op, and the rows came back in scan order — which for a small
+/// fixture is often *already* the ascending order, so the bug reads as a
+/// correct answer until you ask for `DESC` and get the same rows back.
+///
+/// It surfaced through the TCK as a scenario that passed or failed depending
+/// on the process, because after a `WITH` that aggregates, "scan order"
+/// becomes hash order.
+///
+/// Only aliases naming a variable can be substituted into a property access:
+/// if `rel` aliases `count(*)` then `rel.id` means nothing and is left alone
+/// for the executor to reject rather than silently rewritten into something
+/// else.
+fn substitute_aliases(key: &Expression, return_items: &[(Expression, String)]) -> Expression {
+    let aliased = |name: &str| -> Option<&Expression> {
+        return_items.iter().find(|(_, alias)| alias == name).map(|(expr, _)| expr)
+    };
+    match key {
+        Expression::Variable(name) => match aliased(name) {
+            Some(expr) => expr.clone(),
+            None => key.clone(),
+        },
+        Expression::Property { variable, property } => match aliased(variable) {
+            Some(Expression::Variable(underlying)) => Expression::Property {
+                variable: underlying.clone(),
+                property: property.clone(),
+            },
+            _ => key.clone(),
+        },
+        Expression::Binary { left, op, right } => Expression::Binary {
+            left: Box::new(substitute_aliases(left, return_items)),
+            op: op.clone(),
+            right: Box::new(substitute_aliases(right, return_items)),
+        },
+        Expression::Unary { op, expr } => Expression::Unary {
+            op: op.clone(),
+            expr: Box::new(substitute_aliases(expr, return_items)),
+        },
+        Expression::Function { name, args, distinct } => Expression::Function {
+            name: name.clone(),
+            args: args.iter().map(|a| substitute_aliases(a, return_items)).collect(),
+            distinct: *distinct,
+        },
+        other => other.clone(),
+    }
+}
+
+fn resolve_sort_key(
+    key: &Expression,
+    return_items: &[(Expression, String)],
+    position: SortPosition,
+) -> Expression {
+    match position {
+        SortPosition::BeforeProjection => substitute_aliases(key, return_items),
+        SortPosition::AfterProjection => {
+            if let Some((_, alias)) = return_items.iter().find(|(expr, _)| expr == key) {
+                return Expression::Variable(alias.clone());
+            }
+            key.clone()
+        }
+    }
+}
+
 /// The `root` field holds the top-level operator (typically a `ProjectOperator` or
 /// `LimitOperator`). Calling `root.next(store)` begins the Volcano pull-based execution,
 /// cascading `next()` calls down the operator tree until a leaf scan produces a record.
@@ -282,6 +455,164 @@ impl QueryPlanner {
         &self.config
     }
 
+    /// Build the physical plan for a detected hierarchy rewrite (ADR-035 §8).
+    ///
+    /// Both shapes cost far less than the expansion they replace, so the cost recorded
+    /// here is the index cost rather than a placeholder: a roll-up is O(log n) in
+    /// nested-set mode, and a descendant scan is one output row per descendant with no
+    /// per-edge work and no visited-set.
+    fn plan_hierarchy_rewrite(
+        &self,
+        rewrite: super::hierarchy_detector::HierarchyRewrite,
+    ) -> ExecutionPlan {
+        use super::hierarchy_detector::{DrivenOutput, HierarchyRewrite, OrderTestOutput};
+        match rewrite {
+            HierarchyRewrite::HierarchyDriven {
+                index_name,
+                root,
+                hier_var,
+                fact_var,
+                fact_labels,
+                edge_type,
+                to_fact,
+                output,
+            } => {
+                // Enumerate the subtree from the index, then walk the relationship
+                // backwards into the fact table. Facts outside the subtree are never
+                // visited, where the default plan scans all of them and discards most.
+                let scan: OperatorBox =
+                    Box::new(super::hierarchy_ops::HierarchyDescendantScanOperator::new(
+                        index_name,
+                        root,
+                        hier_var.clone(),
+                    ));
+                let expand: OperatorBox = Box::new(
+                    ExpandOperator::new(
+                        scan,
+                        hier_var,
+                        fact_var.clone(),
+                        None,
+                        vec![edge_type],
+                        to_fact,
+                    )
+                    .with_target_labels(fact_labels),
+                );
+                let (agg, alias) = match output {
+                    DrivenOutput::Count { alias, distinct } => (
+                        AggregateFunction {
+                            func: AggregateType::Count,
+                            expr: Expression::Variable(fact_var),
+                            alias: alias.clone(),
+                            distinct,
+                        },
+                        alias,
+                    ),
+                    DrivenOutput::Sum { alias, property } => (
+                        AggregateFunction {
+                            func: AggregateType::Sum,
+                            expr: Expression::Property {
+                                variable: fact_var,
+                                property,
+                            },
+                            alias: alias.clone(),
+                            distinct: false,
+                        },
+                        alias,
+                    ),
+                };
+                ExecutionPlan {
+                    root: Box::new(AggregateOperator::new(expand, Vec::new(), vec![agg])),
+                    output_columns: vec![alias],
+                    is_write: false,
+                    candidates_evaluated: 1,
+                    chosen_plan_cost: super::cost_model::HIERARCHY_DESCENDANT_SCAN_COST,
+                    candidate_costs: Vec::new(),
+                }
+            }
+            HierarchyRewrite::OrderTest {
+                index_name,
+                root,
+                var,
+                labels,
+                negated,
+                output,
+            } => {
+                // Scan the tested side once and filter it with an O(1) interval check,
+                // instead of evaluating `subsumes()` as a generic expression per row.
+                let scan: OperatorBox = Box::new(NodeScanOperator::new(var.clone(), labels));
+                let filtered: OperatorBox =
+                    Box::new(super::hierarchy_ops::HierarchyOrderTestOperator::new(
+                        scan,
+                        index_name,
+                        var.clone(),
+                        root,
+                        negated,
+                    ));
+                match output {
+                    OrderTestOutput::Count(alias) => ExecutionPlan {
+                        root: Box::new(AggregateOperator::new(
+                            filtered,
+                            Vec::new(),
+                            vec![AggregateFunction {
+                                func: AggregateType::Count,
+                                expr: Expression::Variable(var),
+                                alias: alias.clone(),
+                                distinct: false,
+                            }],
+                        )),
+                        output_columns: vec![alias],
+                        is_write: false,
+                        candidates_evaluated: 1,
+                        chosen_plan_cost: super::cost_model::HIERARCHY_DESCENDANT_SCAN_COST,
+                        candidate_costs: Vec::new(),
+                    },
+                    OrderTestOutput::Nodes => ExecutionPlan {
+                        root: filtered,
+                        output_columns: vec![var],
+                        is_write: false,
+                        candidates_evaluated: 1,
+                        chosen_plan_cost: super::cost_model::HIERARCHY_DESCENDANT_SCAN_COST,
+                        candidate_costs: Vec::new(),
+                    },
+                }
+            }
+            HierarchyRewrite::Rollup {
+                index_name,
+                root,
+                op,
+                alias,
+            } => ExecutionPlan {
+                root: Box::new(super::hierarchy_ops::HierarchyRollupOperator::new(
+                    index_name,
+                    root,
+                    op,
+                    alias.clone(),
+                )),
+                output_columns: vec![alias],
+                is_write: false,
+                candidates_evaluated: 1,
+                chosen_plan_cost: super::cost_model::HIERARCHY_ROLLUP_COST,
+                candidate_costs: Vec::new(),
+            },
+            HierarchyRewrite::DescendantScan {
+                index_name,
+                root,
+                var,
+            } => ExecutionPlan {
+                root: Box::new(super::hierarchy_ops::HierarchyDescendantScanOperator::new(
+                    index_name,
+                    root,
+                    var.clone(),
+                )),
+                output_columns: vec![var],
+                is_write: false,
+                candidates_evaluated: 1,
+                chosen_plan_cost: super::cost_model::HIERARCHY_DESCENDANT_SCAN_COST,
+                candidate_costs: Vec::new(),
+            },
+        }
+    }
+
     /// Invalidate the plan cache (e.g., after CREATE INDEX or schema change)
     pub fn invalidate_cache(&self) {
         self.cache_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -289,13 +620,219 @@ impl QueryPlanner {
     }
 
     /// Plan a query
+    /// Plan a query, then apply `RETURN DISTINCT` if the query asked for it.
+    ///
+    /// The deduplication is applied here, at the single point every planning path funnels
+    /// through, rather than inside the dozen-odd places that build a `ProjectOperator`.
+    /// That matters because several of those paths are specialized fast plans
+    /// (adjacency-count aggregation, hierarchy rewrites, label-count caches) that were
+    /// each individually capable of dropping the flag on the floor — which is how
+    /// `RETURN DISTINCT` came to be a complete no-op (#311). One choke point cannot
+    /// forget.
+    /// Reject non-literal property values where they are not yet evaluated.
+    ///
+    /// CREATE evaluates them per row; MATCH and MERGE patterns do not. Until they do, a
+    /// pattern carrying one has to be an error: silently dropping the constraint means
+    /// `MATCH (p:P {n: x})` returns every `:P` rather than the matching one, which looks
+    /// like a working query returning too much.
+    fn reject_unevaluated_property_exprs(query: &Query) -> ExecutionResult<()> {
+        let complain = |clause: &str, key: &str| {
+            ExecutionError::PlanningError(format!(
+                "{clause} does not yet support a non-literal property value (`{key}`); use a WHERE comparison instead"
+            ))
+        };
+
+        for mc in &query.match_clauses {
+            for path in &mc.pattern.paths {
+                if let Some(key) = path.start.property_exprs.as_ref().and_then(|e| e.keys().next()) {
+                    return Err(complain("MATCH", key));
+                }
+                for seg in &path.segments {
+                    if let Some(key) = seg.node.property_exprs.as_ref().and_then(|e| e.keys().next()) {
+                        return Err(complain("MATCH", key));
+                    }
+                    if let Some(key) = seg.edge.property_exprs.as_ref().and_then(|e| e.keys().next()) {
+                        return Err(complain("MATCH", key));
+                    }
+                }
+            }
+        }
+
+        // A clause-pipeline query keeps its clauses here and leaves the fields
+        // above empty, so the checks above see nothing. Missing this let
+        // `UNWIND ['a','b','a'] AS x MERGE (n:N {v: x})` create **one** node
+        // instead of two: the property is an expression, MERGE matched on the
+        // label alone, and every row found the first `:N`. The established
+        // path had refused that query for exactly this reason since #311's
+        // lesson — a new path does not inherit an old guard.
+        for clause in &query.clauses {
+            // MERGE resolves its property expressions against the row now
+            // (#642), so only MATCH is still restricted here.
+            let (label, pattern) = match clause {
+                crate::query::ast::Clause::Match(m) => ("MATCH", &m.pattern),
+                _ => continue,
+            };
+            for path in &pattern.paths {
+                if let Some(key) = path.start.property_exprs.as_ref().and_then(|e| e.keys().next()) {
+                    return Err(complain(label, key));
+                }
+                for seg in &path.segments {
+                    if let Some(key) = seg.node.property_exprs.as_ref().and_then(|e| e.keys().next()) {
+                        return Err(complain(label, key));
+                    }
+                    if let Some(key) = seg.edge.property_exprs.as_ref().and_then(|e| e.keys().next()) {
+                        return Err(complain(label, key));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Variables that exist only *above* the match pipeline, and so cannot be referenced by
+    /// a predicate evaluated during match planning.
+    ///
+    /// Two sources, both of which bind their variables in an operator that sits on top of
+    /// the matches: a leading UNWIND, and a `CALL ... YIELD`. A predicate mentioning one of
+    /// these must be left to the top-level WHERE filter, which runs after both are joined
+    /// in. Assigning it to a MATCH instead puts the filter underneath the operator that
+    /// binds the variable, and the query dies with "Variable not found" even though the
+    /// same variable projects fine in RETURN (#429).
+    /// Whether the query has an `UNWIND` anywhere, in either slot the parser
+    /// uses for one.
+    ///
+    /// A leading `UNWIND` is `query.unwind_clause` when a single `WITH`
+    /// follows, and the *first extra stage's* unwind when two or more do. Four
+    /// early branches -- the CREATE-only path, the standalone-RETURN path, the
+    /// leading-FOREACH path and the "no clauses at all" error -- tested only
+    /// the first slot, so `UNWIND [1,2] AS x WITH x WHERE x > 1 WITH ... RETURN`
+    /// was planned as a standalone RETURN and the `UNWIND` vanished from the
+    /// plan entirely (#572).
+    fn has_any_unwind(query: &Query) -> bool {
+        query.unwind_clause.is_some()
+            || query
+                .extra_with_stages
+                .iter()
+                .any(|(_, unwind, _, _)| unwind.is_some())
+    }
+
+    fn late_bound_variables(query: &Query) -> HashSet<String> {
+        let mut vars = HashSet::new();
+        if query.unwind_leading {
+            if let Some(u) = &query.unwind_clause {
+                vars.insert(u.variable.clone());
+            }
+        }
+        if let Some(call) = &query.call_clause {
+            for item in &call.yield_items {
+                vars.insert(item.alias.clone().unwrap_or_else(|| item.name.clone()));
+            }
+        }
+        vars
+    }
+
     pub fn plan(&self, query: &Query, store: &GraphStore) -> ExecutionResult<ExecutionPlan> {
+        // A query parsed as a clause sequence has empty by-kind fields — it is
+        // there precisely because they cannot represent it. Planning it through
+        // the established path would read those empty fields as "no MATCH, no
+        // CREATE" and answer a different query, which is worse than the parse
+        // error it replaced. Until `plan_clause_pipeline` covers a shape, the
+        // engine says so.
+        // Checked for *both* paths. It reads `query.clauses` as well as the
+        // by-kind fields, so a pipeline query cannot slip a pattern carrying an
+        // unevaluated property expression past it.
+        Self::reject_unevaluated_property_exprs(query)?;
+        if query.needs_clause_pipeline {
+            return self.plan_clause_pipeline(query, store);
+        }
+        // `DISTINCT` is inserted inside `plan_inner`, below SKIP and LIMIT.
+        // Wrapping the finished plan here put it *above* them, so `LIMIT n`
+        // took n duplicate-bearing rows and DISTINCT then collapsed them --
+        // `RETURN DISTINCT p.city LIMIT 3` returned one row (#522).
+        self.plan_inner(query, store)
+    }
+
+    fn plan_inner(&self, query: &Query, store: &GraphStore) -> ExecutionResult<ExecutionPlan> {
         // Handle SHOW INDEXES
         if query.show_indexes {
             return Ok(ExecutionPlan {
                 root: Box::new(ShowIndexesOperator::new()),
                 output_columns: vec!["label".to_string(), "property".to_string(), "type".to_string()],
                 is_write: false, candidates_evaluated: 0, chosen_plan_cost: 0.0, candidate_costs: Vec::new(),
+            });
+        }
+
+        // Handle SHOW HIERARCHY INDEXES (ADR-035)
+        if query.show_hierarchy_indexes {
+            return Ok(ExecutionPlan {
+                root: Box::new(super::hierarchy_ops::ShowHierarchyIndexesOperator::new()),
+                output_columns: super::hierarchy_ops::hierarchy_info_columns(),
+                is_write: false, candidates_evaluated: 0, chosen_plan_cost: 0.0, candidate_costs: Vec::new(),
+            });
+        }
+
+        // Handle CREATE HIERARCHY INDEX (ADR-035)
+        if let Some(clause) = &query.create_hierarchy_index_clause {
+            let mut spec = crate::index::hierarchy::HierarchySpec::new(
+                clause.name.clone(),
+                clause
+                    .edge_types
+                    .iter()
+                    .map(|t| crate::graph::types::EdgeType::new(t.as_str()))
+                    .collect(),
+            );
+            spec.reverse = clause.reverse;
+            if let Some(prop) = &clause.measure_property {
+                // An unrecognized aggregate name is rejected here rather than silently
+                // dropped: a user who asks for `AGGREGATE avg` should learn that the index
+                // does not support it, not get an index that quietly lacks it.
+                let mut ops = Vec::new();
+                for name in &clause.aggregates {
+                    match crate::index::hierarchy::RollupOp::parse(name) {
+                        Some(op) => ops.push(op),
+                        None => {
+                            return Err(ExecutionError::RuntimeError(format!(
+                                "unsupported hierarchy aggregate '{}': expected sum, count, min or max",
+                                name
+                            )))
+                        }
+                    }
+                }
+                if ops.is_empty() {
+                    ops.push(crate::index::hierarchy::RollupOp::Sum);
+                }
+                spec = spec.with_measure(
+                    clause
+                        .measure_label
+                        .as_ref()
+                        .map(|l| crate::graph::types::Label::new(l.as_str())),
+                    prop.clone(),
+                    ops,
+                );
+            }
+            return Ok(ExecutionPlan {
+                root: Box::new(super::hierarchy_ops::CreateHierarchyIndexOperator::new(spec)),
+                output_columns: super::hierarchy_ops::hierarchy_info_columns(),
+                is_write: true, candidates_evaluated: 0, chosen_plan_cost: 0.0, candidate_costs: Vec::new(),
+            });
+        }
+
+        // Handle DROP HIERARCHY INDEX
+        if let Some(name) = &query.drop_hierarchy_index {
+            return Ok(ExecutionPlan {
+                root: Box::new(super::hierarchy_ops::DropHierarchyIndexOperator::new(name.clone())),
+                output_columns: vec![],
+                is_write: true, candidates_evaluated: 0, chosen_plan_cost: 0.0, candidate_costs: Vec::new(),
+            });
+        }
+
+        // Handle REBUILD HIERARCHY INDEX
+        if let Some(name) = &query.rebuild_hierarchy_index {
+            return Ok(ExecutionPlan {
+                root: Box::new(super::hierarchy_ops::RebuildHierarchyIndexOperator::new(name.clone())),
+                output_columns: super::hierarchy_ops::hierarchy_info_columns(),
+                is_write: true, candidates_evaluated: 0, chosen_plan_cost: 0.0, candidate_costs: Vec::new(),
             });
         }
 
@@ -376,6 +913,13 @@ impl QueryPlanner {
             }
         }
 
+        // ADR-035: answer a reflexive subtree aggregate or enumeration from the OEH
+        // hierarchy index. The detector is conservative — when it returns Some, the
+        // rewrite is answer-preserving and only the cost changes.
+        if let Some(rewrite) = super::hierarchy_detector::detect(query, store) {
+            return Ok(self.plan_hierarchy_rewrite(rewrite));
+        }
+
         // ADR-017 Phase 1: recognize the adjacency-count-aggregate shape before
         // the generic planner runs. The detector's constraints are conservative
         // enough that when it returns Some, the specialized plan is always
@@ -396,8 +940,17 @@ impl QueryPlanner {
             return self.plan_aggregate_then_expand(query, pat);
         }
 
-        // Handle MERGE-only statement (no MATCH needed)
-        if query.match_clauses.is_empty() && query.call_clause.is_none() {
+        // Handle MERGE-only statement (no MATCH needed).
+        //
+        // A leading UNWIND is excluded for the same reason as the CREATE-only
+        // branch below: `UNWIND [...] AS x MERGE (n:N {v: x})` has no MATCH but
+        // is still row-driven, and planning it here runs the MERGE once with
+        // nothing bound. It falls through to the general path, where the
+        // Unwind feeds the merge.
+        if query.match_clauses.is_empty()
+            && query.call_clause.is_none()
+            && !Self::has_any_unwind(query)
+        {
             if let Some(merge_clause) = &query.merge_clause {
                 let on_create: Vec<(String, String, Expression)> = merge_clause.on_create_set.iter()
                     .map(|s| (s.variable.clone(), s.property.clone(), s.value.clone()))
@@ -405,25 +958,44 @@ impl QueryPlanner {
                 let on_match: Vec<(String, String, Expression)> = merge_clause.on_match_set.iter()
                     .map(|s| (s.variable.clone(), s.property.clone(), s.value.clone()))
                     .collect();
+                let on_create_labels: Vec<(String, Vec<Label>)> = merge_clause.on_create_labels.iter()
+                    .map(|l| (l.variable.clone(), l.labels.clone()))
+                    .collect();
+                let on_match_labels: Vec<(String, Vec<Label>)> = merge_clause.on_match_labels.iter()
+                    .map(|l| (l.variable.clone(), l.labels.clone()))
+                    .collect();
 
                 let mut operator: OperatorBox = Box::new(MergeOperator::new(
                     merge_clause.pattern.clone(),
                     on_create,
                     on_match,
+                    on_create_labels,
+                    on_match_labels,
                 ));
+
+                // A bare `SET` after MERGE applies on both branches, unlike ON CREATE /
+                // ON MATCH. It parsed but was dropped here, so `MERGE (m) SET m.x = 1`
+                // silently left the property unset.
+                if !query.set_clauses.is_empty() {
+                    let items: Vec<(String, String, Expression)> = query
+                        .set_clauses
+                        .iter()
+                        .flat_map(|sc| sc.items.iter())
+                        .map(|item| {
+                            (item.variable.clone(), item.property.clone(), item.value.clone())
+                        })
+                        .collect();
+                    operator = Box::new(SetPropertyOperator::new(operator, items));
+                }
 
                 let mut output_columns = Vec::new();
                 if let Some(return_clause) = &query.return_clause {
                     let projections: Vec<(Expression, String)> = return_clause.items.iter().enumerate().map(|(i, item)| {
-                        let alias = item.alias.clone().unwrap_or_else(|| match &item.expression {
-                            Expression::Variable(v) => v.clone(),
-                            Expression::Property { variable, property } => format!("{}.{}", variable, property),
-                            _ => format!("col_{}", i),
-                        });
+                        let alias = item.column_name(i);
                         output_columns.push(alias.clone());
                         (item.expression.clone(), alias)
                     }).collect();
-                    operator = Box::new(ProjectOperator::new(operator, projections));
+                            operator = Box::new(ProjectOperator::new(operator, projections));
                 }
 
                 return Ok(ExecutionPlan {
@@ -434,19 +1006,23 @@ impl QueryPlanner {
             }
         }
 
-        // Handle CREATE-only queries (no MATCH/CALL required)
-        if query.match_clauses.is_empty() && query.call_clause.is_none() {
+        // Handle CREATE-only queries (no MATCH/CALL required).
+        //
+        // A leading UNWIND is excluded: `UNWIND $rows AS row CREATE (:N {id: row.id})` has
+        // no MATCH but is still row-driven, and planning it as a CREATE-only statement runs
+        // it once with nothing bound. It falls through to the general pipeline, where the
+        // Unwind feeds the create.
+        if query.match_clauses.is_empty()
+            && query.call_clause.is_none()
+            && !Self::has_any_unwind(query)
+        {
             if let Some(create_clause) = &query.create_clause {
                 let mut plan = self.plan_create_only(create_clause)?;
                 // CY-12: Wrap with ProjectOperator if RETURN clause is present
                 if let Some(return_clause) = &query.return_clause {
                     let mut output_columns = Vec::new();
                     let projections: Vec<(Expression, String)> = return_clause.items.iter().enumerate().map(|(i, item)| {
-                        let alias = item.alias.clone().unwrap_or_else(|| match &item.expression {
-                            Expression::Variable(v) => v.clone(),
-                            Expression::Property { variable, property } => format!("{}.{}", variable, property),
-                            _ => format!("col_{}", i),
-                        });
+                        let alias = item.column_name(i);
                         output_columns.push(alias.clone());
                         (item.expression.clone(), alias)
                     }).collect();
@@ -461,7 +1037,7 @@ impl QueryPlanner {
 
                 // WITH projection: bind expressions to aliases
                 let with_projections: Vec<(Expression, String)> = with_clause.items.iter().enumerate().map(|(i, item)| {
-                    let alias = item.alias.clone().unwrap_or_else(|| format!("col_{}", i));
+                    let alias = item.column_name(i);
                     (item.expression.clone(), alias)
                 }).collect();
 
@@ -473,11 +1049,7 @@ impl QueryPlanner {
                 // RETURN projection: project from WITH-bound variables
                 let mut output_columns = Vec::new();
                 let return_projections: Vec<(Expression, String)> = return_clause.items.iter().enumerate().map(|(i, item)| {
-                    let alias = item.alias.clone().unwrap_or_else(|| match &item.expression {
-                        Expression::Variable(v) => v.clone(),
-                        Expression::Property { variable, property } => format!("{}.{}", variable, property),
-                        _ => format!("col_{}", i),
-                    });
+                    let alias = item.column_name(i);
                     output_columns.push(alias.clone());
                     (item.expression.clone(), alias)
                 }).collect();
@@ -491,17 +1063,17 @@ impl QueryPlanner {
                 });
             }
 
-            // CY-30: Standalone RETURN without MATCH/CREATE (e.g., RETURN 1+2, RETURN sin(0.5))
+            // CY-30: Standalone RETURN without MATCH/CREATE (e.g., RETURN 1+2, RETURN sin(0.5)).
+            // A leading UNWIND also has no MATCH, but it is *not* a single-row projection --
+            // it must fall through to the general pipeline so the Unwind, and any
+            // aggregation over it, get planned.
+            if !Self::has_any_unwind(query) {
             if let Some(return_clause) = &query.return_clause {
                 // Single-row operator that emits one empty record for projection
                 use crate::query::executor::operator::SingleRowOperator;
                 let mut output_columns = Vec::new();
                 let projections: Vec<(Expression, String)> = return_clause.items.iter().enumerate().map(|(i, item)| {
-                    let alias = item.alias.clone().unwrap_or_else(|| match &item.expression {
-                        Expression::Variable(v) => v.clone(),
-                        Expression::Property { variable, property } => format!("{}.{}", variable, property),
-                        _ => format!("col_{}", i),
-                    });
+                    let alias = item.column_name(i);
                     output_columns.push(alias.clone());
                     (item.expression.clone(), alias)
                 }).collect();
@@ -517,10 +1089,47 @@ impl QueryPlanner {
                     is_write: false, candidates_evaluated: 0, chosen_plan_cost: 0.0, candidate_costs: Vec::new(),
                 });
             }
+            }
 
-            return Err(ExecutionError::PlanningError(
-                "Query must have at least one MATCH, CALL, CREATE, or RETURN clause".to_string()
-            ));
+            // A leading FOREACH has no pattern to drive it, so it runs against a
+            // single empty row -- the same way a bare RETURN does. The loop
+            // variable is bound per element inside ForeachOperator, so nothing
+            // upstream needs to supply bindings.
+            if query.foreach_clause.is_some() && !Self::has_any_unwind(query) {
+                let foreach_clause = query.foreach_clause.as_ref().expect("checked above");
+                let mut set_items = Vec::new();
+                for set_clause in &foreach_clause.set_clauses {
+                    for item in &set_clause.items {
+                        set_items.push((item.variable.clone(), item.property.clone(), item.value.clone()));
+                    }
+                }
+                let create_patterns: Vec<Pattern> = foreach_clause
+                    .create_clauses
+                    .iter()
+                    .map(|c| c.pattern.clone())
+                    .collect();
+                let root: OperatorBox = Box::new(ForeachOperator::new(
+                    Box::new(crate::query::executor::operator::SingleRowOperator::new()),
+                    foreach_clause.variable.clone(),
+                    foreach_clause.expression.clone(),
+                    set_items,
+                    create_patterns,
+                ));
+                return Ok(ExecutionPlan {
+                    root,
+                    output_columns: Vec::new(),
+                    is_write: true,
+                    candidates_evaluated: 0,
+                    chosen_plan_cost: 0.0,
+                    candidate_costs: Vec::new(),
+                });
+            }
+
+            if !Self::has_any_unwind(query) {
+                return Err(ExecutionError::PlanningError(
+                    "Query must have at least one MATCH, CALL, CREATE, or RETURN clause".to_string()
+                ));
+            }
         }
 
         let mut operator: Option<OperatorBox> = None;
@@ -542,17 +1151,10 @@ impl QueryPlanner {
         let post_with_clauses = &query.match_clauses[split..];
 
         // Pre-compute variable sets for each pre-WITH MATCH clause
-        let pre_match_var_sets: Vec<HashSet<String>> = pre_with_clauses.iter().map(|mc| {
-            let mut vars = HashSet::new();
-            for path in &mc.pattern.paths {
-                if let Some(v) = &path.start.variable { vars.insert(v.clone()); }
-                for seg in &path.segments {
-                    if let Some(v) = &seg.node.variable { vars.insert(v.clone()); }
-                    if let Some(v) = &seg.edge.variable { vars.insert(v.clone()); }
-                }
-            }
-            vars
-        }).collect();
+        let pre_match_var_sets: Vec<HashSet<String>> = pre_with_clauses
+            .iter()
+            .map(|mc| Self::clause_variables(&mc.pattern))
+            .collect();
 
         // Decompose WHERE clause: assign predicates to MATCH clauses or cross-MATCH
         let pre_where_preds = query.where_clause.as_ref()
@@ -561,9 +1163,85 @@ impl QueryPlanner {
         let mut per_match_where: Vec<Option<WhereClause>> = vec![None; pre_with_clauses.len()];
         let mut cross_match_predicates: Vec<Expression> = Vec::new();
 
+        // See the matching guard in the WITH-stage decomposition below: a predicate that
+        // references a leading UNWIND's variable cannot run during match planning, because
+        // the Unwind operator that binds it sits above the matches. The top-level WHERE
+        // filter re-applies the full predicate after the Unwind, so dropping it here loses
+        // nothing.
+        let late_bound_pre = Self::late_bound_variables(query);
+
+        // Predicates deferred past match planning because they name a leading
+        // UNWIND's variable. Kept rather than dropped: the claim above -- that
+        // the top-level WHERE re-applies them -- holds only when there is no
+        // WITH, because that filter is skipped once a barrier exists. With a
+        // WITH they were being discarded, so
+        // `UNWIND [1,2,3] AS x MATCH (p) WHERE p.n = x WITH ... RETURN ...`
+        // returned a cross product instead of the join (#572).
+        let mut late_bound_predicates: Vec<Expression> = Vec::new();
+        // Predicates that become join conditions on an OPTIONAL MATCH (#667).
+        let mut optional_join_predicates: Vec<Option<Expression>> =
+            vec![None; pre_with_clauses.len()];
+
         for pred in pre_where_preds {
             let mut pred_vars = HashSet::new();
             Self::collect_expression_variables(&pred, &mut pred_vars);
+            if pred_vars.iter().any(|v| late_bound_pre.contains(v)) {
+                late_bound_predicates.push(pred);
+                continue;
+            }
+
+            // A predicate mentioning an OPTIONAL MATCH's variables belongs to
+            // that clause, not above the join. Cypher scopes the WHERE after an
+            // OPTIONAL MATCH to the optional match itself, so a row failing it
+            // keeps the left side and nulls the right — filtering above the
+            // join deletes the row entirely, which is what
+            // `OPTIONAL MATCH (x)-[:E1]->(y) WHERE y.val > 4` did: one row
+            // returned where Cypher returns three (#667).
+            //
+            // Only for predicates that cannot be pushed *into* the optional
+            // clause's own plan, i.e. ones also referencing an outer variable.
+            // Any predicate naming a variable the optional clause introduces.
+            // "Introduces" is the operative word: the clause's own set includes
+            // the join variable it shares with the outer match, so testing
+            // against the whole set catches predicates that belong entirely to
+            // the outer side.
+            let optional_target = pre_with_clauses.iter().enumerate().find(|(i, mc)| {
+                if !mc.optional || pred_vars.is_empty() {
+                    return false;
+                }
+                let own = &pre_match_var_sets[*i];
+                // Must *span* the join: name something this clause introduces
+                // **and** something it does not.
+                //
+                // A predicate naming only the optional clause's own variables
+                // is pushed inside that clause instead, where it can anchor the
+                // scan — `OPTIONAL MATCH (b:N) WHERE id(b) = 6` has to stay an
+                // id lookup. Routing those here cost that anchor and
+                // `anchor_coverage` caught it. They are already handled
+                // correctly by the existing per-clause decomposition: a filter
+                // inside the optional side leaves unmatched rows null, which is
+                // what Cypher asks for.
+                let earlier: HashSet<&String> = pre_match_var_sets[..*i]
+                    .iter()
+                    .flat_map(|s| s.iter())
+                    .collect();
+                let introduced: HashSet<&String> =
+                    own.iter().filter(|v| !earlier.contains(*v)).collect();
+                let touches_optional = pred_vars.iter().any(|v| introduced.contains(v));
+                let touches_outer = pred_vars.iter().any(|v| !introduced.contains(v));
+                touches_optional && touches_outer
+            });
+            if let Some((i, _)) = optional_target {
+                optional_join_predicates[i] = Some(match optional_join_predicates[i].take() {
+                    Some(existing) => Expression::Binary {
+                        left: Box::new(existing),
+                        op: BinaryOp::And,
+                        right: Box::new(pred),
+                    },
+                    None => pred,
+                });
+                continue;
+            }
 
             let target = pre_match_var_sets.iter().position(|match_vars| {
                 pred_vars.is_empty() || pred_vars.iter().all(|v| match_vars.contains(v))
@@ -594,21 +1272,130 @@ impl QueryPlanner {
 
             operator = Some(match operator {
                 Some(existing) => {
-                    let shared: Vec<String> = known_vars.intersection(&clause_vars).cloned().collect();
+                    // ALL shared variables form the join key. Taking one of them left the
+                    // rest uncorrelated — a silent cartesian product — and since this comes
+                    // from a HashSet intersection, which one varied between runs (#360).
+                    let mut shared: Vec<String> =
+                        known_vars.intersection(&clause_vars).cloned().collect();
+                    shared.sort();
                     if !shared.is_empty() {
                         if match_clause.optional {
                             let right_only: Vec<String> = clause_vars.difference(&known_vars).cloned().collect();
-                            Box::new(LeftOuterJoinOperator::new(existing, match_op, shared[0].clone(), right_only)) as OperatorBox
+                            let mut join =
+                                LeftOuterJoinOperator::new(existing, match_op, shared.clone(), right_only);
+                            if let Some(pred) = optional_join_predicates[match_idx].clone() {
+                                join = join.with_join_predicate(pred);
+                            }
+                            Box::new(join) as OperatorBox
                         } else {
-                            Box::new(JoinOperator::new(existing, match_op, shared[0].clone())) as OperatorBox
+                            Box::new(JoinOperator::new(existing, match_op, shared.clone())) as OperatorBox
                         }
                     } else {
                         Box::new(CartesianProductOperator::new(existing, match_op)) as OperatorBox
                     }
                 }
+                // A *leading* OPTIONAL MATCH has no left side, so there was
+                // nothing to null-fill and a query matching nothing returned
+                // **no rows** instead of one null row —
+                // `OPTIONAL MATCH (a:Nope) RETURN a` came back empty (#671).
+                // Joining against a single empty row gives the outer join the
+                // left side the clause implies.
+                None if match_clause.optional => {
+                    use crate::query::executor::operator::SingleRowOperator;
+                    let right_only: Vec<String> = clause_vars.iter().cloned().collect();
+                    Box::new(LeftOuterJoinOperator::new(
+                        Box::new(SingleRowOperator::new()),
+                        match_op,
+                        Vec::new(),
+                        right_only,
+                    )) as OperatorBox
+                }
                 None => match_op,
             });
             known_vars.extend(clause_vars);
+        }
+
+        // A leading UNWIND binds its variable before anything downstream reads it,
+        // and that has to happen *before* the first WITH barrier.
+        //
+        // A barrier projects the variables the WITH names, so with the UNWIND
+        // applied after it there is nothing bound for it to project, and
+        // `UNWIND [1,2,3] AS x WITH x WHERE x > 1 RETURN x` failed with
+        // `VariableNotFound("x")` -- as did every other shape, whatever the
+        // value type. Since `WHERE` cannot follow `UNWIND` directly, that left
+        // no way to filter an unwound list at all (#572).
+        //
+        // It also has to happen before the cross-MATCH predicates below, which
+        // may reference it: `UNWIND [1,2] AS x MATCH (p) WHERE p.n = x` puts
+        // `x` in a predicate spanning the unwound variable and a match
+        // variable. Applied after that filter, the predicate was silently
+        // dropped rather than failing, and the query returned a cross product.
+        //
+        // A statement that begins with UNWIND has no MATCH to build a pipeline
+        // on, so it is seeded with a single empty row here for the same reason
+        // it was seeded further down: the rest of the planner -- filters,
+        // aggregation, ORDER BY, SKIP/LIMIT -- then applies unchanged.
+        //
+        // Which slot holds it depends on how many WITH stages follow, which is
+        // a parser detail rather than a semantic one: with a single WITH the
+        // leading UNWIND is `query.unwind_clause`, and with two or more it is
+        // the *first* extra stage's unwind. Both mean the same query.
+        let leading_unwind: Option<&UnwindClause> = if query.unwind_leading {
+            if query.extra_with_stages.is_empty() {
+                query.unwind_clause.as_ref()
+            } else {
+                query.extra_with_stages[0].1.as_ref()
+            }
+        } else {
+            None
+        };
+
+        if query.unwind_leading {
+            if let Some(unwind) = leading_unwind {
+                use crate::query::executor::operator::SingleRowOperator;
+                let base: OperatorBox = match operator.take() {
+                    Some(op) => op,
+                    None => Box::new(SingleRowOperator::new()),
+                };
+                operator = Some(Box::new(UnwindOperator::new(
+                    base,
+                    unwind.expression.clone(),
+                    unwind.variable.clone(),
+                )));
+                known_vars.insert(unwind.variable.clone());
+
+                // A run of UNWINDs at the head of the query: each expands the
+                // rows the previous produced, giving the cross product the TCK
+                // uses to enumerate three-variable truth tables.
+                for extra in &query.extra_unwind_clauses {
+                    let base = operator.take().expect("previous UNWIND produced an operator");
+                    operator = Some(Box::new(UnwindOperator::new(
+                        base,
+                        extra.expression.clone(),
+                        extra.variable.clone(),
+                    )));
+                    known_vars.insert(extra.variable.clone());
+                }
+            }
+        }
+
+        // The predicates held back above, now that the UNWIND has bound its
+        // variable. Only when a WITH follows: without one, the top-level WHERE
+        // applies the full predicate and doing it here as well would just cost
+        // a second evaluation per row.
+        if query.with_clause.is_some() && !late_bound_predicates.is_empty() {
+            if let Some(op) = operator.take() {
+                let filter_expr = late_bound_predicates
+                    .clone()
+                    .into_iter()
+                    .reduce(|acc, pred| Expression::Binary {
+                        left: Box::new(acc),
+                        op: BinaryOp::And,
+                        right: Box::new(pred),
+                    })
+                    .unwrap();
+                operator = Some(Box::new(FilterOperator::new(op, filter_expr)));
+            }
         }
 
         // Apply cross-MATCH predicates after all pre-WITH MATCH clauses are joined
@@ -630,11 +1417,21 @@ impl QueryPlanner {
         // Each stage: (with_clause, unwind, post_match_clauses, post_where_clause)
         let mut all_with_stages: Vec<(&WithClause, Option<&UnwindClause>, Vec<&MatchClause>, Option<&WhereClause>)> = Vec::new();
 
-        for (wc, uw, mcs, wh) in &query.extra_with_stages {
-            all_with_stages.push((wc, uw.as_ref(), mcs.iter().collect(), wh.as_ref()));
+        for (idx, (wc, uw, mcs, wh)) in query.extra_with_stages.iter().enumerate() {
+            // Stage 0 holds the leading UNWIND when there is more than one WITH;
+            // it was applied before the barriers, above.
+            let stage_unwind = if idx == 0 && leading_unwind.is_some() { None } else { uw.as_ref() };
+            all_with_stages.push((wc, stage_unwind, mcs.iter().collect(), wh.as_ref()));
         }
         if let Some(wc) = &query.with_clause {
-            all_with_stages.push((wc, query.unwind_clause.as_ref(), post_with_clauses.iter().collect(), query.post_with_where_clause.as_ref()));
+            // A *leading* UNWIND was applied before the barriers, above. Only a
+            // trailing one belongs to this stage.
+            let stage_unwind = if query.unwind_leading && query.extra_with_stages.is_empty() {
+                None
+            } else {
+                query.unwind_clause.as_ref()
+            };
+            all_with_stages.push((wc, stage_unwind, post_with_clauses.iter().collect(), query.post_with_where_clause.as_ref()));
         }
 
         let mut anon_counter: usize = 0;
@@ -684,9 +1481,20 @@ impl QueryPlanner {
             let mut per_match_where: Vec<Option<WhereClause>> = vec![None; stage_matches.len()];
             let mut cross_match_preds: Vec<Expression> = Vec::new();
 
+            // A predicate referring to a leading UNWIND's variable cannot be evaluated
+            // during match planning -- the variable is not bound until the Unwind operator
+            // runs, which sits above the matches. Leaving it here produced a filter under
+            // the Unwind and the query died with "Variable not found". Dropping it from the
+            // decomposition is safe because the top-level WHERE filter, applied after the
+            // Unwind, evaluates the full predicate anyway.
+            let late_bound = Self::late_bound_variables(query);
+
             for pred in where_preds {
                 let mut pred_vars = HashSet::new();
                 Self::collect_expression_variables(&pred, &mut pred_vars);
+                if pred_vars.iter().any(|v| late_bound.contains(v)) {
+                    continue;
+                }
                 let target = match_var_sets.iter().position(|match_vars| {
                     pred_vars.is_empty() || pred_vars.iter().all(|v| match_vars.contains(v))
                 });
@@ -784,13 +1592,18 @@ impl QueryPlanner {
 
                     operator = Some(match operator {
                         Some(existing) => {
-                            let shared: Vec<String> = known_vars.intersection(&clause_vars).cloned().collect();
+                            // ALL shared variables form the join key. Taking one of them left the
+                    // rest uncorrelated — a silent cartesian product — and since this comes
+                    // from a HashSet intersection, which one varied between runs (#360).
+                    let mut shared: Vec<String> =
+                        known_vars.intersection(&clause_vars).cloned().collect();
+                    shared.sort();
                             if !shared.is_empty() {
                                 if match_clause.optional {
                                     let right_only: Vec<String> = clause_vars.difference(&known_vars).cloned().collect();
-                                    Box::new(LeftOuterJoinOperator::new(existing, match_op, shared[0].clone(), right_only)) as OperatorBox
+                                    Box::new(LeftOuterJoinOperator::new(existing, match_op, shared.clone(), right_only)) as OperatorBox
                                 } else {
-                                    Box::new(JoinOperator::new(existing, match_op, shared[0].clone())) as OperatorBox
+                                    Box::new(JoinOperator::new(existing, match_op, shared.clone())) as OperatorBox
                                 }
                             } else {
                                 Box::new(CartesianProductOperator::new(existing, match_op)) as OperatorBox
@@ -847,8 +1660,9 @@ impl QueryPlanner {
                 }
 
                 if !shared_vars.is_empty() {
-                    // Use JoinOperator on the first shared variable
-                    operator = Some(Box::new(JoinOperator::new(existing_op, call_op, shared_vars[0].clone())));
+                    // Join on every shared variable, not just the first — see #360.
+                    shared_vars.sort();
+                    operator = Some(Box::new(JoinOperator::new(existing_op, call_op, shared_vars.clone())));
                 } else {
                     // Fallback to Cartesian Product
                     operator = Some(Box::new(CartesianProductOperator::new(existing_op, call_op)));
@@ -858,7 +1672,23 @@ impl QueryPlanner {
             }
         }
 
+        // A statement that begins with UNWIND has no MATCH to build a pipeline on, so seed
+        // it with a single empty row and let the rest of the planner -- filters,
+        // aggregation, ORDER BY, SKIP/LIMIT -- apply unchanged. Hand-building a plan here
+        // instead would have to re-implement all of that; the first attempt did, and
+        // promptly failed on `UNWIND [...] AS x RETURN count(x)`.
+        if operator.is_none() && Self::has_any_unwind(query) {
+            use crate::query::executor::operator::SingleRowOperator;
+            operator = Some(Box::new(SingleRowOperator::new()));
+        }
+
         let mut operator = operator.unwrap();
+
+        // A *leading* UNWIND is planned before the WITH barriers, above, so that
+        // a following WITH has its variable bound. It still lands below the
+        // WHERE, which is what `UNWIND [1,2] AS x MATCH (p) WHERE p.n = x`
+        // needs -- the predicate references the unwound variable.
+        let leading_unwind = query.unwind_leading;
 
         // Add WHERE clause if present.
         // When a WITH clause exists, WHERE predicates were already decomposed and
@@ -866,20 +1696,148 @@ impl QueryPlanner {
         // would fail because the WithBarrier projects away referenced variables.
         if query.with_clause.is_none() {
             if let Some(where_clause) = &query.where_clause {
-                operator = Box::new(FilterOperator::new(operator, where_clause.predicate.clone()));
+                // Apply only the conjuncts the plan below is not already
+                // applying.
+                //
+                // The decomposition above hands each MATCH the conjuncts that
+                // reference only its own variables, and the match planners
+                // attach them as filters inside the subplan -- often at the
+                // scan, which is the whole point of pushing them down. This
+                // line then re-applied the *entire* WHERE on top. For
+                // `WHERE p.age > 10 AND f.age < 40` over `(p)-[:KNOWS]->(f)`
+                // the result was three evaluations of the same work:
+                //
+                //     Filter (p.age > 10 AND f.age < 40)     <- here
+                //       Filter (f.age < 40)
+                //         Expand
+                //           Filter (p.age > 10)
+                //             NodeScan
+                //
+                // On LDBC IC9 the redundant pass cost ~130 ms over 389,461
+                // rows and removed nothing (#519).
+                //
+                // What is dropped is decided by reading the plan that was
+                // actually built, not by trusting that the planner pushed what
+                // it was given: there are several planning paths and none of
+                // them promises to attach every predicate it receives.
+                //
+                // Two shapes make re-application load-bearing rather than
+                // redundant, and both are excluded rather than reasoned about:
+                //
+                //   * OPTIONAL MATCH -- a left outer join can leave a variable
+                //     NULL for unmatched rows. A filter pushed inside the
+                //     optional side never sees those rows; the top-level one
+                //     does, and rejects them. Dropping it would admit rows
+                //     that should have been excluded.
+                //
+                //     A predicate made a *join condition* on the outer join is
+                //     the exception, and the one this reasoning did not
+                //     anticipate. Cypher scopes the WHERE after an OPTIONAL
+                //     MATCH to the optional match, so a row failing it keeps
+                //     the left side and nulls the right. Re-applying such a
+                //     conjunct here deletes exactly the rows the OPTIONAL
+                //     MATCH exists to produce:
+                //     `MATCH (x:X) OPTIONAL MATCH (x)-[:E1]->(y) WHERE y.val > 4`
+                //     returned one row where Cypher returns three (#667).
+                //     Those conjuncts are subtracted below by name.
+                //   * a leading UNWIND -- predicates on its variable are
+                //     deliberately left out of the decomposition, because the
+                //     Unwind that binds them sits above the matches. They are
+                //     not in any descendant filter, so they survive the
+                //     subtraction anyway; excluding the case as well makes the
+                //     reasoning independent of that.
+                //
+                // With those excluded, every operator between a pushed filter
+                // and this point only *adds* bindings -- Expand, ExpandInto,
+                // Join on shared equal values, CartesianProduct -- so a
+                // conjunct proved below stays true here.
+                let has_optional = query.match_clauses.iter().any(|mc| mc.optional);
+                let has_late_bound = !Self::late_bound_variables(query).is_empty();
+
+                // Conjuncts scoped to an OPTIONAL MATCH. Subtracted even in
+                // the OPTIONAL MATCH case, because re-applying one of these is
+                // not redundant -- it changes the answer.
+                //
+                // Two ways a conjunct gets that scope, and both must be
+                // subtracted:
+                //
+                //   * it spans the join and became a join condition;
+                //   * it names only the optional clause's own variables and was
+                //     pushed inside that clause, where it anchors the scan.
+                //
+                // The second is the common case and needs no new machinery at
+                // all -- the decomposition already puts it in the right place.
+                // The bug was purely that this filter then put it back on top,
+                // and a filter above a left outer join deletes the null-filled
+                // rows the OPTIONAL MATCH exists to produce (#667).
+                let mut optional_scoped: Vec<Expression> = optional_join_predicates
+                    .iter()
+                    .flatten()
+                    .flat_map(flatten_and_predicates)
+                    .collect();
+                for (i, mc) in pre_with_clauses.iter().enumerate() {
+                    if !mc.optional {
+                        continue;
+                    }
+                    if let Some(wc) = &per_match_where[i] {
+                        optional_scoped.extend(flatten_and_predicates(&wc.predicate));
+                    }
+                }
+                let as_join_conditions = optional_scoped;
+
+                let predicate = if has_optional || has_late_bound {
+                    let remaining: Vec<Expression> =
+                        flatten_and_predicates(&where_clause.predicate)
+                            .into_iter()
+                            .filter(|c| !as_join_conditions.contains(c))
+                            .collect();
+                    remaining.into_iter().reduce(|acc, pred| Expression::Binary {
+                        left: Box::new(acc),
+                        op: BinaryOp::And,
+                        right: Box::new(pred),
+                    })
+                } else {
+                    let mut applied = Vec::new();
+                    Self::collect_applied_predicates(&mut operator, &mut applied);
+                    let remaining: Vec<Expression> = flatten_and_predicates(&where_clause.predicate)
+                        .into_iter()
+                        .filter(|conjunct| !applied.contains(conjunct))
+                        .collect();
+                    remaining.into_iter().reduce(|acc, pred| Expression::Binary {
+                        left: Box::new(acc),
+                        op: BinaryOp::And,
+                        right: Box::new(pred),
+                    })
+                };
+
+                if let Some(predicate) = predicate {
+                    operator = Box::new(FilterOperator::new(operator, predicate));
+                }
             }
         }
 
         // Extra WITH stages and UNWIND are now handled in the unified loop above.
 
-        // Add standalone UNWIND clause (only when no WITH clause handles it)
-        if query.with_clause.is_none() {
+        // Add standalone UNWIND clause (only when no WITH clause handles it, and not
+        // already applied above as a leading UNWIND). A trailing UNWIND stays here, after
+        // the filter, so the cross product is built from the already-narrowed rows.
+        if query.with_clause.is_none() && !leading_unwind {
             if let Some(unwind_clause) = &query.unwind_clause {
                 operator = Box::new(UnwindOperator::new(
                     operator,
                     unwind_clause.expression.clone(),
                     unwind_clause.variable.clone(),
                 ));
+                // Consecutive UNWINDs stack: each one expands the rows the
+                // previous produced, so `UNWIND [1,2] AS a UNWIND [3,4] AS b`
+                // is four rows and not two.
+                for extra in &query.extra_unwind_clauses {
+                    operator = Box::new(UnwindOperator::new(
+                        operator,
+                        extra.expression.clone(),
+                        extra.variable.clone(),
+                    ));
+                }
             }
         }
 
@@ -893,13 +1851,83 @@ impl QueryPlanner {
             let create_pattern = &create_clause.pattern;
 
             // Collect edges to create from the CREATE pattern
-            let mut edges_to_create: Vec<(String, String, EdgeType, HashMap<String, PropertyValue>, Option<String>)> = Vec::new();
+            let mut edges_to_create: Vec<crate::query::executor::operator::EdgeToCreate> = Vec::new();
+
+            // Variables the MATCH already bound. Anything else in the CREATE pattern is a
+            // *new* node: previously such nodes were dropped on the floor, so
+            // `MATCH (p) CREATE (p)-[:R]->(c:C {..})` created neither node nor edge and
+            // still reported success.
+            let mut matched_vars: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for mc in &query.match_clauses {
+                for path in &mc.pattern.paths {
+                    if let Some(v) = &path.start.variable {
+                        matched_vars.insert(v.clone());
+                    }
+                    for seg in &path.segments {
+                        if let Some(v) = &seg.node.variable {
+                            matched_vars.insert(v.clone());
+                        }
+                    }
+                }
+            }
+
+            // Nodes to create per matched row: (handle, labels, properties)
+            let mut nodes_to_create: Vec<(
+                String,
+                Vec<Label>,
+                HashMap<String, PropertyValue>,
+                Option<HashMap<String, Expression>>,
+            )> = Vec::new();
+            let mut anon_seq = 0usize;
+
+            // Assign a handle to a CREATE-pattern node, registering it for creation when
+            // the MATCH did not bind it. Anonymous nodes get a synthetic handle so an edge
+            // can still be wired to them.
+            let mut handle_for = |node: &crate::query::ast::NodePattern,
+                                  nodes_to_create: &mut Vec<(
+                String,
+                Vec<Label>,
+                HashMap<String, PropertyValue>,
+                Option<HashMap<String, Expression>>,
+            )>,
+                                  anon_seq: &mut usize|
+             -> String {
+                match &node.variable {
+                    Some(v) if matched_vars.contains(v) => v.clone(),
+                    // Already registered by an earlier path in this same
+                    // CREATE — reuse it rather than creating a second node.
+                    Some(v) if nodes_to_create.iter().any(|(h, ..)| h == v) => v.clone(),
+                    Some(v) => {
+                        nodes_to_create.push((
+                            v.clone(),
+                            node.labels.clone(),
+                            node.properties.clone().unwrap_or_default(),
+                            node.property_exprs.clone(),
+                        ));
+                        v.clone()
+                    }
+                    None => {
+                        let h = format!("__anon_mcreate_{anon_seq}");
+                        *anon_seq += 1;
+                        nodes_to_create.push((
+                            h.clone(),
+                            node.labels.clone(),
+                            node.properties.clone().unwrap_or_default(),
+                            node.property_exprs.clone(),
+                        ));
+                        h
+                    }
+                }
+            };
 
             for path in &create_pattern.paths {
-                let mut current_var = path.start.variable.clone();
+                let mut current_var =
+                    handle_for(&path.start, &mut nodes_to_create, &mut anon_seq);
 
                 for segment in &path.segments {
-                    let target_var = segment.node.variable.clone();
+                    let target_var =
+                        handle_for(&segment.node, &mut nodes_to_create, &mut anon_seq);
                     let edge = &segment.edge;
                     let edge_type = edge.types.first()
                         .cloned()
@@ -907,24 +1935,34 @@ impl QueryPlanner {
                     let edge_properties = edge.properties.clone().unwrap_or_default();
                     let edge_variable = edge.variable.clone();
 
-                    if let (Some(src), Some(tgt)) = (&current_var, &target_var) {
-                        edges_to_create.push((
-                            src.clone(),
-                            tgt.clone(),
-                            edge_type,
-                            edge_properties,
-                            edge_variable,
-                        ));
-                    }
+                    // Direction comes from the pattern, not from write order.
+                    let (from, to) = match segment.edge.direction {
+                        Direction::Incoming => (target_var.clone(), current_var.clone()),
+                        Direction::Outgoing | Direction::Both => {
+                            (current_var.clone(), target_var.clone())
+                        }
+                    };
+                    edges_to_create.push((
+                        from,
+                        to,
+                        edge_type,
+                        edge_properties,
+                        edge_variable,
+                        edge.property_exprs.clone(),
+                    ));
 
                     current_var = target_var;
                 }
             }
 
-            // Wrap the match operator with edge creation
-            if !edges_to_create.is_empty() {
+            // Wrap the match operator with node+edge creation
+            if !edges_to_create.is_empty() || !nodes_to_create.is_empty() {
                 use crate::query::executor::operator::MatchCreateEdgeOperator;
-                operator = Box::new(MatchCreateEdgeOperator::new(operator, edges_to_create));
+                operator = Box::new(MatchCreateEdgeOperator::with_nodes(
+                    operator,
+                    nodes_to_create,
+                    edges_to_create,
+                ));
             }
 
             true // This is a write query
@@ -946,12 +1984,29 @@ impl QueryPlanner {
         // Handle SET clauses
         let is_write = if !query.set_clauses.is_empty() {
             let mut items = Vec::new();
+            let mut label_adds = Vec::new();
+            let mut entity_items = Vec::new();
             for set_clause in &query.set_clauses {
                 for item in &set_clause.items {
                     items.push((item.variable.clone(), item.property.clone(), item.value.clone()));
                 }
+                for item in &set_clause.label_items {
+                    for label in &item.labels {
+                        label_adds.push((item.variable.clone(), label.clone()));
+                    }
+                }
+                for item in &set_clause.entity_items {
+                    entity_items.push((item.variable.clone(), item.merge, item.value.clone()));
+                }
             }
-            operator = Box::new(SetPropertyOperator::new(operator, items));
+            if !items.is_empty() || !entity_items.is_empty() {
+                operator = Box::new(SetPropertyOperator::with_entity_items(
+                    operator, items, entity_items,
+                ));
+            }
+            if !label_adds.is_empty() {
+                operator = Box::new(LabelMutationOperator::new(operator, label_adds, Vec::new()));
+            }
             true
         } else {
             is_write
@@ -960,15 +2015,27 @@ impl QueryPlanner {
         // Handle REMOVE clauses
         let is_write = if !query.remove_clauses.is_empty() {
             let mut items = Vec::new();
+            let mut label_removes = Vec::new();
             for remove_clause in &query.remove_clauses {
                 for item in &remove_clause.items {
-                    if let RemoveItem::Property { variable, property } = item {
-                        items.push((variable.clone(), property.clone()));
+                    match item {
+                        RemoveItem::Property { variable, property } => {
+                            items.push((variable.clone(), property.clone()));
+                        }
+                        // Previously dropped here while the statement still
+                        // reported a successful write, so `REMOVE n:Label` was
+                        // a silent no-op (#596).
+                        RemoveItem::Label { variable, label } => {
+                            label_removes.push((variable.clone(), label.clone()));
+                        }
                     }
                 }
             }
             if !items.is_empty() {
                 operator = Box::new(RemovePropertyOperator::new(operator, items));
+            }
+            if !label_removes.is_empty() {
+                operator = Box::new(LabelMutationOperator::new(operator, Vec::new(), label_removes));
             }
             true
         } else {
@@ -1026,17 +2093,49 @@ impl QueryPlanner {
                 }
             }
 
-            if !edges_to_merge.is_empty() {
+            // `MatchMergeEdgeOperator` wires an edge between endpoints that
+            // are **already bound**, which is what this branch is for -- the
+            // `MATCH (a), (b) MERGE (a)-[:R]->(b)` shape. Without a MATCH the
+            // endpoints are not bound by anything, so it wired nothing and
+            // `UNWIND [...] AS i MERGE (:A {id: i})-[:R]->(:B {id: i})`
+            // silently created no nodes and no edges. That case is a
+            // whole-pattern merge, which `MergeOperator` already does (#642).
+            if !edges_to_merge.is_empty() && !query.match_clauses.is_empty() {
                 // Edge MERGE: use MatchMergeEdgeOperator
                 use crate::query::executor::operator::MatchMergeEdgeOperator;
                 operator = Box::new(MatchMergeEdgeOperator::new(
                     operator, edges_to_merge, on_create, on_match,
                 ));
             } else {
-                // Node-only MERGE: use existing MergeOperator with input
-                operator = Box::new(MergeOperator::new(
-                    merge_clause.pattern.clone(), on_create, on_match,
-                ));
+                // Node-only MERGE, or a whole-pattern MERGE with nothing bound
+                // to hang it off, running once per upstream row.
+                //
+                // The comment here used to say "with input" while the code
+                // assigned over `operator` and threw the input away, so the
+                // MERGE ran exactly once no matter what fed it -- and, more to
+                // the point, could not see the row. That is why
+                // `UNWIND [...] AS x MERGE (n:N {v: x})` had nowhere to read
+                // `x` from (#642).
+                let on_create_labels: Vec<(String, Vec<Label>)> = merge_clause
+                    .on_create_labels
+                    .iter()
+                    .map(|l| (l.variable.clone(), l.labels.clone()))
+                    .collect();
+                let on_match_labels: Vec<(String, Vec<Label>)> = merge_clause
+                    .on_match_labels
+                    .iter()
+                    .map(|l| (l.variable.clone(), l.labels.clone()))
+                    .collect();
+                operator = Box::new(
+                    MergeOperator::new(
+                        merge_clause.pattern.clone(),
+                        on_create,
+                        on_match,
+                        on_create_labels,
+                        on_match_labels,
+                    )
+                    .with_input(operator),
+                );
             }
             true
         } else {
@@ -1050,32 +2149,23 @@ impl QueryPlanner {
             let mut projections = Vec::new();
             let mut has_aggregation = false;
             let mut agg_counter = 0usize;
+            let mut return_item_aliases: Vec<(Expression, String)> = Vec::new();
             // Post-projection items: after aggregation, compute final expressions
             // from aggregate aliases (e.g. round(__agg_0 * 100 / __agg_1) AS strike_rate)
             let mut post_projections: Vec<(Expression, String)> = Vec::new();
 
             for (idx, item) in return_clause.items.iter().enumerate() {
-                let alias = item.alias.clone().unwrap_or_else(|| {
-                    match &item.expression {
-                        Expression::Variable(var) => var.clone(),
-                        Expression::Property { variable, property } => format!("{}.{}", variable, property),
-                        Expression::Function { name, args, distinct } => {
-                            let arg_strs: Vec<String> = args.iter().map(|a| match a {
-                                Expression::Variable(v) => v.clone(),
-                                Expression::Property { variable, property } => format!("{}.{}", variable, property),
-                                _ => "?".to_string(),
-                            }).collect();
-                            if *distinct {
-                                format!("{}(DISTINCT {})", name, arg_strs.join(", "))
-                            } else {
-                                format!("{}({})", name, arg_strs.join(", "))
-                            }
-                        },
-                        _ => format!("col_{}", idx),
-                    }
-                });
+                // `column_name` first: it uses the text the user wrote, which
+                // the reconstruction below cannot recover. `count(*)` came out
+                // as `count()` here because `*` is not an argument expression,
+                // and a column nobody can name by writing the query again is
+                // not a usable result (#635).
+                let alias = item.column_name(idx);
 
                 output_columns.push(alias.clone());
+                // Kept so ORDER BY can be translated between alias and expression form,
+                // whichever is bound where the sort lands.
+                return_item_aliases.push((item.expression.clone(), alias.clone()));
 
                 // Extract nested aggregates from expressions like round(sum(x) / sum(y))
                 let (rewritten, extracted) = extract_nested_aggregates(&item.expression, &mut agg_counter);
@@ -1100,11 +2190,33 @@ impl QueryPlanner {
                 && group_by.is_empty()
                 && matches!(aggregates[0].func, AggregateType::Count)
                 && !aggregates[0].distinct
+                // O(1) label count answers "how many rows", which is `count(*)` or
+                // `count(var)`. `count(x.prop)` counts non-null *values*, and returning the
+                // label count for it reported every node as having the property (#358).
+                && matches!(
+                    aggregates[0].expr,
+                    Expression::Literal(_) | Expression::Variable(_)
+                )
                 && query.where_clause.is_none()
                 && query.with_clause.is_none()
                 && query.match_clauses.len() == 1
                 && query.match_clauses[0].pattern.paths.len() == 1
                 && query.match_clauses[0].pattern.paths[0].segments.is_empty()
+                // An inline property is a filter, and the label count knows nothing about
+                // it. Without this, `MATCH (p:P {name: "alice"}) RETURN count(p)` returned
+                // the count of *every* :P -- a fast, confident, wrong number, while the
+                // same pattern with `RETURN p` returned the single correct row. Same shape
+                // as #358 above: the shortcut may only fire when the pattern says nothing
+                // the metadata cannot express.
+                && query.match_clauses[0].pattern.paths[0]
+                    .start
+                    .properties
+                    .as_ref()
+                    .is_none_or(|p| p.is_empty())
+                && query.match_clauses[0].pattern.paths[0]
+                    .start
+                    .property_exprs
+                    .is_none()
                 && !query.match_clauses[0].pattern.paths[0].start.labels.is_empty();
 
             // Edge type count cache: O(1) shortcut for MATCH ()-[r]->() RETURN type(r), count(r)
@@ -1122,9 +2234,81 @@ impl QueryPlanner {
                 && query.match_clauses[0].pattern.paths[0].start.labels.is_empty()
                 && query.match_clauses[0].pattern.paths[0].segments[0].node.labels.is_empty()
                 && matches!(&group_by[0].0, Expression::Function { name, args, .. }
-                    if name == "type" && args.len() == 1 && matches!(&args[0], Expression::Variable(_)));
+                    if name == "type" && args.len() == 1 && matches!(&args[0], Expression::Variable(_)))
+                // Directed only — see the note on `use_edge_count` below.
+                && !matches!(
+                    query.match_clauses[0].pattern.paths[0].segments[0].edge.direction,
+                    Direction::Both
+                );
 
-            if use_edge_type_count {
+            // O(1) count for a single edge type (or all edges): the metadata that already
+            // answers `type(r), count(r)` and node label counts can answer this too, but
+            // this shape fell through to a full Expand + Aggregate -- on a billion-edge
+            // graph, a timeout for a question the statistics already hold (#304).
+            //
+            // Requires the counted variable to be the *edge* (or `count(*)`): counting a
+            // node variable over the same expand is a different question once the pattern
+            // has labels, and the label-free case is handled below anyway.
+            let edge_var = if query.match_clauses.len() == 1
+                && query.match_clauses[0].pattern.paths.len() == 1
+                && query.match_clauses[0].pattern.paths[0].segments.len() == 1
+            {
+                query.match_clauses[0].pattern.paths[0].segments[0]
+                    .edge
+                    .variable
+                    .clone()
+            } else {
+                None
+            };
+            let use_edge_count = has_aggregation
+                && aggregates.len() == 1
+                && group_by.is_empty()
+                && matches!(aggregates[0].func, AggregateType::Count)
+                && !aggregates[0].distinct
+                && query.where_clause.is_none()
+                && query.with_clause.is_none()
+                && query.order_by.is_none()
+                && query.match_clauses.len() == 1
+                && query.match_clauses[0].pattern.paths.len() == 1
+                && query.match_clauses[0].pattern.paths[0].segments.len() == 1
+                && query.match_clauses[0].pattern.paths[0].start.labels.is_empty()
+                && query.match_clauses[0].pattern.paths[0].start.properties.as_ref().is_none_or(|p| p.is_empty())
+                && query.match_clauses[0].pattern.paths[0].segments[0].node.labels.is_empty()
+                && query.match_clauses[0].pattern.paths[0].segments[0].node.properties.as_ref().is_none_or(|p| p.is_empty())
+                && query.match_clauses[0].pattern.paths[0].segments[0].edge.length.is_none()
+                && query.match_clauses[0].pattern.paths[0].segments[0].edge.types.len() <= 1
+                && match &aggregates[0].expr {
+                    Expression::Literal(_) => true,
+                    Expression::Variable(v) => Some(v) == edge_var.as_ref(),
+                    _ => false,
+                }
+                // Last, because it indexes into the pattern and every check
+                // that guarantees those indices exist is above it. Placing it
+                // earlier panicked on `UNWIND [1,2,3] AS x RETURN max(x)`,
+                // which has no match clause at all.
+                //
+                // Both fast paths read the edge count straight off the store,
+                // which counts each edge once. An **undirected** pattern
+                // matches every edge twice — once from each end — so
+                // `MATCH (a)--(b) RETURN count(*)` over two edges is 4, not 2.
+                // Doubling here would then have to reason about self-loops, so
+                // the fast path is restricted to directed patterns and the
+                // general operator answers the rest.
+                && !matches!(
+                    query.match_clauses[0].pattern.paths[0].segments[0].edge.direction,
+                    Direction::Both
+                );
+
+            if use_edge_count {
+                let edge_type = query.match_clauses[0].pattern.paths[0].segments[0]
+                    .edge
+                    .types
+                    .first()
+                    .map(|t| t.as_str().to_string());
+                let alias = aggregates[0].alias.clone();
+                operator = Box::new(EdgeCountOperator::new(edge_type, alias));
+                operator = Box::new(ProjectOperator::new(operator, post_projections));
+            } else if use_edge_type_count {
                 let type_alias = group_by[0].1.clone();
                 let count_alias = aggregates[0].alias.clone();
                 operator = Box::new(EdgeTypeCountOperator::new(type_alias, count_alias));
@@ -1133,7 +2317,10 @@ impl QueryPlanner {
                 // Sort after projection
                 if let Some(order_by) = &query.order_by {
                     let sort_items: Vec<(Expression, bool)> = order_by.items.iter()
-                        .map(|i| (i.expression.clone(), i.ascending)).collect();
+                        .map(|i| (
+                            resolve_sort_key(&i.expression, &return_item_aliases, SortPosition::AfterProjection),
+                            i.ascending,
+                        )).collect();
                     operator = Box::new(SortOperator::new(operator, sort_items));
                 }
             } else if use_label_count {
@@ -1154,7 +2341,10 @@ impl QueryPlanner {
                 if let Some(order_by) = &query.order_by {
                     let mut sort_items = Vec::new();
                     for item in &order_by.items {
-                        sort_items.push((item.expression.clone(), item.ascending));
+                        sort_items.push((
+                            resolve_sort_key(&item.expression, &return_item_aliases, SortPosition::AfterProjection),
+                            item.ascending,
+                        ));
                     }
                     operator = Box::new(SortOperator::new(operator, sort_items));
                 }
@@ -1163,7 +2353,10 @@ impl QueryPlanner {
                 if let Some(order_by) = &query.order_by {
                     let mut sort_items = Vec::new();
                     for item in &order_by.items {
-                        sort_items.push((item.expression.clone(), item.ascending));
+                        sort_items.push((
+                            resolve_sort_key(&item.expression, &return_item_aliases, SortPosition::BeforeProjection),
+                            item.ascending,
+                        ));
                     }
                     operator = Box::new(SortOperator::new(operator, sort_items));
                 }
@@ -1190,6 +2383,25 @@ impl QueryPlanner {
                     output_columns.push(item.alias.clone().unwrap_or_else(|| item.name.clone()));
                 }
             }
+        }
+
+        // DISTINCT, before SKIP and LIMIT.
+        //
+        // openCypher evaluates `RETURN DISTINCT` ahead of `ORDER BY`, `SKIP`
+        // and `LIMIT`: the projection is deduplicated, and only then is the
+        // result ordered and sliced. Deduplicating afterwards means `LIMIT n`
+        // slices a list that still contains duplicates, so fewer than n rows
+        // survive -- and `SKIP k` skips raw rows rather than distinct ones,
+        // which can leave the row it was meant to skip in the output (#522).
+        //
+        // `DistinctOperator` is a streaming, first-occurrence-wins filter, so
+        // placing it above the sort preserves the ordering the sort produced;
+        // no second sort is needed. Both plan shapes reach here with the
+        // projection already on top -- `Sort -> Project` when there is no
+        // aggregation, `Aggregate -> Project -> Sort` when there is -- so one
+        // insertion point covers both.
+        if query.return_clause.as_ref().is_some_and(|r| r.distinct) {
+            operator = Box::new(DistinctOperator::new(operator));
         }
 
         // Add SKIP if present
@@ -1246,8 +2458,16 @@ impl QueryPlanner {
                 _ => return Err(ExecutionError::PlanningError("Second argument (property) must be a string literal".to_string())),
             };
 
+            // Any numeric list literal, not only one that parsed as a
+            // `Vector`. List literals stay lists now (#628), so requiring the
+            // `Vector` variant here would reject every query vector written
+            // with a decimal point -- which is all of them.
             let query_vector = match &call_clause.arguments[2] {
-                Expression::Literal(PropertyValue::Vector(v)) => v.clone(),
+                Expression::Literal(pv) => pv.to_vector().ok_or_else(|| {
+                    ExecutionError::PlanningError(
+                        "Third argument (vector) must be a list of numbers".to_string(),
+                    )
+                })?,
                 _ => return Err(ExecutionError::PlanningError("Third argument (vector) must be a vector literal".to_string())),
             };
 
@@ -1283,7 +2503,17 @@ impl QueryPlanner {
             Ok(Box::new(ShowPropertyKeysOperator::new()))
         } else if call_clause.procedure_name == "db.schema.visualization" {
             Ok(Box::new(SchemaVisualizationOperator::new()))
-        } else if call_clause.procedure_name.starts_with("algo.") {
+        } else if call_clause.procedure_name.starts_with("algo.")
+            || AlgorithmOperator::is_algorithm(&call_clause.procedure_name)
+        {
+            // Namespace optional and case-insensitive: `pagerank`, `algo.pagerank`,
+            // `algo.pageRank` and `samyama.pageRank` all route here. Routing on the
+            // `algo.` prefix alone meant `CALL pagerank()` never reached the operator and
+            // came back as "Unknown procedure" (#198).
+            //
+            // The prefix check is kept alongside so an unrecognised `algo.*` name still
+            // reaches the operator and gets the specific "Unknown algorithm" error rather
+            // than the generic "Unknown procedure".
             Ok(Box::new(AlgorithmOperator::new(
                 call_clause.procedure_name.clone(),
                 call_clause.arguments.clone(),
@@ -1295,6 +2525,20 @@ impl QueryPlanner {
 
     /// Dispatch to graph-native or legacy planner based on configuration.
     /// Falls back to legacy planner if graph-native fails (e.g., label-free patterns).
+    /// Every conjunct any `Filter` in this subtree is already applying.
+    ///
+    /// Read off the built plan rather than tracked during construction: the
+    /// planner has several paths into a match subplan and the question here is
+    /// what the chosen one *did*, not what it was asked to do.
+    fn collect_applied_predicates(op: &mut OperatorBox, out: &mut Vec<Expression>) {
+        if let Some(predicate) = op.filter_predicate() {
+            out.extend(flatten_and_predicates(predicate));
+        }
+        for child in op.children_mut() {
+            Self::collect_applied_predicates(child, out);
+        }
+    }
+
     fn dispatch_plan_match(&self, match_clause: &MatchClause, where_clause: Option<&WhereClause>, store: &GraphStore) -> ExecutionResult<OperatorBox> {
         if self.config.graph_native {
             match self.plan_match_native(match_clause, where_clause, store) {
@@ -1445,17 +2689,20 @@ impl QueryPlanner {
             }
             let start_var = path_nodes[0].var.clone();
 
-            // QP-05: Anchor selection — pick the cheapest node in the pattern (by index
-            // lookup or label cardinality) to start the scan from, instead of always
-            // scanning from the first written node. Traversal toward earlier-written
-            // nodes then uses reversed edge direction. Restricted to simple linear
-            // chains: no variable-length hops, no shortestPath, no named path variable
-            // (path materialization assumes forward traversal order from the start).
+            // QP-05: Anchor selection — pick the node the *whole path* is
+            // cheapest from, not the node with the cheapest scan. Traversal
+            // toward earlier-written nodes uses the reversed edge direction.
+            //
+            // shortestPath and named path variables stay excluded: both
+            // materialise a path and assume forward traversal order from the
+            // start. Variable-length hops used to be excluded too, which meant
+            // any pattern containing a `*` always started at its first written
+            // node — LDBC IC6 among them. `build_path_from_anchor` now
+            // reverses those segments, so the restriction is no longer needed.
             let anchor_eligible = path.path_variable.is_none()
-                && !matches!(path.path_type, PathType::Shortest | PathType::AllShortest)
-                && !path.segments.iter().any(|s| s.edge.length.is_some());
+                && !matches!(path.path_type, PathType::Shortest | PathType::AllShortest);
             let anchor_idx = if anchor_eligible {
-                choose_anchor_index(&path_nodes, &per_path_preds[path_idx], store)
+                choose_anchor_index(path, &path_nodes, &per_path_preds[path_idx], store)
             } else {
                 0
             };
@@ -1483,7 +2730,23 @@ impl QueryPlanner {
             // Optimization: Check for index usage (using this path's assigned predicates).
             // Recognizes both `n.prop OP literal` and `literal OP n.prop` operand orders.
             let mut remaining_predicates: Vec<Expression> = per_path_preds[path_idx].clone();
-            let mut path_operator: OperatorBox = if let Some((idx, label, property, op, val)) =
+            let mut path_operator: OperatorBox = if let Some((idx, ids)) =
+                find_id_predicate(&start_var, &remaining_predicates)
+            {
+                // `id()` before any index: it is unique by construction, so
+                // there is nothing for a cost model to weigh. Without this,
+                // `MATCH (n) WHERE id(n) = 5` scanned the whole label and
+                // filtered (#538).
+                //
+                // The label, if the pattern named one, still has to be
+                // checked -- `MATCH (n:Person) WHERE id(n) = 5` must not
+                // match a node of another label that happens to hold that id.
+                remaining_predicates.remove(idx);
+                Box::new(
+                    NodeByIdOperator::new(ids, start_var.clone())
+                        .with_labels(path.start.labels.clone()),
+                )
+            } else if let Some((idx, label, property, op, val)) =
                 find_index_predicate(&start_var, &path.start.labels, &remaining_predicates, store)
             {
                 remaining_predicates.remove(idx);
@@ -1538,11 +2801,50 @@ impl QueryPlanner {
                     .collect();
                 let all_paths = matches!(path.path_type, PathType::AllShortest);
 
-                // We need the target node to be scanned too — create a CartesianProduct with target scan
-                let target_scan: OperatorBox = Box::new(NodeScanOperator::new(
-                    target_var.clone(),
-                    last_segment.node.labels.clone(),
-                ));
+                // We need the target node to be scanned too — create a CartesianProduct with target scan.
+                //
+                // The target gets the same `id()` anchoring the start already
+                // got (#538), because without it only *one* endpoint was
+                // pinned: `WHERE id(a) = 1 AND id(b) = 6` planned as
+                // `NodeById(a) x NodeScan(b)`, so the BFS ran once per node in
+                // the label and a filter above discarded all but one result.
+                // Measured against the same query written with inline
+                // properties, that cost 329x (#584).
+                let target_id_pred = find_id_predicate(&target_var, &deferred_predicates);
+                let target_scan: OperatorBox = match &target_id_pred {
+                    Some((_, ids)) => {
+                        let mut op = NodeByIdOperator::new(ids.clone(), target_var.clone());
+                        if !last_segment.node.labels.is_empty() {
+                            // A scan by id bypasses the label index, so the
+                            // pattern's labels still have to be checked.
+                            op = op.with_labels(last_segment.node.labels.clone());
+                        }
+                        Box::new(op) as OperatorBox
+                    }
+                    // Then an indexed property, for the same reason and by the
+                    // same argument. `WHERE a.seq = 0 AND b.seq = 5` planned as
+                    // `IndexScan(a) x NodeScan(b)` -- the WHERE form of what the
+                    // inline form `(b:N {seq: 5})` already got right, which is
+                    // why this went unnoticed (#584).
+                    None => match find_index_predicate(
+                        &target_var,
+                        &last_segment.node.labels,
+                        &deferred_predicates,
+                        store,
+                    ) {
+                        Some((_, label, property, op, val)) => Box::new(IndexScanOperator::new(
+                            target_var.clone(),
+                            label,
+                            property,
+                            op,
+                            val,
+                        )),
+                        None => Box::new(NodeScanOperator::new(
+                            target_var.clone(),
+                            last_segment.node.labels.clone(),
+                        )),
+                    },
+                };
                 // Add property filter for target node
                 let target_op = if let Some(ref props) = last_segment.node.properties {
                     if !props.is_empty() {
@@ -1568,10 +2870,29 @@ impl QueryPlanner {
             } else {
                 // Normal path: use ExpandOperator for each segment
                 let mut current_var = start_var.clone();
+                // Variables bound so far, so a deferred predicate can be
+                // applied the moment its last variable arrives rather than
+                // after the whole path (#328).
+                let mut bound: HashSet<String> = HashSet::new();
+                bound.insert(start_var.clone());
+                // Relationship isomorphism (#684): a pattern with more than one
+                // segment must not walk the same edge twice. The first expand
+                // built is the first to execute, so it clears history from an
+                // earlier clause — the rule is per-clause.
+                let track_edges = path.segments.len() > 1;
+                let mut first_expand = true;
                 for (seg_idx, segment) in path.segments.iter().enumerate() {
                     let target_var = path_nodes[seg_idx + 1].var.clone();
 
-                    let edge_var = segment.edge.variable.clone();
+                    // An inline relationship property constraint has to be
+                    // applied; it used to be dropped, so
+                    // `MATCH ()-[r:R {num: 2}]->()` returned every `:R` (#649).
+                    // An anonymous relationship gets a name to filter on.
+                    let edge_filter = self.edge_property_filter(&segment.edge, seg_idx);
+                    let edge_var = match &edge_filter {
+                        Some((var, _)) => Some(var.clone()),
+                        None => segment.edge.variable.clone(),
+                    };
                     let edge_types: Vec<String> = segment.edge.types.iter()
                         .map(|t| t.as_str().to_string())
                         .collect();
@@ -1592,6 +2913,29 @@ impl QueryPlanner {
                         if let Some(ref pv) = path.path_variable {
                             expand = expand.with_path_variable(pv.clone());
                         }
+                        // `MATCH (a)-[r:T*]->(b)` binds `r` to the list of
+                        // relationships traversed. Dropping it made the query
+                        // fail with "Variable not found: r" (#652).
+                        if let Some(ref rv) = segment.edge.variable {
+                            expand = expand.with_rel_variable(rv.clone());
+                        }
+                        // If the destination resolves to exactly one node, the
+                        // question is "can each source reach *this* node",
+                        // which one reversed BFS answers for every row. LDBC
+                        // IC6 reaches this operator with thousands of candidate
+                        // friends and one pinned person; without the pin each
+                        // candidate expands its own two-hop neighbourhood.
+                        //
+                        // `min_hops <= 1` because a set keyed on shortest
+                        // distance cannot answer `*2..n` correctly, and no path
+                        // variable because a membership test yields no path.
+                        if path.path_variable.is_none() && min_hops <= 1 {
+                            if let Some(pinned) =
+                                pinned_node_for(&target_var, &deferred_predicates, store)
+                            {
+                                expand = expand.with_pinned_target(pinned);
+                            }
+                        }
                         path_operator = if !segment.node.labels.is_empty() {
                             Box::new(expand.with_target_labels(segment.node.labels.clone()))
                         } else {
@@ -1603,18 +2947,70 @@ impl QueryPlanner {
                                 path_operator = Box::new(FilterOperator::new(path_operator, filter_expr));
                             }
                         }
+                        bound.insert(target_var.clone());
+                        if let Some(ev) = &segment.edge.variable {
+                            bound.insert(ev.clone());
+                        }
+                        path_operator = Self::apply_ready_predicates(
+                            path_operator,
+                            &mut deferred_predicates,
+                            &bound,
+                        );
                         current_var = target_var;
                         continue;
                     }
 
+                    // A variable already bound has to be *matched*, not
+                    // rebound. `ExpandOperator` binds its target
+                    // unconditionally, so `MATCH (b)-->(b)` bound the far end
+                    // of each edge over the near one and every edge matched --
+                    // a graph containing no self-relationships at all returned
+                    // one row per edge (#639). Expanding into a synthetic name
+                    // and requiring the two to be equal is what a repeated
+                    // variable means; the walk then continues from the
+                    // original, which the filter has just proved is the same
+                    // node.
+                    let self_ref = bound.contains(&target_var);
+                    let expand_var = if self_ref {
+                        format!("__self_{target_var}_{seg_idx}")
+                    } else {
+                        target_var.clone()
+                    };
                     let mut expand = ExpandOperator::new(
                         path_operator,
                         current_var.clone(),
-                        target_var.clone(),
+                        expand_var.clone(),
                         edge_var,
                         edge_types,
                         segment.edge.direction.clone(),
                     );
+                    if track_edges {
+                        expand = expand.with_edge_isolation(first_expand);
+                        first_expand = false;
+                    }
+                    // A closing hop back onto an already-bound variable can
+                    // only land on that node. Without this the expand walks
+                    // every neighbour and the `__self_x = x` filter below
+                    // discards all but one — BI-17's triangle close is ~41
+                    // neighbours per person over ~17.8M paths (#195).
+                    if self_ref {
+                        expand = expand.with_target_bound_var(target_var.clone());
+                    }
+                    // A selective equality on the far side of the expansion —
+                    // LDBC IC11's `org.name = "..."` — applied during the walk
+                    // rather than to the rows it produces (#656).
+                    let pushed = Self::target_equality_props(&deferred_predicates, &target_var);
+                    if !pushed.is_empty() {
+                        // Resolved to ids where possible: the property check
+                        // costs a node fetch per candidate edge and this costs
+                        // a hash lookup (#665).
+                        if let Some(ids) =
+                            self.resolve_target_ids(&segment.node.labels, &pushed, store)
+                        {
+                            expand = expand.with_target_ids(ids);
+                        }
+                        expand = expand.with_target_props(pushed);
+                    }
 
                     // CY-04: Set path variable for named path materialization
                     if let Some(ref pv) = path.path_variable {
@@ -1627,6 +3023,16 @@ impl QueryPlanner {
                     } else {
                         Box::new(expand)
                     };
+                    if self_ref {
+                        path_operator = Box::new(FilterOperator::new(
+                            path_operator,
+                            Expression::Binary {
+                                left: Box::new(Expression::Variable(expand_var)),
+                                op: BinaryOp::Eq,
+                                right: Box::new(Expression::Variable(target_var.clone())),
+                            },
+                        ));
+                    }
 
                     // Add property filter for target node if properties specified
                     if let Some(ref props) = segment.node.properties {
@@ -1635,6 +3041,20 @@ impl QueryPlanner {
                             path_operator = Box::new(FilterOperator::new(path_operator, filter_expr));
                         }
                     }
+
+                    if let Some((_, predicate)) = edge_filter {
+                        path_operator = Box::new(FilterOperator::new(path_operator, predicate));
+                    }
+
+                    bound.insert(target_var.clone());
+                    if let Some(ev) = &segment.edge.variable {
+                        bound.insert(ev.clone());
+                    }
+                    path_operator = Self::apply_ready_predicates(
+                        path_operator,
+                        &mut deferred_predicates,
+                        &bound,
+                    );
 
                     current_var = target_var;
                 }
@@ -1672,7 +3092,7 @@ impl QueryPlanner {
         for (op, vars) in operators.into_iter().zip(path_vars.into_iter()) {
             let shared: Vec<String> = combined_vars.intersection(&vars).cloned().collect();
             if !shared.is_empty() {
-                result = Box::new(JoinOperator::new(result, op, shared[0].clone()));
+                result = Box::new(JoinOperator::new(result, op, shared.clone()));
             } else {
                 result = Box::new(CartesianProductOperator::new(result, op));
             }
@@ -1694,6 +3114,144 @@ impl QueryPlanner {
         Ok(result)
     }
 
+    /// Attach any deferred predicate whose variables are all bound by now.
+    ///
+    /// The path builders used to hold every predicate that mentions a
+    /// non-anchor variable until the **whole path** was expanded. On LDBC IC3
+    /// that meant `m.creationDate >= … AND m.creationDate < …` -- which
+    /// references only `m`, bound by the *first* expand -- was evaluated after
+    /// the second expand had already produced 409,960 rows, of which 622
+    /// survived. The predicate could have cut the second expand's input by
+    /// ~80% (#328).
+    ///
+    /// Applying a conjunct as soon as its variables are bound cannot change
+    /// the answer of a conjunctive pattern: the rows it removes are rows the
+    /// later filter would have removed. `OPTIONAL MATCH` is not affected --
+    /// this runs inside a single path of a single MATCH, and the outer join is
+    /// built above it.
+    /// Equality predicates of the form `<var>.<prop> = <literal>` for one
+    /// variable, read out of the deferred set **without removing them**.
+    ///
+    /// Additive on purpose. The filter the planner would have built stays
+    /// where it is, so pushing these into an expand cannot change what the
+    /// query returns — only how much is materialised on the way. Getting a
+    /// pushdown subtly wrong is a wrong answer; getting this one wrong is a
+    /// slow query.
+    /// The exact node set a target's equality predicates admit, when that can
+    /// be computed without scanning the whole store.
+    ///
+    /// The profile of LDBC IC11 at SF10 is what motivates this. Pushing
+    /// `org.name = "..."` into the expand (#656) correctly cut its output to
+    /// 190 rows, and the expand still took **74% of the query** — because the
+    /// check costs a `get_node` and a property compare per candidate edge, and
+    /// there are ~29,000 of them. Moving a filter earlier made it more
+    /// expensive per candidate.
+    ///
+    /// Resolving the predicate to node ids once turns that into a hash lookup.
+    /// The property index answers it directly when one exists; otherwise a
+    /// label scan is used, which is worth it only because it happens once at
+    /// plan time against a small label — 7,955 Organisations against 29,000
+    /// edge candidates. The scan is capped for that reason: above the cap the
+    /// per-candidate check is the cheaper of the two (#665).
+    fn resolve_target_ids(
+        &self,
+        labels: &[Label],
+        props: &[(String, PropertyValue)],
+        store: &GraphStore,
+    ) -> Option<HashSet<crate::graph::NodeId>> {
+        let (key, value) = props.first()?;
+
+        // Preferred: an index answers without touching any node.
+        let candidates: Vec<Label> = labels
+            .iter()
+            .cloned()
+            .chain(store.catalog().label_counts.keys().cloned())
+            .collect();
+        for label in &candidates {
+            if let Some(index) = store.property_index.get_index(label, key) {
+                let ids = index.read().unwrap().get(value);
+                if !ids.is_empty() {
+                    return Some(ids.into_iter().collect());
+                }
+            }
+        }
+
+        // Fallback: scan one label, once. Only worth doing when the label is
+        // small — otherwise this trades a per-candidate cost for a per-query
+        // one that is larger.
+        const MAX_SCAN: usize = 50_000;
+        let label = labels.first()?;
+        let nodes = store.get_nodes_by_label(label);
+        if nodes.len() > MAX_SCAN {
+            return None;
+        }
+        Some(
+            nodes
+                .iter()
+                .filter(|n| n.get_property(key).is_some_and(|p| p == value))
+                .map(|n| n.id)
+                .collect(),
+        )
+    }
+
+    fn target_equality_props(
+        deferred: &[Expression],
+        var: &str,
+    ) -> Vec<(String, PropertyValue)> {
+        let mut out = Vec::new();
+        for pred in deferred {
+            for part in flatten_and_predicates(pred) {
+                if let Expression::Binary { left, op: BinaryOp::Eq, right } = &part {
+                    if let (
+                        Expression::Property { variable, property },
+                        Expression::Literal(value),
+                    ) = (left.as_ref(), right.as_ref())
+                    {
+                        if variable == var {
+                            out.push((property.clone(), value.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn apply_ready_predicates(
+        operator: OperatorBox,
+        deferred: &mut Vec<Expression>,
+        bound: &HashSet<String>,
+    ) -> OperatorBox {
+        if deferred.is_empty() {
+            return operator;
+        }
+        let mut ready: Vec<Expression> = Vec::new();
+        deferred.retain(|pred| {
+            let mut vars = HashSet::new();
+            Self::collect_expression_variables(pred, &mut vars);
+            // A predicate with no variables at all is a constant; leave it to
+            // the existing early-predicate path rather than moving it here.
+            if !vars.is_empty() && vars.iter().all(|v| bound.contains(v)) {
+                ready.push(pred.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if ready.is_empty() {
+            return operator;
+        }
+        let filter_expr = ready
+            .into_iter()
+            .reduce(|acc, pred| Expression::Binary {
+                left: Box::new(acc),
+                op: BinaryOp::And,
+                right: Box::new(pred),
+            })
+            .unwrap();
+        Box::new(FilterOperator::new(operator, filter_expr))
+    }
+
     /// Build a path plan anchored at `nodes[anchor_idx]` instead of the pattern's first
     /// node. Traverses backward (reversed edge direction) toward earlier-written nodes
     /// and forward (written direction) toward later-written nodes. Only invoked when
@@ -1708,6 +3266,17 @@ impl QueryPlanner {
     ) -> (OperatorBox, Vec<Expression>) {
         let anchor = &nodes[anchor_idx];
         let anchor_var = anchor.var.clone();
+
+        // Relationship isomorphism (#684). A single-hop pattern cannot reuse an
+        // edge, so it does not pay for the bookkeeping; anything longer must.
+        //
+        // The first expand built here is also the first to execute — each one
+        // wraps the previous — so it is the one that drops history inherited
+        // from an earlier clause. That matters because the rule is scoped to a
+        // clause: `MATCH (a)-[:R]-(b) MATCH (b)-[:R]-(c)` may legitimately walk
+        // the same edge twice, and Neo4j agrees.
+        let track_edges = path.segments.len() > 1;
+        let mut first_expand = true;
 
         // Predicates referencing only the anchor variable can be evaluated at the
         // anchor scan; everything else is deferred until the whole path is built,
@@ -1736,7 +3305,17 @@ impl QueryPlanner {
         }
         candidates.extend(anchor_only_preds);
 
-        let mut path_operator: OperatorBox = if let Some((idx, label, property, op, val)) =
+        // `id()` first: it is unique by construction, so it beats any index
+        // and needs no statistics to know that (#538).
+        let mut path_operator: OperatorBox = if let Some((idx, ids)) =
+            find_id_predicate(&anchor_var, &candidates)
+        {
+            candidates.remove(idx);
+            Box::new(
+                NodeByIdOperator::new(ids, anchor_var.clone())
+                    .with_labels(anchor.labels.clone()),
+            )
+        } else if let Some((idx, label, property, op, val)) =
             find_index_predicate(&anchor_var, &anchor.labels, &candidates, store)
         {
             candidates.remove(idx);
@@ -1751,6 +3330,14 @@ impl QueryPlanner {
             path_operator = Box::new(FilterOperator::new(path_operator, filter_expr));
         }
 
+        // Variables bound so far, so a deferred predicate can be applied the
+        // moment its last variable arrives rather than after the whole path
+        // (#328). This builder is the one that runs whenever the cheapest
+        // anchor is not the pattern's first node -- which on LDBC IC3 and IC6
+        // is most of the time.
+        let mut bound: HashSet<String> = HashSet::new();
+        bound.insert(anchor_var.clone());
+
         // Walk backward toward earlier-written nodes using reversed edge direction:
         // the anchor is now the traversal source, so an originally-outgoing edge from
         // the earlier node must be read as incoming from the anchor's perspective.
@@ -1758,18 +3345,114 @@ impl QueryPlanner {
         for seg_idx in (0..anchor_idx).rev() {
             let segment = &path.segments[seg_idx];
             let target = &nodes[seg_idx];
-            let edge_var = segment.edge.variable.clone();
+            // Same rule as the main path builder: an inline relationship
+            // property constraint is applied rather than dropped (#649). Which
+            // of these builders runs depends on where the cheapest anchor is,
+            // so a fix in only one of them is a fix that depends on the
+            // optimiser's mood.
+            let edge_filter = self.edge_property_filter(&segment.edge, seg_idx);
+            let edge_var = match &edge_filter {
+                Some((var, _)) => Some(var.clone()),
+                None => segment.edge.variable.clone(),
+            };
             let edge_types: Vec<String> = segment.edge.types.iter().map(|t| t.as_str().to_string()).collect();
             let reversed_dir = match segment.edge.direction {
                 Direction::Outgoing => Direction::Incoming,
                 Direction::Incoming => Direction::Outgoing,
                 Direction::Both => Direction::Both,
             };
-            let expand = ExpandOperator::new(path_operator, current_var.clone(), target.var.clone(), edge_var, edge_types, reversed_dir);
-            path_operator = if !target.labels.is_empty() {
-                Box::new(expand.with_target_labels(target.labels.clone()))
+            path_operator = if let Some(length) = &segment.edge.length {
+                // A variable-length segment traversed against the written
+                // direction is the same relation read the other way:
+                // `(a)-[:R*1..2]->(b)` from `b` is `(b)<-[:R*1..2]-(a)`. The
+                // pairs are identical, and the BFS deduplicates by node at
+                // whichever end it starts from.
+                //
+                // Before this, any path containing a `*` was excluded from
+                // anchor selection outright, which is why LDBC IC6 always
+                // started at the person and expanded to 400,257 rows rather
+                // than starting at the tag that selects seven.
+                let mut expand = VarLengthExpandOperator::new(
+                    path_operator,
+                    current_var.clone(),
+                    target.var.clone(),
+                    edge_types,
+                    reversed_dir,
+                    length.min.unwrap_or(1),
+                    length.max.unwrap_or(usize::MAX),
+                );
+                // `MATCH (a)-[r:T*]->(b)` binds `r` to the list of
+                // relationships traversed. Dropping it made the query fail
+                // with "Variable not found: r" (#652).
+                if let Some(ref rv) = segment.edge.variable {
+                    expand = expand.with_rel_variable(rv.clone());
+                }
+                // When the far end resolves to a single node, one reversed BFS
+                // from it answers every input row — see `with_pinned_target`.
+                // This is the shape anchoring produces on LDBC IC6: the walk
+                // ends at the pinned person, and without the pin each of
+                // thousands of candidates expands its own neighbourhood to
+                // discover whether that one person is in it.
+                if path.path_variable.is_none() && length.min.unwrap_or(1) <= 1 {
+                    if let Some(pinned) = pinned_node_for(&target.var, path_preds, store)
+                        .or_else(|| target.properties.as_ref().and_then(|props| {
+                            let inline: Vec<Expression> = props.iter().map(|(k, v)| Expression::Binary {
+                                left: Box::new(Expression::Property {
+                                    variable: target.var.clone(),
+                                    property: k.clone(),
+                                }),
+                                op: BinaryOp::Eq,
+                                right: Box::new(Expression::Literal(v.clone())),
+                            }).collect();
+                            pinned_node_for(&target.var, &inline, store)
+                        }))
+                    {
+                        expand = expand.with_pinned_target(pinned);
+                    }
+                }
+                if !target.labels.is_empty() {
+                    Box::new(expand.with_target_labels(target.labels.clone())) as OperatorBox
+                } else {
+                    Box::new(expand) as OperatorBox
+                }
             } else {
-                Box::new(expand)
+                // A variable already bound has to be *matched*, not rebound.
+                // `ExpandOperator` binds its target unconditionally, so
+                // `MATCH (b)-->(b)` bound the far end of each edge over the
+                // near one and every edge matched -- a graph containing no
+                // self-relationships at all returned one row per edge (#639).
+                // Expanding into a synthetic name and requiring the two to be
+                // equal is what a repeated variable means; the walk continues
+                // from the original, which the filter has just proved is the
+                // same node.
+                let self_ref = bound.contains(&target.var);
+                let expand_var = if self_ref {
+                    format!("__self_{}_{}", target.var, seg_idx)
+                } else {
+                    target.var.clone()
+                };
+                let mut expand = ExpandOperator::new(path_operator, current_var.clone(), expand_var.clone(), edge_var, edge_types, reversed_dir);
+                if track_edges {
+                    expand = expand.with_edge_isolation(first_expand);
+                    first_expand = false;
+                }
+                let expanded: OperatorBox = if !target.labels.is_empty() {
+                    Box::new(expand.with_target_labels(target.labels.clone()))
+                } else {
+                    Box::new(expand)
+                };
+                if self_ref {
+                    Box::new(FilterOperator::new(
+                        expanded,
+                        Expression::Binary {
+                            left: Box::new(Expression::Variable(expand_var)),
+                            op: BinaryOp::Eq,
+                            right: Box::new(Expression::Variable(target.var.clone())),
+                        },
+                    )) as OperatorBox
+                } else {
+                    expanded
+                }
             };
             if let Some(ref props) = target.properties {
                 if !props.is_empty() {
@@ -1777,6 +3460,15 @@ impl QueryPlanner {
                     path_operator = Box::new(FilterOperator::new(path_operator, filter_expr));
                 }
             }
+            if let Some((_, predicate)) = edge_filter {
+                path_operator = Box::new(FilterOperator::new(path_operator, predicate));
+            }
+            bound.insert(target.var.clone());
+            if let Some(ev) = &segment.edge.variable {
+                bound.insert(ev.clone());
+            }
+            path_operator =
+                Self::apply_ready_predicates(path_operator, &mut deferred_predicates, &bound);
             current_var = target.var.clone();
         }
 
@@ -1785,13 +3477,76 @@ impl QueryPlanner {
         for seg_idx in anchor_idx..path.segments.len() {
             let segment = &path.segments[seg_idx];
             let target = &nodes[seg_idx + 1];
-            let edge_var = segment.edge.variable.clone();
+            // Same rule as the main path builder: an inline relationship
+            // property constraint is applied rather than dropped (#649). Which
+            // of these builders runs depends on where the cheapest anchor is,
+            // so a fix in only one of them is a fix that depends on the
+            // optimiser's mood.
+            let edge_filter = self.edge_property_filter(&segment.edge, seg_idx);
+            let edge_var = match &edge_filter {
+                Some((var, _)) => Some(var.clone()),
+                None => segment.edge.variable.clone(),
+            };
             let edge_types: Vec<String> = segment.edge.types.iter().map(|t| t.as_str().to_string()).collect();
-            let expand = ExpandOperator::new(path_operator, current_var.clone(), target.var.clone(), edge_var, edge_types, segment.edge.direction.clone());
-            path_operator = if !target.labels.is_empty() {
-                Box::new(expand.with_target_labels(target.labels.clone()))
+            path_operator = if let Some(length) = &segment.edge.length {
+                let mut expand = VarLengthExpandOperator::new(
+                    path_operator,
+                    current_var.clone(),
+                    target.var.clone(),
+                    edge_types,
+                    segment.edge.direction.clone(),
+                    length.min.unwrap_or(1),
+                    length.max.unwrap_or(usize::MAX),
+                );
+                // `MATCH (a)-[r:T*]->(b)` binds `r` to the list of
+                // relationships traversed. Dropping it made the query fail
+                // with "Variable not found: r" (#652).
+                if let Some(ref rv) = segment.edge.variable {
+                    expand = expand.with_rel_variable(rv.clone());
+                }
+                if !target.labels.is_empty() {
+                    Box::new(expand.with_target_labels(target.labels.clone())) as OperatorBox
+                } else {
+                    Box::new(expand) as OperatorBox
+                }
             } else {
-                Box::new(expand)
+                // A variable already bound has to be *matched*, not rebound.
+                // `ExpandOperator` binds its target unconditionally, so
+                // `MATCH (b)-->(b)` bound the far end of each edge over the
+                // near one and every edge matched -- a graph containing no
+                // self-relationships at all returned one row per edge (#639).
+                // Expanding into a synthetic name and requiring the two to be
+                // equal is what a repeated variable means; the walk continues
+                // from the original, which the filter has just proved is the
+                // same node.
+                let self_ref = bound.contains(&target.var);
+                let expand_var = if self_ref {
+                    format!("__self_{}_{}", target.var, seg_idx)
+                } else {
+                    target.var.clone()
+                };
+                let mut expand = ExpandOperator::new(path_operator, current_var.clone(), expand_var.clone(), edge_var, edge_types, segment.edge.direction.clone());
+                if track_edges {
+                    expand = expand.with_edge_isolation(first_expand);
+                    first_expand = false;
+                }
+                let expanded: OperatorBox = if !target.labels.is_empty() {
+                    Box::new(expand.with_target_labels(target.labels.clone()))
+                } else {
+                    Box::new(expand)
+                };
+                if self_ref {
+                    Box::new(FilterOperator::new(
+                        expanded,
+                        Expression::Binary {
+                            left: Box::new(Expression::Variable(expand_var)),
+                            op: BinaryOp::Eq,
+                            right: Box::new(Expression::Variable(target.var.clone())),
+                        },
+                    )) as OperatorBox
+                } else {
+                    expanded
+                }
             };
             if let Some(ref props) = target.properties {
                 if !props.is_empty() {
@@ -1799,6 +3554,15 @@ impl QueryPlanner {
                     path_operator = Box::new(FilterOperator::new(path_operator, filter_expr));
                 }
             }
+            if let Some((_, predicate)) = edge_filter {
+                path_operator = Box::new(FilterOperator::new(path_operator, predicate));
+            }
+            bound.insert(target.var.clone());
+            if let Some(ev) = &segment.edge.variable {
+                bound.insert(ev.clone());
+            }
+            path_operator =
+                Self::apply_ready_predicates(path_operator, &mut deferred_predicates, &bound);
             current_var = target.var.clone();
         }
 
@@ -1807,6 +3571,30 @@ impl QueryPlanner {
 
     /// Build a filter expression from node properties.
     /// Converts {name: "Alice", age: 30} into (n.name = "Alice" AND n.age = 30)
+    /// A filter for an inline relationship property constraint, if it has one.
+    ///
+    /// `MATCH ()-[r:R {num: 2}]->()` was planned with the type filter only and
+    /// the properties dropped, so it returned **every** `:R` -- a silent
+    /// over-match, and the same query written `WHERE r.num = 2` answered
+    /// correctly. The node side of the pattern has always been filtered; this
+    /// is the relationship side of the same rule (#649).
+    ///
+    /// An anonymous relationship needs a name to filter on, so one is invented
+    /// when the pattern did not give it one. Nothing reads it: `RETURN *`
+    /// expands from the query's own variables, not from the record's keys.
+    fn edge_property_filter(
+        &self,
+        edge: &crate::query::ast::EdgePattern,
+        seg_idx: usize,
+    ) -> Option<(String, Expression)> {
+        let props = edge.properties.as_ref().filter(|p| !p.is_empty())?;
+        let var = edge
+            .variable
+            .clone()
+            .unwrap_or_else(|| format!("__edge_props_{seg_idx}"));
+        Some((var.clone(), self.build_property_filter(&var, props)))
+    }
+
     fn build_property_filter(&self, var: &str, props: &HashMap<String, PropertyValue>) -> Expression {
         let mut conditions: Vec<Expression> = Vec::new();
 
@@ -1937,7 +3725,11 @@ impl QueryPlanner {
             pat.count_alias.clone(),
             pat.edge_type.clone(),
             physical_direction,
-        );
+        )
+        // A degree counts every edge of the type whatever sits at the far end,
+        // so a pattern that labels the neighbour needs the label applied while
+        // counting (#601).
+        .with_neighbor_label(pat.neighbor_label.clone());
         if !group_by_props.is_empty() {
             adj_op = adj_op.with_group_by_props(group_by_props);
         }
@@ -1962,13 +3754,7 @@ impl QueryPlanner {
                 let alias = item
                     .alias
                     .clone()
-                    .unwrap_or_else(|| match &item.expression {
-                        Expression::Variable(v) => v.clone(),
-                        Expression::Property { variable, property } => {
-                            format!("{}.{}", variable, property)
-                        }
-                        _ => format!("col_{}", i),
-                    });
+                    .unwrap_or_else(|| item.column_name(i));
                 output_columns.push(alias.clone());
                 // For the count() item, project the already-bound alias
                 // rather than re-evaluating the aggregate function.
@@ -1983,18 +3769,36 @@ impl QueryPlanner {
                 (expr, alias)
             })
             .collect();
+        // Pair each RETURN item's original expression with the alias this plan actually
+        // emits, so an ORDER BY written either way resolves after the projection.
+        let order_keys: Vec<(Expression, String)> = query
+            .return_clause
+            .as_ref()
+            .map(|rc| {
+                rc.items
+                    .iter()
+                    .zip(projections.iter())
+                    .map(|(item, (_, alias))| (item.expression.clone(), alias.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         operator = Box::new(ProjectOperator::new(operator, projections));
 
         // (GROUP BY is now handled inside AdjacencyCountAggregateOperator
         // via `with_group_by_props` above — no post-aggregate step needed.)
 
-        // ORDER BY — the count alias is already bound, so any ORDER BY
-        // expression the detector accepted evaluates cheaply.
+        // ORDER BY — resolved against the projected aliases, since the sort runs after
+        // the projection and the source variables are gone by then.
         if let Some(order_by) = &query.order_by {
             let sort_items: Vec<(Expression, bool)> = order_by
                 .items
                 .iter()
-                .map(|i| (i.expression.clone(), i.ascending))
+                .map(|i| {
+                    (
+                        resolve_sort_key(&i.expression, &order_keys, SortPosition::AfterProjection),
+                        i.ascending,
+                    )
+                })
                 .collect();
             operator = Box::new(SortOperator::new(operator, sort_items));
         }
@@ -2098,7 +3902,8 @@ impl QueryPlanner {
             pat.core.count_alias.clone(),
             pat.core.edge_type.clone(),
             physical_direction,
-        );
+        )
+        .with_neighbor_label(pat.core.neighbor_label.clone());
         if !group_by_props.is_empty() {
             adj_op = adj_op.with_group_by_props(group_by_props);
         }
@@ -2121,13 +3926,7 @@ impl QueryPlanner {
                 let alias = item
                     .alias
                     .clone()
-                    .unwrap_or_else(|| match &item.expression {
-                        Expression::Variable(v) => v.clone(),
-                        Expression::Property { variable, property } => {
-                            format!("{}.{}", variable, property)
-                        }
-                        _ => format!("col_{}", i),
-                    });
+                    .unwrap_or_else(|| item.column_name(i));
                 output_columns.push(alias.clone());
                 let expr = match &item.expression {
                     Expression::Function { name, .. }
@@ -2140,13 +3939,31 @@ impl QueryPlanner {
                 (expr, alias)
             })
             .collect();
+        // Pair each RETURN item's original expression with the alias this plan actually
+        // emits, so an ORDER BY written either way resolves after the projection.
+        let order_keys: Vec<(Expression, String)> = query
+            .return_clause
+            .as_ref()
+            .map(|rc| {
+                rc.items
+                    .iter()
+                    .zip(projections.iter())
+                    .map(|(item, (_, alias))| (item.expression.clone(), alias.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         operator = Box::new(ProjectOperator::new(operator, projections));
 
         if let Some(order_by) = &query.order_by {
             let sort_items: Vec<(Expression, bool)> = order_by
                 .items
                 .iter()
-                .map(|i| (i.expression.clone(), i.ascending))
+                .map(|i| {
+                    (
+                        resolve_sort_key(&i.expression, &order_keys, SortPosition::AfterProjection),
+                        i.ascending,
+                    )
+                })
                 .collect();
             operator = Box::new(SortOperator::new(operator, sort_items));
         }
@@ -2210,7 +4027,8 @@ impl QueryPlanner {
             pat.core.count_alias.clone(),
             pat.core.edge_type.clone(),
             physical_direction,
-        );
+        )
+        .with_neighbor_label(pat.core.neighbor_label.clone());
         if !group_by_props.is_empty() {
             adj_op = adj_op.with_group_by_props(group_by_props);
         }
@@ -2258,24 +4076,36 @@ impl QueryPlanner {
                 let alias = item
                     .alias
                     .clone()
-                    .unwrap_or_else(|| match &item.expression {
-                        Expression::Variable(v) => v.clone(),
-                        Expression::Property { variable, property } => {
-                            format!("{}.{}", variable, property)
-                        }
-                        _ => format!("col_{}", i),
-                    });
+                    .unwrap_or_else(|| item.column_name(i));
                 output_columns.push(alias.clone());
                 (item.expression.clone(), alias)
             })
             .collect();
+        // Pair each RETURN item's original expression with the alias this plan actually
+        // emits, so an ORDER BY written either way resolves after the projection.
+        let order_keys: Vec<(Expression, String)> = query
+            .return_clause
+            .as_ref()
+            .map(|rc| {
+                rc.items
+                    .iter()
+                    .zip(projections.iter())
+                    .map(|(item, (_, alias))| (item.expression.clone(), alias.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         operator = Box::new(ProjectOperator::new(operator, projections));
 
         if let Some(order_by) = &query.order_by {
             let sort_items: Vec<(Expression, bool)> = order_by
                 .items
                 .iter()
-                .map(|i| (i.expression.clone(), i.ascending))
+                .map(|i| {
+                    (
+                        resolve_sort_key(&i.expression, &order_keys, SortPosition::AfterProjection),
+                        i.ascending,
+                    )
+                })
                 .collect();
             operator = Box::new(SortOperator::new(operator, sort_items));
         }
@@ -2305,11 +4135,54 @@ impl QueryPlanner {
 
         // Collect all nodes to create from the pattern
         // Each node has: (labels, properties, variable_name)
-        let mut nodes_to_create: Vec<(Vec<Label>, HashMap<String, PropertyValue>, Option<String>)> = Vec::new();
+        let mut nodes_to_create: Vec<(
+            Vec<Label>,
+            HashMap<String, PropertyValue>,
+            Option<String>,
+            Option<HashMap<String, Expression>>,
+        )> = Vec::new();
         let mut output_columns: Vec<String> = Vec::new();
 
         // Collect edges to create: (source_var, target_var, edge_type, properties, edge_var)
-        let mut edges_to_create: Vec<(String, String, EdgeType, HashMap<String, PropertyValue>, Option<String>)> = Vec::new();
+        let mut edges_to_create: Vec<crate::query::executor::operator::EdgeToCreate> = Vec::new();
+
+        // Anonymous nodes still need a handle for edge wiring. Edges are wired by variable
+        // name, so an endpoint written as `(:Label)` used to have nothing to wire to and
+        // the edge was dropped -- silently, since the nodes were still created. Give every
+        // anonymous node a synthetic name that cannot collide with a user variable, and
+        // keep it out of `output_columns` so it stays invisible to RETURN.
+        let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for path in &pattern.paths {
+            if let Some(v) = &path.start.variable {
+                declared.insert(v.clone());
+            }
+            for seg in &path.segments {
+                if let Some(v) = &seg.node.variable {
+                    declared.insert(v.clone());
+                }
+            }
+        }
+        let mut anon_seq = 0usize;
+        let mut next_anon = move |declared: &std::collections::HashSet<String>| -> String {
+            loop {
+                let name = format!("__anon_create_{anon_seq}");
+                anon_seq += 1;
+                if !declared.contains(&name) {
+                    return name;
+                }
+            }
+        };
+
+        // A variable bound earlier in the *same* CREATE refers to the node
+        // already being created, not to a new one:
+        //
+        //     CREATE (a), (b), (a)-[:R]->(b)
+        //
+        // creates two nodes and one edge. Re-registering `a` and `b` for
+        // creation made it four nodes — the edge was correct, so the query
+        // succeeded and quietly doubled the graph. This is the shape every
+        // TCK fixture and most of our own loaders are written in.
+        let mut created_vars: HashSet<String> = HashSet::new();
 
         for path in &pattern.paths {
             // Add start node
@@ -2318,15 +4191,38 @@ impl QueryPlanner {
             let properties: HashMap<String, PropertyValue> = start.properties.clone().unwrap_or_default();
             let variable = start.variable.clone();
 
-            // Track output column if variable exists
+            let start_already_bound = variable
+                .as_ref()
+                .is_some_and(|v| created_vars.contains(v));
+
+            // Track output column if variable exists — once per variable, since
+            // a repeat mention is the same node.
             if let Some(ref var) = variable {
-                output_columns.push(var.clone());
+                if !start_already_bound {
+                    output_columns.push(var.clone());
+                }
             }
 
-            nodes_to_create.push((labels, properties, variable.clone()));
+            // Only the *named* variable reaches output_columns above; the synthetic one is
+            // purely for edge wiring.
+            let start_handle = match &variable {
+                Some(v) => v.clone(),
+                None => next_anon(&declared),
+            };
+            if !start_already_bound {
+                if let Some(v) = &variable {
+                    created_vars.insert(v.clone());
+                }
+                nodes_to_create.push((
+                    labels,
+                    properties,
+                    Some(start_handle.clone()),
+                    start.property_exprs.clone(),
+                ));
+            }
 
             // Track current source variable for edge creation
-            let mut current_source_var = variable;
+            let mut current_source_var = Some(start_handle);
 
             // Add nodes and edges from path segments (if any)
             // Example: CREATE (a:Person)-[:KNOWS]->(b:Person)
@@ -2336,11 +4232,31 @@ impl QueryPlanner {
                 let node_properties: HashMap<String, PropertyValue> = node.properties.clone().unwrap_or_default();
                 let node_variable = node.variable.clone();
 
+                let node_already_bound = node_variable
+                    .as_ref()
+                    .is_some_and(|v| created_vars.contains(v));
+
                 if let Some(ref var) = node_variable {
-                    output_columns.push(var.clone());
+                    if !node_already_bound {
+                        output_columns.push(var.clone());
+                    }
                 }
 
-                nodes_to_create.push((node_labels, node_properties, node_variable.clone()));
+                let node_handle = match &node_variable {
+                    Some(v) => v.clone(),
+                    None => next_anon(&declared),
+                };
+                if !node_already_bound {
+                    if let Some(v) = &node_variable {
+                        created_vars.insert(v.clone());
+                    }
+                    nodes_to_create.push((
+                        node_labels,
+                        node_properties,
+                        Some(node_handle.clone()),
+                        node.property_exprs.clone(),
+                    ));
+                }
 
                 // Extract edge information
                 let edge = &segment.edge;
@@ -2350,20 +4266,34 @@ impl QueryPlanner {
                 let edge_properties: HashMap<String, PropertyValue> = edge.properties.clone().unwrap_or_default();
                 let edge_variable = edge.variable.clone();
 
-                // Create edge between source and target nodes
-                // For CREATE, we need both variables to be defined
-                if let (Some(source_var), Some(target_var)) = (&current_source_var, &node_variable) {
+                // Both endpoints now always have a handle (real or synthetic), so an edge
+                // is created for every segment regardless of how the pattern was written.
+                //
+                // Direction is taken from the pattern rather than from write order: an
+                // `<-` segment points at the *earlier* node. This was previously ignored
+                // entirely, so `CREATE (a)<-[:R]-(b)` stored a->b -- an edge pointing the
+                // opposite way to what was written, with nothing to indicate it.
+                if let Some(source_var) = &current_source_var {
+                    let (from, to) = match segment.edge.direction {
+                        Direction::Incoming => (node_handle.clone(), source_var.clone()),
+                        // `-[:R]-` is undirected; CREATE has to pick one, and written
+                        // order is the least surprising choice.
+                        Direction::Outgoing | Direction::Both => {
+                            (source_var.clone(), node_handle.clone())
+                        }
+                    };
                     edges_to_create.push((
-                        source_var.clone(),
-                        target_var.clone(),
+                        from,
+                        to,
                         edge_type,
                         edge_properties,
                         edge_variable,
+                        edge.property_exprs.clone(),
                     ));
                 }
 
                 // Update source variable for next segment
-                current_source_var = node_variable;
+                current_source_var = Some(node_handle);
             }
         }
 
@@ -2499,6 +4429,71 @@ fn flip_comparison_op(op: &BinaryOp) -> BinaryOp {
 /// either operand order (`var.prop OP literal` or `literal OP var.prop`).
 /// Returns the predicate's index within `preds` plus the matched label,
 /// property, normalized operator, and literal value.
+/// Find an `id(var) = <literal>` or `id(var) IN [...]` predicate.
+///
+/// Returns the predicate's position and the node ids it pins, so the caller
+/// can drop it and scan those ids directly.
+///
+/// `id()` is unique by construction, so this needs no cost model and no
+/// statistics: the predicate selects at most one node per literal. Without it
+/// `MATCH (n) WHERE id(n) = 5` lowered to a full label scan plus a filter, and
+/// `shortestPath((a)-[:KNOWS*]-(b)) WHERE id(a) = 1 AND id(b) = 3500` ran
+/// ~1000x slower than the same query written with inline properties (#538).
+fn find_id_predicate(var: &str, preds: &[Expression]) -> Option<(usize, Vec<crate::graph::NodeId>)> {
+    /// `id(x)` applied to exactly this variable.
+    fn is_id_of(expr: &Expression, var: &str) -> bool {
+        matches!(
+            expr,
+            Expression::Function { name, args, .. }
+                if name.eq_ignore_ascii_case("id")
+                    && args.len() == 1
+                    && matches!(&args[0], Expression::Variable(v) if v == var)
+        )
+    }
+
+    fn as_node_id(value: &PropertyValue) -> Option<crate::graph::NodeId> {
+        match value {
+            // Negative ids cannot exist, and `as u64` would wrap one into a
+            // very large positive id that matches nothing slowly.
+            PropertyValue::Integer(i) if *i >= 0 => Some(crate::graph::NodeId::new(*i as u64)),
+            _ => None,
+        }
+    }
+
+    for (i, pred) in preds.iter().enumerate() {
+        let Expression::Binary { left, op, right } = pred else {
+            continue;
+        };
+        // Accept the literal on either side: `id(n) = 5` and `5 = id(n)`.
+        let literal = match (left.as_ref(), right.as_ref()) {
+            (l, Expression::Literal(v)) if is_id_of(l, var) => Some(v),
+            (Expression::Literal(v), r) if is_id_of(r, var) => Some(v),
+            _ => None,
+        };
+        let Some(literal) = literal else { continue };
+
+        match op {
+            BinaryOp::Eq => {
+                if let Some(id) = as_node_id(literal) {
+                    return Some((i, vec![id]));
+                }
+            }
+            BinaryOp::In => {
+                if let PropertyValue::Array(items) = literal {
+                    let ids: Vec<crate::graph::NodeId> = items.iter().filter_map(as_node_id).collect();
+                    // Only if every element was a usable id -- dropping one
+                    // silently would lose rows.
+                    if !ids.is_empty() && ids.len() == items.len() {
+                        return Some((i, ids));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn find_index_predicate(
     var: &str,
     labels: &[Label],
@@ -2535,38 +4530,349 @@ fn find_index_predicate(
 /// falling back to plain label-scan cardinality, and finally an all-nodes scan
 /// for label-free nodes. Ties favor the earliest (first-written) node so
 /// behavior is unchanged when no node is strictly cheaper than the start.
-fn choose_anchor_index(nodes: &[PathNodeRef], path_preds: &[Expression], store: &GraphStore) -> usize {
+/// What the anchor scan reads, and how many rows survive its own predicates.
+///
+/// These are different numbers and conflating them is what made anchor
+/// selection pick the wrong end. A `Tag {name: "…"}` with no index on `name`
+/// must **read** all 16,080 tags, but it **emits** one — and it is the emitted
+/// row count that every subsequent expand multiplies.
+fn anchor_cardinality(
+    node: &PathNodeRef,
+    path_preds: &[Expression],
+    store: &GraphStore,
+) -> (f64, f64) {
     let stats = store.statistics();
+
+    let mut candidates: Vec<Expression> = Vec::new();
+    if let Some(props) = &node.properties {
+        for (prop_name, prop_value) in props {
+            candidates.push(Expression::Binary {
+                left: Box::new(Expression::Property {
+                    variable: node.var.clone(),
+                    property: prop_name.clone(),
+                }),
+                op: BinaryOp::Eq,
+                right: Box::new(Expression::Literal(prop_value.clone())),
+            });
+        }
+    }
+    candidates.extend(path_preds.iter().cloned());
+
+    // `id()` pins exactly one node per literal, whatever the label holds.
+    if let Some((_, ids)) = find_id_predicate(&node.var, &candidates) {
+        let n = ids.len() as f64;
+        return (n, n);
+    }
+
+    if let Some((_, label, property, op, val)) =
+        find_index_predicate(&node.var, &node.labels, &candidates, store)
+    {
+        // An indexed equality: ask the index how many nodes match rather than
+        // estimating. `estimate_equality_selectivity` falls back to 10% when a
+        // property has no statistics, which on a large label costed an index
+        // lookup at a tenth of the label -- more than a full scan of a smaller
+        // one -- and inverted the choice (#303). One probe at plan time also
+        // makes a missing anchor cost 0, so the plan short-circuits.
+        let exact = if matches!(op, BinaryOp::Eq) {
+            store.property_index.indexed_equality_count(&label, &property, &val)
+        } else {
+            None
+        };
+        let rows = match exact {
+            Some(n) => n as f64,
+            None => {
+                let base = stats.estimate_label_scan(&label) as f64;
+                let selectivity = if matches!(op, BinaryOp::Eq) {
+                    stats.estimate_equality_selectivity_for_value(&label, &property, &val)
+                } else {
+                    0.3
+                };
+                (base * selectivity).max(1.0)
+            }
+        };
+        // An index read costs what it returns.
+        return (rows, rows);
+    }
+
+    let Some(label) = node.labels.first() else {
+        return (f64::MAX, f64::MAX);
+    };
+    let scan = stats.estimate_label_scan(label) as f64;
+
+    // No index, so the scan reads the whole label -- but an equality on a
+    // property still cuts what comes *out* of it, and that is what the rest of
+    // the path multiplies.
+    //
+    // Both sources of equality count. Reading only the inline form made
+    // `MATCH (org:Organisation) WHERE org.name = '…'` look like all 7,955
+    // organisations while the identical `MATCH (org:Organisation {name: '…'})`
+    // looked like one — the same query costed two ways depending on where the
+    // author put the predicate. On LDBC IC11 that is the difference between
+    // anchoring on one organisation and anchoring on a person whose two-hop
+    // neighbourhood then has to be enumerated.
+    let mut emitted = scan;
+    let mut apply = |prop_name: &str, prop_value: &PropertyValue| {
+        emitted *= stats.estimate_equality_selectivity_for_value(label, prop_name, prop_value);
+    };
+    if let Some(props) = &node.properties {
+        for (prop_name, prop_value) in props {
+            apply(prop_name, prop_value);
+        }
+    }
+    for pred in path_preds {
+        let Expression::Binary { left, op: BinaryOp::Eq, right } = pred else { continue };
+        let (var, prop, value) = match (left.as_ref(), right.as_ref()) {
+            (Expression::Property { variable, property }, Expression::Literal(v)) => (variable, property, v),
+            (Expression::Literal(v), Expression::Property { variable, property }) => (variable, property, v),
+            _ => continue,
+        };
+        if var == &node.var {
+            apply(prop, value);
+        }
+    }
+    (scan, emitted.max(1.0))
+}
+
+/// Rows out per row in, for one traversal step.
+///
+/// `forward` is the direction the pattern was written; anchoring elsewhere in
+/// the path means traversing some segments against it, and the fan-out of an
+/// edge type is not symmetric -- `HAS_CREATOR` is ~1 outgoing from a Post and
+/// ~337 incoming to a Person.
+fn segment_fanout(
+    segment: &crate::query::ast::PathSegment,
+    from: &PathNodeRef,
+    to: &PathNodeRef,
+    forward: bool,
+    store: &GraphStore,
+) -> f64 {
+    let catalog = store.catalog();
+    let edge_types = &segment.edge.types;
+
+    let step = |source: &PathNodeRef, target: &PathNodeRef, outgoing: bool| -> f64 {
+        if edge_types.is_empty() {
+            // No type named: fall back to the graph-wide average degree.
+            return store.statistics().estimate_expand(None).max(1.0);
+        }
+        edge_types
+            .iter()
+            .map(|et| {
+                if outgoing {
+                    match source.labels.first() {
+                        Some(l) => catalog.estimate_expand_out(l, et),
+                        None => store.statistics().estimate_expand(Some(et)),
+                    }
+                } else {
+                    match target.labels.first() {
+                        Some(l) => catalog.estimate_expand_in(l, et),
+                        None => store.statistics().estimate_expand(Some(et)),
+                    }
+                }
+            })
+            .sum::<f64>()
+            .max(0.01)
+    };
+
+    let one_hop = match (&segment.edge.direction, forward) {
+        (Direction::Outgoing, true) | (Direction::Incoming, false) => step(from, to, true),
+        (Direction::Incoming, true) | (Direction::Outgoing, false) => step(to, from, false),
+        // Undirected reads both adjacencies.
+        (Direction::Both, _) => step(from, to, true) + step(to, from, false),
+    };
+
+    // A variable-length segment compounds: reaching depth k costs roughly
+    // d + d^2 + … + d^k. Capped, because an unbounded `*` would otherwise
+    // produce infinity and make every anchor look equally bad.
+    match &segment.edge.length {
+        None => one_hop,
+        Some(length) => {
+            let max_hops = length.max.unwrap_or(3).min(6) as i32;
+            let mut total = 0.0;
+            for hop in 1..=max_hops.max(1) {
+                total += one_hop.powi(hop);
+            }
+            total.min(1e12)
+        }
+    }
+}
+
+/// Total intermediate rows for a plan anchored at `nodes[anchor]`.
+///
+/// The sum of every operator's output, not just the scan's. That distinction
+/// is the whole point: anchoring LDBC IC6 on the person costs 1 row to start
+/// and then 3,272 -> 409,960 -> 400,257, while anchoring on the tag costs
+/// 16,080 rows to scan and almost nothing after it.
+/// The single node a variable is pinned to, if the predicates pin it to one.
+///
+/// Resolved at plan time by asking the property index, so this only fires when
+/// the pin is exact — an indexed equality matching exactly one node, or an
+/// `id()` literal. A predicate that merely narrows the variable is not a pin,
+/// and treating it as one would silently drop rows.
+fn pinned_node_for(
+    var: &str,
+    preds: &[Expression],
+    store: &GraphStore,
+) -> Option<crate::graph::NodeId> {
+    if let Some((_, ids)) = find_id_predicate(var, preds) {
+        if ids.len() == 1 {
+            return Some(ids[0]);
+        }
+        return None;
+    }
+    for pred in preds {
+        let Expression::Binary { left, op: BinaryOp::Eq, right } = pred else { continue };
+        let (prop_var, prop_name, value) = match (left.as_ref(), right.as_ref()) {
+            (Expression::Property { variable, property }, Expression::Literal(v)) => (variable, property, v),
+            (Expression::Literal(v), Expression::Property { variable, property }) => (variable, property, v),
+            _ => continue,
+        };
+        if prop_var != var {
+            continue;
+        }
+        // Ask the index for the actual matches rather than estimating: a pin
+        // has to be exactly one node, and an estimate cannot establish that.
+        for label in store.catalog().label_counts.keys() {
+            let Some(index) = store.property_index.get_index(label, prop_name) else { continue };
+            let nodes = index.read().unwrap().get(value);
+            if nodes.len() == 1 {
+                return nodes.first().copied();
+            }
+            if !nodes.is_empty() {
+                return None;
+            }
+        }
+    }
+    None
+}
+
+fn estimate_path_cost(
+    path: &PathPattern,
+    nodes: &[PathNodeRef],
+    anchor: usize,
+    path_preds: &[Expression],
+    store: &GraphStore,
+) -> f64 {
+    let (scan_rows, anchor_rows) = anchor_cardinality(&nodes[anchor], path_preds, store);
+    if scan_rows == f64::MAX {
+        return f64::MAX;
+    }
+    let mut total = scan_rows;
+
+    // Backward toward earlier-written nodes, against the written direction.
+    let mut rows = anchor_rows;
+    for seg_idx in (0..anchor).rev() {
+        rows = step_rows(
+            rows,
+            &path.segments[seg_idx],
+            &nodes[seg_idx + 1],
+            &nodes[seg_idx],
+            false,
+            path_preds,
+            store,
+        );
+        total += rows;
+        if !total.is_finite() {
+            return f64::MAX;
+        }
+    }
+
+    // Forward toward later-written nodes.
+    let mut rows = anchor_rows;
+    for seg_idx in anchor..path.segments.len() {
+        rows = step_rows(
+            rows,
+            &path.segments[seg_idx],
+            &nodes[seg_idx],
+            &nodes[seg_idx + 1],
+            true,
+            path_preds,
+            store,
+        );
+        total += rows;
+        if !total.is_finite() {
+            return f64::MAX;
+        }
+    }
+
+    total
+}
+
+/// Rows after one traversal step, bounded by **both** ends.
+///
+/// A step cannot produce more rows than its destination can supply. Multiplying
+/// the incoming rows by a fan-out ignores that, and on a pattern whose far end
+/// is pinned it is wrong by orders of magnitude: LDBC IC6 anchors `p` with
+/// `{id: …}`, so traversing `KNOWS*1..2` *toward* `p` is a check against one
+/// person, not a 41² expansion. Costing it as an expansion made every
+/// alternative anchor look expensive and the planner never left the first node.
+///
+/// The bound is the standard one for a join: the result is at most what either
+/// side can produce, so take the smaller of "rows in × fan-out forward" and
+/// "rows the destination has × fan-out back".
+fn step_rows(
+    rows_in: f64,
+    segment: &crate::query::ast::PathSegment,
+    from: &PathNodeRef,
+    to: &PathNodeRef,
+    forward: bool,
+    path_preds: &[Expression],
+    store: &GraphStore,
+) -> f64 {
+    let forward_estimate = rows_in * segment_fanout(segment, from, to, forward, store);
+
+    // What the destination side can supply, if it is constrained at all.
+    let (_, dest_rows) = anchor_cardinality(to, path_preds, store);
+    if dest_rows == f64::MAX {
+        return forward_estimate;
+    }
+    let reverse_estimate = dest_rows * segment_fanout(segment, to, from, !forward, store);
+
+    forward_estimate.min(reverse_estimate).max(1.0)
+}
+
+/// Which node to start the scan from.
+///
+/// Costed by the **whole path**, not by the anchor's own scan. The previous
+/// version compared only scan cardinalities and therefore always preferred an
+/// indexed endpoint, however expensive the traversal away from it was. On
+/// LDBC IC6:
+///
+/// ```text
+///   anchored on p:Person {id: …}   scan 1     -> 3,272 -> 409,960 -> 400,257
+///   anchored on tag:Tag {name: …}  scan 16,080 -> ~1 -> a handful
+/// ```
+///
+/// Scanning 16,080 rows to avoid 800,000 is the better trade, and only a model
+/// that sums the intermediates can see it.
+fn choose_anchor_index(
+    path: &PathPattern,
+    nodes: &[PathNodeRef],
+    path_preds: &[Expression],
+    store: &GraphStore,
+) -> usize {
     let mut best_idx = 0usize;
     let mut best_cost = f64::MAX;
 
-    for (i, node) in nodes.iter().enumerate() {
-        let mut candidates: Vec<Expression> = Vec::new();
-        if let Some(props) = &node.properties {
-            for (prop_name, prop_value) in props {
-                candidates.push(Expression::Binary {
-                    left: Box::new(Expression::Property { variable: node.var.clone(), property: prop_name.clone() }),
-                    op: BinaryOp::Eq,
-                    right: Box::new(Expression::Literal(prop_value.clone())),
-                });
-            }
+    // `SAMYAMA_EXPLAIN_ANCHORS=1` prints the cost of every candidate anchor.
+    // Anchor choice is the difference between a plan that finishes and one
+    // that times out, and `EXPLAIN` shows only the winner — so when the winner
+    // looks wrong there is otherwise nothing to inspect but the source.
+    let trace = std::env::var("SAMYAMA_EXPLAIN_ANCHORS").is_ok_and(|v| v == "1");
+
+    for i in 0..nodes.len() {
+        let cost = estimate_path_cost(path, nodes, i, path_preds, store);
+        if trace {
+            let (scan, emitted) = anchor_cardinality(&nodes[i], path_preds, store);
+            eprintln!(
+                "[anchor] {:<12} labels={:?} scan={:.0} emitted={:.0} path_cost={:.0}",
+                nodes[i].var, nodes[i].labels.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
+                scan, emitted, cost
+            );
         }
-        candidates.extend(path_preds.iter().cloned());
-
-        let cost = if let Some((_, label, property, op, _)) = find_index_predicate(&node.var, &node.labels, &candidates, store) {
-            let base = stats.estimate_label_scan(&label) as f64;
-            let selectivity = if matches!(op, BinaryOp::Eq) {
-                stats.estimate_equality_selectivity(&label, &property)
-            } else {
-                0.3
-            };
-            (base * selectivity).max(1.0)
-        } else if let Some(label) = node.labels.first() {
-            stats.estimate_label_scan(label) as f64
-        } else {
-            f64::MAX
-        };
-
+        // Strict, so node 0 wins ties: re-anchoring has a real cost the model
+        // does not capture (a reversed traversal reads the other adjacency,
+        // which may be colder), and the written order is the better default
+        // when the estimate cannot tell them apart.
         if cost < best_cost {
             best_cost = cost;
             best_idx = i;
@@ -2590,6 +4896,504 @@ fn flatten_and_predicates(expr: &Expression) -> Vec<Expression> {
 }
 
 impl QueryPlanner {
+    /// Plan a query held as an ordered clause sequence.
+    ///
+    /// Walks the clauses in written order, threading one operator through
+    /// them, which is what the by-kind representation cannot do: it has one
+    /// `Option<CreateClause>` and no way to say "this create happens after
+    /// that projection".
+    /// Wrap `input` with the node and edge creation a CREATE pattern asks for.
+    ///
+    /// Mirrors the construction the `MATCH … CREATE` path uses, so the clause
+    /// pipeline creates through the same operator rather than a second
+    /// implementation. `bound` names the variables already in scope: those are
+    /// referenced, not re-created, which is the rule that stops
+    /// `MATCH (a) CREATE (a)-[:R]->(b)` making a second `a`.
+    fn build_create_on_input(
+        &self,
+        input: OperatorBox,
+        pattern: &crate::query::ast::Pattern,
+        bound: &HashSet<String>,
+        anon_seq: &mut usize,
+    ) -> OperatorBox {
+        use crate::query::executor::operator::MatchCreateEdgeOperator;
+
+        let mut nodes_to_create: Vec<(
+            String,
+            Vec<Label>,
+            HashMap<String, PropertyValue>,
+            Option<HashMap<String, Expression>>,
+        )> = Vec::new();
+        let mut edges_to_create: Vec<crate::query::executor::operator::EdgeToCreate> =
+            Vec::new();
+
+        let mut handle_for = |node: &crate::query::ast::NodePattern,
+                              nodes: &mut Vec<(
+            String,
+            Vec<Label>,
+            HashMap<String, PropertyValue>,
+            Option<HashMap<String, Expression>>,
+        )>,
+                              seq: &mut usize|
+         -> String {
+            match &node.variable {
+                // Already in scope, or already registered by an earlier path in
+                // this same CREATE: reference it.
+                Some(v) if bound.contains(v) || nodes.iter().any(|(h, ..)| h == v) => v.clone(),
+                Some(v) => {
+                    nodes.push((
+                        v.clone(),
+                        node.labels.clone(),
+                        node.properties.clone().unwrap_or_default(),
+                        node.property_exprs.clone(),
+                    ));
+                    v.clone()
+                }
+                None => {
+                    let h = format!("__anon_pipe_{seq}");
+                    *seq += 1;
+                    nodes.push((
+                        h.clone(),
+                        node.labels.clone(),
+                        node.properties.clone().unwrap_or_default(),
+                        node.property_exprs.clone(),
+                    ));
+                    h
+                }
+            }
+        };
+
+        for path in &pattern.paths {
+            let mut current = handle_for(&path.start, &mut nodes_to_create, anon_seq);
+            for segment in &path.segments {
+                let target = handle_for(&segment.node, &mut nodes_to_create, anon_seq);
+                let edge_type = segment
+                    .edge
+                    .types
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| EdgeType::new("RELATED_TO"));
+                let (from, to) = match segment.edge.direction {
+                    Direction::Incoming => (target.clone(), current.clone()),
+                    Direction::Outgoing | Direction::Both => (current.clone(), target.clone()),
+                };
+                edges_to_create.push((
+                    from,
+                    to,
+                    edge_type,
+                    segment.edge.properties.clone().unwrap_or_default(),
+                    segment.edge.variable.clone(),
+                    segment.edge.property_exprs.clone(),
+                ));
+                current = target;
+            }
+        }
+
+        if edges_to_create.is_empty() && nodes_to_create.is_empty() {
+            return input;
+        }
+        Box::new(MatchCreateEdgeOperator::with_nodes(
+            input,
+            nodes_to_create,
+            edges_to_create,
+        ))
+    }
+
+    fn plan_clause_pipeline(
+        &self,
+        query: &Query,
+        store: &GraphStore,
+    ) -> ExecutionResult<ExecutionPlan> {
+        use crate::query::ast::Clause;
+        use crate::query::executor::operator::SingleRowOperator;
+
+        let clauses = &query.clauses;
+
+        // The leading run of *reading* clauses is planned by the established
+        // path: it is legacy-representable by construction, and rebuilding
+        // pattern planning here would be a second implementation of the
+        // hardest part of the planner.
+        let split = clauses
+            .iter()
+            .position(|c| !matches!(c, Clause::Match(_) | Clause::Where(_) | Clause::Unwind(_)))
+            .unwrap_or(clauses.len());
+
+        let mut operator: OperatorBox = if split == 0 {
+            // No reading prefix — a query that opens with `WITH` projects from
+            // a single empty row.
+            Box::new(SingleRowOperator::new())
+        } else {
+            let mut prefix = Query::new();
+            for clause in &clauses[..split] {
+                match clause {
+                    Clause::Match(m) => prefix.match_clauses.push(m.clone()),
+                    Clause::Where(w) => prefix.where_clause = Some(w.clone()),
+                    Clause::Unwind(u) => {
+                        if prefix.unwind_clause.is_none() {
+                            prefix.unwind_clause = Some(u.clone());
+                            prefix.unwind_leading = prefix.match_clauses.is_empty();
+                        } else {
+                            prefix.extra_unwind_clauses.push(u.clone());
+                        }
+                    }
+                    _ => unreachable!("split stops at the first non-reading clause"),
+                }
+            }
+            self.plan_inner(&prefix, store)?.root
+        };
+
+        let mut output_columns: Vec<String> = Vec::new();
+        // Variables in scope. A CREATE references those and creates the rest;
+        // a WITH replaces the set with what it projects.
+        let mut bound: HashSet<String> = HashSet::new();
+        for clause in &clauses[..split] {
+            match clause {
+                Clause::Match(m) => {
+                    for path in &m.pattern.paths {
+                        if let Some(v) = &path.path_variable { bound.insert(v.clone()); }
+                        if let Some(v) = &path.start.variable { bound.insert(v.clone()); }
+                        for seg in &path.segments {
+                            if let Some(v) = &seg.edge.variable { bound.insert(v.clone()); }
+                            if let Some(v) = &seg.node.variable { bound.insert(v.clone()); }
+                        }
+                    }
+                }
+                Clause::Unwind(u) => { bound.insert(u.variable.clone()); }
+                _ => {}
+            }
+        }
+        let mut anon_seq = 0usize;
+        // Set when a RETURN has already placed the sort below its projection.
+        let mut order_by_applied = false;
+
+        for clause in &clauses[split..] {
+            match clause {
+                Clause::Create(cc) => {
+                    // Scope as it stands *before* this CREATE decides what to
+                    // create. Adding the pattern's own variables first would
+                    // make every one of them look already-bound, and the
+                    // clause would create nothing.
+                    operator =
+                        self.build_create_on_input(operator, &cc.pattern, &bound, &mut anon_seq);
+                    for path in &cc.pattern.paths {
+                        if let Some(v) = &path.start.variable {
+                            bound.insert(v.clone());
+                        }
+                        for seg in &path.segments {
+                            if let Some(v) = &seg.edge.variable {
+                                bound.insert(v.clone());
+                            }
+                            if let Some(v) = &seg.node.variable {
+                                bound.insert(v.clone());
+                            }
+                        }
+                    }
+                }
+                Clause::Match(mc) => {
+                    // Same join rule as the established multi-MATCH path: every
+                    // shared variable is a join key, and only a pattern sharing
+                    // nothing with what is already bound becomes a cartesian
+                    // product. Taking a subset of the keys would silently widen
+                    // the result instead of failing (#360), so the intersection
+                    // is taken whole and sorted — it comes from a HashSet, and
+                    // an unsorted key order varies between runs.
+                    let clause_vars = Self::clause_variables(&mc.pattern);
+                    let match_op = self.dispatch_plan_match(mc, None, store)?;
+                    let mut shared: Vec<String> = bound.intersection(&clause_vars).cloned().collect();
+                    shared.sort();
+                    operator = if shared.is_empty() {
+                        Box::new(CartesianProductOperator::new(operator, match_op)) as OperatorBox
+                    } else if mc.optional {
+                        let right_only: Vec<String> =
+                            clause_vars.difference(&bound).cloned().collect();
+                        Box::new(LeftOuterJoinOperator::new(operator, match_op, shared, right_only))
+                            as OperatorBox
+                    } else {
+                        Box::new(JoinOperator::new(operator, match_op, shared)) as OperatorBox
+                    };
+                    bound.extend(clause_vars);
+                }
+                Clause::Merge(mc) => {
+                    let on_create: Vec<(String, String, Expression)> = mc
+                        .on_create_set
+                        .iter()
+                        .map(|i| (i.variable.clone(), i.property.clone(), i.value.clone()))
+                        .collect();
+                    let on_match: Vec<(String, String, Expression)> = mc
+                        .on_match_set
+                        .iter()
+                        .map(|i| (i.variable.clone(), i.property.clone(), i.value.clone()))
+                        .collect();
+                    let on_create_labels: Vec<(String, Vec<Label>)> = mc
+                        .on_create_labels
+                        .iter()
+                        .map(|l| (l.variable.clone(), l.labels.clone()))
+                        .collect();
+                    let on_match_labels: Vec<(String, Vec<Label>)> = mc
+                        .on_match_labels
+                        .iter()
+                        .map(|l| (l.variable.clone(), l.labels.clone()))
+                        .collect();
+                    operator = Box::new(
+                        MergeOperator::new(
+                            mc.pattern.clone(),
+                            on_create,
+                            on_match,
+                            on_create_labels,
+                            on_match_labels,
+                        )
+                        .with_input(operator),
+                    );
+                    for path in &mc.pattern.paths {
+                        if let Some(v) = &path.start.variable {
+                            bound.insert(v.clone());
+                        }
+                        for seg in &path.segments {
+                            if let Some(v) = &seg.edge.variable {
+                                bound.insert(v.clone());
+                            }
+                            if let Some(v) = &seg.node.variable {
+                                bound.insert(v.clone());
+                            }
+                        }
+                    }
+                }
+                Clause::With(wc) => {
+                    operator = self.build_with_barrier(operator, wc, store)?;
+                    bound = wc
+                        .items
+                        .iter()
+                        .filter_map(|i| i.alias.clone().or_else(|| match &i.expression {
+                            Expression::Variable(v) => Some(v.clone()),
+                            _ => None,
+                        }))
+                        .collect();
+                    output_columns = wc
+                        .items
+                        .iter()
+                        .map(|i| i.alias.clone().unwrap_or_else(|| match &i.expression {
+                            Expression::Variable(v) => v.clone(),
+                            Expression::Property { variable, property } => {
+                                format!("{variable}.{property}")
+                            }
+                            _ => String::new(),
+                        }))
+                        .collect();
+                }
+                Clause::Unwind(u) => {
+                    operator = Box::new(UnwindOperator::new(
+                        operator,
+                        u.expression.clone(),
+                        u.variable.clone(),
+                    ));
+                    bound.insert(u.variable.clone());
+                }
+                Clause::Set(sc) => {
+                    let items: Vec<(String, String, Expression)> = sc
+                        .items
+                        .iter()
+                        .map(|i| (i.variable.clone(), i.property.clone(), i.value.clone()))
+                        .collect();
+                    let entity_items: Vec<(String, bool, Expression)> = sc
+                        .entity_items
+                        .iter()
+                        .map(|i| (i.variable.clone(), i.merge, i.value.clone()))
+                        .collect();
+                    if !items.is_empty() || !entity_items.is_empty() {
+                        operator = Box::new(SetPropertyOperator::with_entity_items(
+                            operator, items, entity_items,
+                        ));
+                    }
+                    let adds: Vec<(String, Label)> = sc
+                        .label_items
+                        .iter()
+                        .flat_map(|i| i.labels.iter().map(|l| (i.variable.clone(), l.clone())))
+                        .collect();
+                    if !adds.is_empty() {
+                        operator = Box::new(LabelMutationOperator::new(operator, adds, Vec::new()));
+                    }
+                }
+                Clause::Remove(rc) => {
+                    let mut props = Vec::new();
+                    let mut labels = Vec::new();
+                    for item in &rc.items {
+                        match item {
+                            crate::query::ast::RemoveItem::Property { variable, property } => {
+                                props.push((variable.clone(), property.clone()));
+                            }
+                            crate::query::ast::RemoveItem::Label { variable, label } => {
+                                labels.push((variable.clone(), label.clone()));
+                            }
+                        }
+                    }
+                    if !props.is_empty() {
+                        operator = Box::new(RemovePropertyOperator::new(operator, props));
+                    }
+                    if !labels.is_empty() {
+                        operator = Box::new(LabelMutationOperator::new(operator, Vec::new(), labels));
+                    }
+                }
+                Clause::Delete(dc) => {
+                    let vars: Vec<String> = dc
+                        .expressions
+                        .iter()
+                        .filter_map(|e| match e {
+                            Expression::Variable(v) => Some(v.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    operator = Box::new(DeleteOperator::new(operator, vars, dc.detach));
+                }
+                Clause::Where(w) => {
+                    operator = Box::new(FilterOperator::new(operator, w.predicate.clone()));
+                }
+                Clause::Return(rc) => {
+                    // ORDER BY goes **below** the projection, not after it.
+                    //
+                    // `WITH p, count(q) AS rng RETURN p ORDER BY rng` sorts on
+                    // a column the RETURN does not carry. Sorting above the
+                    // projection leaves the key unbound, the sort silently
+                    // becomes a no-op, and the rows come back in whatever
+                    // order the barrier produced — which is hash order, so the
+                    // answer differs between processes. CH-DETERM caught
+                    // exactly this scenario after the pipeline landed.
+                    if let Some(order_by) = &query.order_by {
+                        let order_keys: Vec<(Expression, String)> = rc
+                            .items
+                            .iter()
+                            .map(|i| {
+                                let alias = i.alias.clone().unwrap_or_else(|| match &i.expression {
+                                    Expression::Variable(v) => v.clone(),
+                                    Expression::Property { variable, property } => {
+                                        format!("{variable}.{property}")
+                                    }
+                                    _ => String::new(),
+                                });
+                                (i.expression.clone(), alias)
+                            })
+                            .collect();
+                        let sort_items: Vec<(Expression, bool)> = order_by
+                            .items
+                            .iter()
+                            .map(|i| {
+                                (
+                                    resolve_sort_key(
+                                        &i.expression,
+                                        &order_keys,
+                                        SortPosition::BeforeProjection,
+                                    ),
+                                    i.ascending,
+                                )
+                            })
+                            .collect();
+                        operator = Box::new(SortOperator::new(operator, sort_items));
+                        order_by_applied = true;
+                    }
+
+                    // An aggregate in RETURN needs an Aggregate below the
+                    // projection. Without this the pipeline projected
+                    // `count(*)` as an ordinary expression, it reached the
+                    // scalar evaluator, and the query died with "Unknown
+                    // function: count" — for every shape that opens with WITH,
+                    // which is what routes a query here in the first place.
+                    //
+                    // The `Clause::With` arm of this same function already did
+                    // this; only RETURN was missed, so the two clauses in one
+                    // pipeline disagreed about what an aggregate is.
+                    let mut agg_counter = 0usize;
+                    let mut aggregates: Vec<AggregateFunction> = Vec::new();
+                    let mut group_by: Vec<(Expression, String)> = Vec::new();
+                    let mut post_projections: Vec<(Expression, String)> = Vec::new();
+                    let mut has_aggregation = false;
+                    let mut rewritten_items: Vec<(Expression, Expression, String)> = Vec::new();
+
+                    for (idx, i) in rc.items.iter().enumerate() {
+                        let alias = i.column_name(idx);
+                        let (rewritten, extracted) =
+                            extract_nested_aggregates(&i.expression, &mut agg_counter);
+                        if !extracted.is_empty() {
+                            has_aggregation = true;
+                        }
+                        rewritten_items.push((i.expression.clone(), rewritten, alias));
+                        aggregates.extend(extracted);
+                    }
+
+                    let projections: Vec<(Expression, String)> = if has_aggregation {
+                        for (original, rewritten, alias) in &rewritten_items {
+                            // An item with no aggregate inside it is a grouping
+                            // key; one with an aggregate projects from the
+                            // aggregate's alias after the Aggregate runs.
+                            if rewritten == original {
+                                group_by.push((original.clone(), alias.clone()));
+                                post_projections
+                                    .push((Expression::Variable(alias.clone()), alias.clone()));
+                            } else {
+                                post_projections.push((rewritten.clone(), alias.clone()));
+                            }
+                        }
+                        operator = Box::new(AggregateOperator::new(
+                            operator,
+                            group_by,
+                            std::mem::take(&mut aggregates),
+                        ));
+                        post_projections
+                    } else {
+                        rewritten_items
+                            .into_iter()
+                            .map(|(original, _, alias)| (original, alias))
+                            .collect()
+                    };
+                    output_columns = projections.iter().map(|(_, a)| a.clone()).collect();
+                    operator = Box::new(ProjectOperator::new(operator, projections));
+                    if rc.distinct {
+                        operator = Box::new(DistinctOperator::new(operator));
+                    }
+                }
+                // Not yet threaded through the pipeline. Refusing is the point:
+                // planning these as though the clause order were different is
+                // how a parse error becomes a wrong answer.
+                unsupported => {
+                    let shape: Vec<&str> = clauses.iter().map(|c| c.kind()).collect();
+                    return Err(ExecutionError::RuntimeError(format!(
+                        "`{}` is not yet supported in this clause position (query shape: {}). \
+                         The parser accepts this order; the planner threads MATCH, WHERE, \
+                         UNWIND, WITH, CREATE, MERGE, SET, REMOVE, DELETE and RETURN through it \
+                         so far, and FOREACH and CALL are still to come (samyama-graph#617).",
+                        unsupported.kind(),
+                        shape.join(" ")
+                    )));
+                }
+            }
+        }
+
+        if let Some(order_by) = &query.order_by {
+            if !order_by_applied {
+                let sort_items: Vec<(Expression, bool)> = order_by
+                    .items
+                    .iter()
+                    .map(|i| (i.expression.clone(), i.ascending))
+                    .collect();
+                operator = Box::new(SortOperator::new(operator, sort_items));
+            }
+        }
+        if let Some(skip) = query.skip {
+            operator = Box::new(SkipOperator::new(operator, skip));
+        }
+        if let Some(limit) = query.limit {
+            operator = Box::new(LimitOperator::new(operator, limit));
+        }
+
+        let is_write = clauses.iter().any(|c| c.is_write());
+        Ok(ExecutionPlan {
+            root: operator,
+            output_columns,
+            is_write,
+            candidates_evaluated: 1,
+            chosen_plan_cost: 0.0,
+            candidate_costs: Vec::new(),
+        })
+    }
+
     /// Build a WithBarrier operator from a WithClause (extracted for multi-WITH reuse)
     fn build_with_barrier(&self, input: OperatorBox, with_clause: &WithClause, _store: &GraphStore) -> ExecutionResult<OperatorBox> {
         let mut items = Vec::new();
@@ -2607,25 +5411,7 @@ impl QueryPlanner {
         let mut item_infos = Vec::new();
 
         for (idx, item) in with_clause.items.iter().enumerate() {
-            let alias = item.alias.clone().unwrap_or_else(|| {
-                match &item.expression {
-                    Expression::Variable(var) => var.clone(),
-                    Expression::Property { variable, property } => format!("{}.{}", variable, property),
-                    Expression::Function { name, args, distinct } => {
-                        let arg_strs: Vec<String> = args.iter().map(|a| match a {
-                            Expression::Variable(v) => v.clone(),
-                            Expression::Property { variable, property } => format!("{}.{}", variable, property),
-                            _ => "?".to_string(),
-                        }).collect();
-                        if *distinct {
-                            format!("{}(DISTINCT {})", name, arg_strs.join(", "))
-                        } else {
-                            format!("{}({})", name, arg_strs.join(", "))
-                        }
-                    },
-                    _ => format!("col_{}", idx),
-                }
-            });
+            let alias = item.column_name(idx);
 
             let (rewritten, extracted) = extract_nested_aggregates(&item.expression, &mut agg_counter);
             if !extracted.is_empty() {
@@ -2638,6 +5424,13 @@ impl QueryPlanner {
                 extracted_aggs: extracted,
             });
         }
+
+        // Captured before `item_infos` is consumed: ORDER BY may restate any
+        // projected expression instead of naming its alias.
+        let projections: Vec<(Expression, String)> = item_infos
+            .iter()
+            .map(|i| (i.original_expr.clone(), i.alias.clone()))
+            .collect();
 
         for info in item_infos {
             if has_aggregation {
@@ -2653,8 +5446,15 @@ impl QueryPlanner {
             }
         }
 
-        let sort_items: Vec<(Expression, bool)> = with_clause.order_by.as_ref()
-            .map(|ob| ob.items.iter().map(|i| (i.expression.clone(), i.ascending)).collect())
+        let sort_items: Vec<(Expression, bool)> = with_clause
+            .order_by
+            .as_ref()
+            .map(|ob| {
+                ob.items
+                    .iter()
+                    .map(|i| (rewrite_sort_key(&i.expression, &projections), i.ascending))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let where_predicate = with_clause.where_clause.as_ref()
@@ -2676,8 +5476,23 @@ impl QueryPlanner {
 
     /// Extract variable names from a MATCH clause
     fn extract_match_vars(&self, mc: &MatchClause) -> HashSet<String> {
+        Self::clause_variables(&mc.pattern)
+    }
+
+    /// Every variable a MATCH clause binds, **including the named path**.
+    ///
+    /// Leaving the path variable out is what made
+    /// `OPTIONAL MATCH p = (a)-[:X]->(b) RETURN p` fail with "Variable not
+    /// found: p" when nothing matched. The left outer join fills its
+    /// right-hand-only variables with null, and that list is this set minus
+    /// what was already bound -- so a variable missing here is a variable the
+    /// join never nulls, and an unmatched OPTIONAL MATCH then looks like a
+    /// query referring to something that does not exist. `b` was nulled
+    /// correctly the whole time; only `p` was invisible.
+    fn clause_variables(pattern: &crate::query::ast::Pattern) -> HashSet<String> {
         let mut vars = HashSet::new();
-        for path in &mc.pattern.paths {
+        for path in &pattern.paths {
+            if let Some(v) = &path.path_variable { vars.insert(v.clone()); }
             if let Some(v) = &path.start.variable { vars.insert(v.clone()); }
             for seg in &path.segments {
                 if let Some(v) = &seg.node.variable { vars.insert(v.clone()); }
@@ -2762,6 +5577,17 @@ impl QueryPlanner {
             if let Some(ref ev) = edge_var {
                 vars.insert(ev.clone());
             }
+            // Apply any deferred conjunct whose variables are now all bound,
+            // rather than holding it until the whole path is expanded (#328).
+            //
+            // This is the builder LDBC IC3, IC6 and IC9 actually use -- their
+            // second MATCH starts from a variable bound by a preceding WITH,
+            // so neither of the other two path builders runs. IC3 carried
+            // 409,960 rows through `(m)-[:IS_LOCATED_IN]->(place)` before
+            // applying a date filter on `m` that only 622 rows survive, and
+            // `m` is bound by the expand before it.
+            path_operator =
+                Self::apply_ready_predicates(path_operator, &mut deferred_predicates, &vars);
             current_var = target_var;
         }
 
@@ -3439,6 +6265,9 @@ mod tests {
             create_clause: None,
             order_by: None,
             limit: None,
+            extra_unwind_clauses: Vec::new(),
+            clauses: Vec::new(),
+            needs_clause_pipeline: false,
             skip: None,
             call_clause: None,
             call_subquery: None,
@@ -3450,12 +6279,17 @@ mod tests {
             create_index_clause: None,
             drop_index_clause: None,
             create_constraint_clause: None,
+            create_hierarchy_index_clause: None,
+            drop_hierarchy_index: None,
+            rebuild_hierarchy_index: None,
+            show_hierarchy_indexes: false,
             show_indexes: false,
             show_constraints: false,
             profile: false,
             params: std::collections::HashMap::new(),
             foreach_clause: None,
             unwind_clause: None,
+            unwind_leading: false,
             merge_clause: None,
             union_queries: vec![],
             explain: false,

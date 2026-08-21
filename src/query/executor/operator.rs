@@ -64,6 +64,8 @@
 //! - `HashMap` — build phase of hash joins in `JoinOperator`
 //! - `BTreeSet` — sorted unique results where ordering matters
 
+use std::sync::Arc;
+use crate::query::executor::record::PropertyCursor;
 use crate::graph::{GraphStore, Label, NodeId, EdgeType};
 use crate::query::ast::{Expression, BinaryOp, UnaryOp, Direction, Pattern};
 use crate::query::executor::{ExecutionError, ExecutionResult, Record, Value, RecordBatch};
@@ -127,11 +129,47 @@ fn eval_binary_op(op: &BinaryOp, left: Value, right: Value) -> ExecutionResult<V
         Value::Null => PropertyValue::Null,
         _ => return Err(ExecutionError::TypeError("Binary op requires property values".to_string())),
     };
+    // Cypher's three-valued logic: any comparison with a null operand is *unknown*, not
+    // true or false, and a WHERE treats unknown as "exclude". Evaluating `null <> 1` as
+    // true kept every row whose property was simply absent — the opposite of what the
+    // predicate asks. `IS NULL` / `IS NOT NULL` are postfix operators and unaffected;
+    // they remain the way to test for absence.
+    if matches!(
+        op,
+        BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+    ) && (matches!(left_prop, PropertyValue::Null) || matches!(right_prop, PropertyValue::Null))
+    {
+        return Ok(Value::Property(PropertyValue::Null));
+    }
+
     let result = match op {
         BinaryOp::Eq => PropertyValue::Boolean(left_prop == right_prop),
         BinaryOp::Ne => PropertyValue::Boolean(left_prop != right_prop),
+        BinaryOp::Pow => match (&left_prop, &right_prop) {
+            (PropertyValue::Null, _) | (_, PropertyValue::Null) => PropertyValue::Null,
+            _ => {
+                // Cypher's `^` is float exponentiation even over integers:
+                // `2 ^ 3` is 8.0, and `2 ^ -1` has to be 0.5 rather than 0.
+                //
+                // `as_float` returns `None` for an `Integer`, so it cannot be
+                // used alone here -- doing that made `2 ^ 3` answer
+                // "^ requires numeric operands".
+                let numeric = |p: &PropertyValue| -> Option<f64> {
+                    p.as_float().or_else(|| p.as_integer().map(|i| i as f64))
+                };
+                match (numeric(&left_prop), numeric(&right_prop)) {
+                    (Some(base), Some(exp)) => PropertyValue::Float(base.powf(exp)),
+                    _ => return Err(ExecutionError::TypeError("^ requires numeric operands".to_string())),
+                }
+            }
+        },
+        BinaryOp::Xor => match (&left_prop, &right_prop) {
+            (PropertyValue::Null, _) | (_, PropertyValue::Null) => PropertyValue::Null,
+            (PropertyValue::Boolean(l), PropertyValue::Boolean(r)) => PropertyValue::Boolean(l != r),
+            _ => return Err(ExecutionError::TypeError("XOR requires boolean operands".to_string())),
+        },
         BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
-            let cmp = left_prop.partial_cmp(&right_prop);
+            let cmp = cypher_ordering(&left_prop, &right_prop);
             match (op, cmp) {
                 (BinaryOp::Lt, Some(std::cmp::Ordering::Less)) => PropertyValue::Boolean(true),
                 (BinaryOp::Le, Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)) => PropertyValue::Boolean(true),
@@ -160,6 +198,28 @@ fn eval_binary_op(op: &BinaryOp, left: Value, right: Value) -> ExecutionResult<V
             (PropertyValue::Integer(l), PropertyValue::Float(r)) => PropertyValue::Float(*l as f64 + r),
             (PropertyValue::Float(l), PropertyValue::Integer(r)) => PropertyValue::Float(l + *r as f64),
             (PropertyValue::String(l), PropertyValue::String(r)) => PropertyValue::String(format!("{}{}", l, r)),
+            // List concatenation, and appending or prepending a scalar. Cypher
+            // defines all three for `+`; none of them worked (#578).
+            (PropertyValue::Array(l), PropertyValue::Array(r)) => {
+                let mut out = l.clone();
+                out.extend(r.iter().cloned());
+                PropertyValue::Array(out)
+            }
+            // Null is excluded here so the propagation arm below still governs
+            // it. `[1,2] + null` appending a null element is arguably Cypher's
+            // answer, but it is a judgement call and this is not the change to
+            // make it in -- the existing rule is that any null operand makes the
+            // result null (#457), and it stays.
+            (PropertyValue::Array(l), scalar) if !matches!(scalar, PropertyValue::Null) => {
+                let mut out = l.clone();
+                out.push(scalar.clone());
+                PropertyValue::Array(out)
+            }
+            (scalar, PropertyValue::Array(r)) if !matches!(scalar, PropertyValue::Null) => {
+                let mut out = vec![scalar.clone()];
+                out.extend(r.iter().cloned());
+                PropertyValue::Array(out)
+            }
             // DateTime + Duration
             (PropertyValue::DateTime(dt), PropertyValue::Duration { months, days, seconds, .. }) |
             (PropertyValue::Duration { months, days, seconds, .. }, PropertyValue::DateTime(dt)) => {
@@ -170,6 +230,12 @@ fn eval_binary_op(op: &BinaryOp, left: Value, right: Value) -> ExecutionResult<V
              PropertyValue::Duration { months: m2, days: d2, seconds: s2, nanos: n2 }) => {
                 PropertyValue::Duration { months: m1 + m2, days: d1 + d2, seconds: s1 + s2, nanos: n1 + n2 }
             }
+            // Cypher null propagation: any arithmetic with a null operand is null,
+            // not an error. Without this, `p.a + p.missing` aborts the whole query --
+            // and a property absent on some nodes is the ordinary state of a property
+            // graph, not an exceptional one (#457). The logical and comparison operators
+            // already propagate null this way; arithmetic was the outlier.
+            (PropertyValue::Null, _) | (_, PropertyValue::Null) => PropertyValue::Null,
             _ => return Err(ExecutionError::TypeError("Add requires numeric or string operands".to_string())),
         },
         BinaryOp::Sub => match (&left_prop, &right_prop) {
@@ -192,6 +258,7 @@ fn eval_binary_op(op: &BinaryOp, left: Value, right: Value) -> ExecutionResult<V
              PropertyValue::Duration { months: m2, days: d2, seconds: s2, nanos: n2 }) => {
                 PropertyValue::Duration { months: m1 - m2, days: d1 - d2, seconds: s1 - s2, nanos: n1 - n2 }
             }
+            (PropertyValue::Null, _) | (_, PropertyValue::Null) => PropertyValue::Null,
             _ => return Err(ExecutionError::TypeError("Sub requires numeric operands".to_string())),
         },
         BinaryOp::Mul => match (&left_prop, &right_prop) {
@@ -199,6 +266,7 @@ fn eval_binary_op(op: &BinaryOp, left: Value, right: Value) -> ExecutionResult<V
             (PropertyValue::Float(l), PropertyValue::Float(r)) => PropertyValue::Float(l * r),
             (PropertyValue::Integer(l), PropertyValue::Float(r)) => PropertyValue::Float(*l as f64 * r),
             (PropertyValue::Float(l), PropertyValue::Integer(r)) => PropertyValue::Float(l * *r as f64),
+            (PropertyValue::Null, _) | (_, PropertyValue::Null) => PropertyValue::Null,
             _ => return Err(ExecutionError::TypeError("Mul requires numeric operands".to_string())),
         },
         BinaryOp::Div => match (&left_prop, &right_prop) {
@@ -207,6 +275,7 @@ fn eval_binary_op(op: &BinaryOp, left: Value, right: Value) -> ExecutionResult<V
             (PropertyValue::Float(l), PropertyValue::Float(r)) => PropertyValue::Float(l / r),
             (PropertyValue::Integer(l), PropertyValue::Float(r)) => PropertyValue::Float(*l as f64 / r),
             (PropertyValue::Float(l), PropertyValue::Integer(r)) => PropertyValue::Float(l / *r as f64),
+            (PropertyValue::Null, _) | (_, PropertyValue::Null) => PropertyValue::Null,
             _ => return Err(ExecutionError::TypeError("Div requires numeric operands".to_string())),
         },
         BinaryOp::Mod => match (&left_prop, &right_prop) {
@@ -215,26 +284,15 @@ fn eval_binary_op(op: &BinaryOp, left: Value, right: Value) -> ExecutionResult<V
             (PropertyValue::Float(l), PropertyValue::Float(r)) => PropertyValue::Float(l % r),
             (PropertyValue::Integer(l), PropertyValue::Float(r)) => PropertyValue::Float(*l as f64 % r),
             (PropertyValue::Float(l), PropertyValue::Integer(r)) => PropertyValue::Float(l % *r as f64),
+            (PropertyValue::Null, _) | (_, PropertyValue::Null) => PropertyValue::Null,
             _ => return Err(ExecutionError::TypeError("Mod requires numeric operands".to_string())),
         },
-        BinaryOp::StartsWith => match (&left_prop, &right_prop) {
-            (PropertyValue::String(l), PropertyValue::String(r)) => PropertyValue::Boolean(l.starts_with(r.as_str())),
-            (PropertyValue::Null, _) | (_, PropertyValue::Null) => PropertyValue::Null,
-            _ => return Err(ExecutionError::TypeError("STARTS WITH requires string operands".to_string())),
-        },
-        BinaryOp::EndsWith => match (&left_prop, &right_prop) {
-            (PropertyValue::String(l), PropertyValue::String(r)) => PropertyValue::Boolean(l.ends_with(r.as_str())),
-            (PropertyValue::Null, _) | (_, PropertyValue::Null) => PropertyValue::Null,
-            _ => return Err(ExecutionError::TypeError("ENDS WITH requires string operands".to_string())),
-        },
-        BinaryOp::Contains => match (&left_prop, &right_prop) {
-            (PropertyValue::String(l), PropertyValue::String(r)) => PropertyValue::Boolean(l.contains(r.as_str())),
-            (PropertyValue::Null, _) | (_, PropertyValue::Null) => PropertyValue::Null,
-            _ => return Err(ExecutionError::TypeError("CONTAINS requires string operands".to_string())),
-        },
-        BinaryOp::In => match &right_prop {
-            PropertyValue::Array(arr) => PropertyValue::Boolean(arr.contains(&left_prop)),
-            _ => return Err(ExecutionError::TypeError("IN requires a list on the right".to_string())),
+        BinaryOp::StartsWith => string_position_op(StringPositionOp::StartsWith, &left_prop, &right_prop),
+        BinaryOp::EndsWith => string_position_op(StringPositionOp::EndsWith, &left_prop, &right_prop),
+        BinaryOp::Contains => string_position_op(StringPositionOp::Contains, &left_prop, &right_prop),
+        BinaryOp::In => match eval_in_list(&left_prop, &right_prop) {
+            Some(v) => v,
+            None => return Err(ExecutionError::TypeError("IN requires a list on the right".to_string())),
         },
         BinaryOp::RegexMatch => match (&left_prop, &right_prop) {
             (PropertyValue::String(text), PropertyValue::String(pattern)) => {
@@ -267,20 +325,53 @@ fn eval_unary_op(op: &UnaryOp, val: Value) -> ExecutionResult<Value> {
         UnaryOp::Minus => match val {
             Value::Property(PropertyValue::Integer(i)) => Ok(Value::Property(PropertyValue::Integer(-i))),
             Value::Property(PropertyValue::Float(f)) => Ok(Value::Property(PropertyValue::Float(-f))),
+            // -null is null, matching NOT above and the binary arithmetic ops (#457).
+            Value::Null | Value::Property(PropertyValue::Null) => Ok(Value::Property(PropertyValue::Null)),
             _ => Err(ExecutionError::TypeError("Negation requires numeric type".to_string())),
         },
     }
 }
 
-/// Shared list/map indexing evaluation
-fn eval_index(collection: Value, index: Value) -> ExecutionResult<Value> {
+/// Shared list/map indexing evaluation.
+///
+/// Takes the store because indexing a node or relationship by name reads a
+/// property, which may live in the column store rather than inline (#673).
+fn eval_index(collection: Value, index: Value, store: &GraphStore) -> ExecutionResult<Value> {
     match (&collection, &index) {
-        (Value::Property(PropertyValue::Array(arr)), Value::Property(PropertyValue::Integer(i))) => {
+        // Any value that reads as a list, so an all-float literal -- which
+        // parses as a `Vector` -- indexes rather than returning null (#605).
+        (Value::Property(p), Value::Property(PropertyValue::Integer(i)))
+            if p.as_list_items().is_some() =>
+        {
+            let arr = p.as_list_items().unwrap();
             let idx = if *i < 0 { (arr.len() as i64 + *i) as usize } else { *i as usize };
             Ok(arr.get(idx).map(|v| Value::Property(v.clone())).unwrap_or(Value::Null))
         }
         (Value::Property(PropertyValue::Map(map)), Value::Property(PropertyValue::String(key))) => {
             Ok(map.get(key).map(|v| Value::Property(v.clone())).unwrap_or(Value::Null))
+        }
+        // A map holding entities — `{k: collect(a)}` (#670).
+        (Value::Map(map), Value::Property(PropertyValue::String(key))) => {
+            Ok(map.get(key).cloned().unwrap_or(Value::Null))
+        }
+        // A *list* holding entities — `[a, 1]` where `a` is a node. The
+        // PropertyValue arm above cannot serve this: a PropertyValue list
+        // cannot hold an entity, so such a list is a `Value::List` and
+        // indexing it fell through to the catch-all and answered null.
+        (Value::List(items), Value::Property(PropertyValue::Integer(i))) => {
+            let idx = if *i < 0 { items.len() as i64 + *i } else { *i };
+            if idx < 0 {
+                return Ok(Value::Null);
+            }
+            Ok(items.get(idx as usize).cloned().unwrap_or(Value::Null))
+        }
+        // Indexing a *node or relationship* by name reads its property.
+        // `startNode(r).id` desugars to `startNode(r)["id"]`, and without this
+        // it answered null — parsing was only half the work, and the half that
+        // fails silently (#673).
+        (Value::Node(..) | Value::NodeRef(_) | Value::Edge(..) | Value::EdgeRef(..),
+         Value::Property(PropertyValue::String(key))) => {
+            Ok(Value::Property(collection.resolve_property(key, store)))
         }
         _ => Ok(Value::Null),
     }
@@ -313,6 +404,34 @@ fn eval_list_slice(collection: Value, start: Option<Value>, end: Option<Value>) 
     }
 }
 
+
+/// Read `<variable>.<property>` from a record.
+///
+/// One implementation, because there were **eight** and they had already
+/// drifted: some error on an unbound variable, some read it as null. Adding
+/// the `Value::Map` case to one of them fixed nothing, because the projection
+/// path uses a different copy — which is how `WITH {k: collect(a)} AS m RETURN
+/// m.k` still answered null after the "fix" (#670).
+fn read_property(
+    record: &Record,
+    variable: &str,
+    property: &str,
+    store: &GraphStore,
+    missing_is_null: bool,
+) -> ExecutionResult<Value> {
+    let val = match record.get(variable) {
+        Some(v) => v,
+        None if missing_is_null => &Value::Null,
+        None => return Err(ExecutionError::VariableNotFound(variable.to_string())),
+    };
+    // A map holding entities cannot answer through `resolve_property`, which
+    // returns a `PropertyValue` and so would degrade a node to null.
+    if let Value::Map(entries) = val {
+        return Ok(entries.get(property).cloned().unwrap_or(Value::Null));
+    }
+    Ok(Value::Property(val.resolve_property(property, store)))
+}
+
 /// Standalone expression evaluator usable from any operator
 fn eval_expression(expr: &Expression, record: &Record, store: &GraphStore) -> ExecutionResult<Value> {
     match expr {
@@ -321,9 +440,21 @@ fn eval_expression(expr: &Expression, record: &Record, store: &GraphStore) -> Ex
                 .ok_or_else(|| ExecutionError::VariableNotFound(var.clone()))
         }
         Expression::Property { variable, property } => {
-            let val = record.get(variable)
-                .ok_or_else(|| ExecutionError::VariableNotFound(variable.clone()))?;
-            Ok(Value::Property(val.resolve_property(property, store)))
+            read_property(record, variable, property, store, false)
+        }
+        // A collection literal whose elements are expressions. The
+        // all-literal form never reaches here -- the grammar matches it as a
+        // `PropertyValue` first -- so this is only the case that could not be
+        // expressed before (#654).
+        Expression::ListExpr(items) => Ok(Value::List(
+            items.iter().map(|e| eval_expression(e, record, store)).collect::<ExecutionResult<Vec<_>>>()?,
+        )),
+        Expression::MapExpr(entries) => {
+            let mut out = std::collections::BTreeMap::new();
+            for (k, e) in entries {
+                out.insert(k.clone(), eval_expression(e, record, store)?);
+            }
+            Ok(Value::Map(out))
         }
         Expression::Literal(lit) => Ok(Value::Property(lit.clone())),
         Expression::Binary { left, op, right } => {
@@ -347,7 +478,7 @@ fn eval_expression(expr: &Expression, record: &Record, store: &GraphStore) -> Ex
         Expression::Index { expr: e, index } => {
             let collection = eval_expression(e, record, store)?;
             let idx = eval_expression(index, record, store)?;
-            eval_index(collection, idx)
+            eval_index(collection, idx, store)
         }
         Expression::ListSlice { expr: e, start, end } => {
             let collection = eval_expression(e, record, store)?;
@@ -453,7 +584,19 @@ fn exists_node_matches(
         return false;
     }
     if let Some(props) = &pat.properties {
-        if !props.iter().all(|(k, v)| node.properties.get(k).map_or(false, |pv| pv == v)) {
+        // Columnar store first, sparse map as fallback. Reading only `node.properties`
+        // made every inline constraint inside EXISTS { } fail on a columnar graph — and
+        // after a snapshot import that map is *always* empty (ADR-021), so EXISTS matched
+        // nothing at all on imported data while the equivalent WHERE inside the subquery
+        // worked (#346).
+        let idx = id.as_u64() as usize;
+        let matches_all = props.iter().all(|(k, v)| {
+            match store.node_columns.get_property(idx, k) {
+                PropertyValue::Null => node.properties.get(k).is_some_and(|pv| pv == v),
+                col => &col == v,
+            }
+        });
+        if !matches_all {
             return false;
         }
     }
@@ -578,7 +721,36 @@ fn exists_expand_hops(
         return Ok(false);
     }
 
+    // If the node this segment lands on is *already bound* and the segment is a
+    // single hop, only that node can close it. Recursing into every neighbour
+    // and rejecting them one level down is the same answer at O(degree) cost —
+    // and it clones the binding record per neighbour to get there.
+    //
+    // LDBC BI-11 is the case that makes this matter: `(t)<-[:HAS_TAG]-(post)`
+    // with `post` bound walks every node carrying that tag, ~250 of them on
+    // SF1, for each of ~1.19M outer rows (#681).
+    //
+    // Restricted to single-hop segments deliberately: in a variable-length
+    // segment the pin applies to the far end, not to the intermediate
+    // positions this loop is walking through, so filtering here would cut off
+    // legitimate paths.
+    let pinned_target: Option<NodeId> = if max_hops == 1 {
+        match segment.node.variable.as_deref().and_then(|v| bindings.get(v)) {
+            Some(Value::NodeRef(id)) | Some(Value::Node(id, _)) => Some(*id),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     for (edge, neighbor) in exists_neighbors(store, current, &segment.edge) {
+        // The pin cannot be satisfied by any other neighbour, so skip before
+        // the record clone below rather than after the recursion.
+        if let Some(target) = pinned_target {
+            if neighbor != target {
+                continue;
+            }
+        }
         // Relationship isomorphism: an edge may not repeat within one path.
         if visited_edges.contains(&edge.id) {
             continue;
@@ -624,8 +796,11 @@ fn eval_list_comprehension(
 ) -> ExecutionResult<Value> {
     let list_val = eval_expression(list_expr, record, store)?;
 
+    // `as_list_items` rather than an `Array` match: an all-float list literal
+    // parses as a `Vector`, and returning the empty list for it made a
+    // comprehension over one silently produce nothing (#605).
     let items = match list_val {
-        Value::Property(PropertyValue::Array(arr)) => arr,
+        Value::Property(ref p) if p.as_list_items().is_some() => p.as_list_items().unwrap(),
         _ => return Ok(Value::Property(PropertyValue::Array(vec![]))),
     };
 
@@ -663,15 +838,26 @@ fn eval_predicate_function(
     store: &GraphStore,
 ) -> ExecutionResult<Value> {
     let list_val = eval_expression(list_expr, record, store)?;
-    let items = match list_val {
-        Value::Property(PropertyValue::Array(arr)) => arr,
+    // A list that holds entities is a `Value::List`; only a list of plain
+    // property values is a `PropertyValue`. Matching on the latter alone meant
+    // `any(x IN nodes WHERE ...)` fell through to `false` for every quantifier,
+    // silently — the caller gets a boolean it will branch on rather than an
+    // error it would notice (Quantifier1-4, scenarios 8 and 9).
+    let items: Vec<Value> = match list_val {
+        Value::Property(ref p) if p.as_list_items().is_some() => p
+            .as_list_items()
+            .unwrap()
+            .into_iter()
+            .map(Value::Property)
+            .collect(),
+        Value::List(items) => items,
         _ => return Ok(Value::Property(PropertyValue::Boolean(false))),
     };
 
     let mut true_count = 0usize;
     for item in &items {
-        let mut inner_record = record.clone();
-        inner_record.bind(variable.to_string(), Value::Property(item.clone()));
+        let mut inner_record = record.clone_with_capacity(1);
+        inner_record.bind(variable.to_string(), item.clone());
         let result = eval_expression(predicate, &inner_record, store)?;
         if matches!(result, Value::Property(PropertyValue::Boolean(true))) {
             true_count += 1;
@@ -700,8 +886,10 @@ fn eval_reduce(
 ) -> ExecutionResult<Value> {
     let init_val = eval_expression(init, record, store)?;
     let list_val = eval_expression(list_expr, record, store)?;
+    // See the note in `eval_list_comprehension`: an all-float list literal is a
+    // `Vector`, and giving up here returned the seed unchanged (#605).
     let items = match list_val {
-        Value::Property(PropertyValue::Array(arr)) => arr,
+        Value::Property(ref p) if p.as_list_items().is_some() => p.as_list_items().unwrap(),
         _ => return Ok(init_val),
     };
 
@@ -723,7 +911,11 @@ fn eval_pattern_comprehension(
     record: &Record,
     store: &GraphStore,
 ) -> ExecutionResult<Value> {
-    let mut results = Vec::new();
+    // `Vec<Value>`, not `Vec<PropertyValue>`: `[p = (n)-->() | p]` projects
+    // *paths*, and a `PropertyValue` cannot hold one (#662). An all-scalar
+    // comprehension is still returned as a `PropertyValue::Array` at the end,
+    // so nothing that consumed the old shape changes.
+    let mut results: Vec<Value> = Vec::new();
 
     for path in &pattern.paths {
         let start_var = path.start.variable.as_deref();
@@ -764,11 +956,7 @@ fn eval_pattern_comprehension(
                     let cond = eval_expression(f, &temp_record, store)?;
                     if !matches!(cond, Value::Property(PropertyValue::Boolean(true))) { continue; }
                 }
-                let val = eval_expression(projection, &temp_record, store)?;
-                match val {
-                    Value::Property(pv) => results.push(pv),
-                    _ => results.push(PropertyValue::Null),
-                }
+                results.push(eval_expression(projection, &temp_record, store)?);
             } else {
                 // One-hop traversal for pattern comprehension
                 for segment in &path.segments {
@@ -793,7 +981,7 @@ fn eval_pattern_comprehension(
                                 if !matches { continue; }
                             } else { continue; }
                         }
-                        let mut temp_record = record.clone();
+                        let mut temp_record = record.clone_with_capacity(2);
                         if let Some(var) = start_var {
                             temp_record.bind(var.to_string(), Value::NodeRef(*node_id));
                         }
@@ -803,22 +991,39 @@ fn eval_pattern_comprehension(
                         if let Some(ref var) = segment.edge.variable {
                             temp_record.bind(var.clone(), Value::EdgeRef(edge.id, edge.source, edge.target, edge.edge_type.clone()));
                         }
+                        // `[p = (a)-->(b) | p]` — the named path, bound for the
+                        // projection to read.
+                        if let Some(ref pv) = path.path_variable {
+                            temp_record.bind(
+                                pv.clone(),
+                                Value::Path { nodes: vec![*node_id, target_id], edges: vec![edge.id] },
+                            );
+                        }
                         if let Some(f) = filter {
                             let cond = eval_expression(f, &temp_record, store)?;
                             if !matches!(cond, Value::Property(PropertyValue::Boolean(true))) { continue; }
                         }
-                        let val = eval_expression(projection, &temp_record, store)?;
-                        match val {
-                            Value::Property(pv) => results.push(pv),
-                            _ => results.push(PropertyValue::Null),
-                        }
+                        results.push(eval_expression(projection, &temp_record, store)?);
                     }
                 }
             }
         }
     }
 
-    Ok(Value::Property(PropertyValue::Array(results)))
+    // Kept as a `PropertyValue::Array` when every element is a scalar, which
+    // is what it always was; only a comprehension projecting entities needs
+    // the wider shape.
+    if results.iter().all(|v| matches!(v, Value::Property(_))) {
+        let scalars = results
+            .into_iter()
+            .map(|v| match v {
+                Value::Property(p) => p,
+                _ => PropertyValue::Null,
+            })
+            .collect();
+        return Ok(Value::Property(PropertyValue::Array(scalars)));
+    }
+    Ok(Value::List(results))
 }
 
 /// Evaluate a boolean predicate expression standalone (for parallel batch filtering).
@@ -830,13 +1035,368 @@ pub fn eval_predicate_standalone(predicate: &Expression, record: &Record, store:
         fn next(&mut self, _: &GraphStore) -> ExecutionResult<Option<Record>> { Ok(None) }
         fn reset(&mut self) {}
     }
-    let evaluator = FilterOperator { input: Box::new(NullScan), predicate: predicate.clone() };
+    let evaluator = FilterOperator::new(Box::new(NullScan), predicate.clone());
     evaluator.evaluate_predicate(record, store)
 }
 
+/// Extract a node id from an evaluated value, whether it arrived materialized or as a
+/// late-materialization reference (ADR-012).
+fn value_node_id(v: &Value) -> Option<NodeId> {
+    match v {
+        Value::Node(id, _) => Some(*id),
+        Value::NodeRef(id) => Some(*id),
+        _ => None,
+    }
+}
+
+/// `left IN right`, where `right` is any value that reads as a list.
+///
+/// Two things the previous `arr.contains(&left)` got wrong. It rejected a
+/// `Vector`, which is what an all-float list literal parses as (#605). And it
+/// compared with `PartialEq`, so `7.0 IN [7, 99]` was false even though
+/// `p.score = 7` matches a float 7.0 -- `IN` disagreed with `=` about whether
+/// an integer and a float can be equal.
+fn eval_in_list(left: &PropertyValue, right: &PropertyValue) -> Option<PropertyValue> {
+    let items = right.as_list_items()?;
+    let numeric = |p: &PropertyValue| -> Option<f64> {
+        match p {
+            PropertyValue::Integer(i) => Some(*i as f64),
+            PropertyValue::Float(f) => Some(*f),
+            _ => None,
+        }
+    };
+    // Cypher's IN is three-valued, and the answers that are neither true nor
+    // false are where it gets interesting:
+    //
+    //   null IN [null]            null   -- nothing can be known about it
+    //   4 IN [1, null, 3]         null   -- the null might have been the 4
+    //   1 IN [1, null]            true   -- a definite match wins regardless
+    //   null IN []                false  -- nothing to compare with at all
+    //   [1] IN [[1, null]]        false  -- different lengths cannot be equal
+    //   [1, 2] IN [[null, 'foo']] false  -- position 1 settles it
+    //
+    // `PartialEq` on `PropertyValue` is derived, so `Null == Null` is `true`
+    // and the first of these answered `true` while the second answered
+    // `false`. Both are values a caller will branch on, which makes this worse
+    // than an error (#647).
+    //
+    // The last two are why "does either side contain a null" is not the rule:
+    // a null makes a comparison unknown only when the comparison would
+    // otherwise have to look at it. A length mismatch, or a definite
+    // difference at any other position, settles the answer without ever
+    // reaching the null.
+
+    /// Cypher equality, three-valued: `None` means unknown.
+    fn eq3(a: &PropertyValue, b: &PropertyValue) -> Option<bool> {
+        match (a, b) {
+            (PropertyValue::Null, _) | (_, PropertyValue::Null) => None,
+            (PropertyValue::Array(x), PropertyValue::Array(y)) => {
+                if x.len() != y.len() {
+                    return Some(false);
+                }
+                let mut unknown = false;
+                for (i, j) in x.iter().zip(y.iter()) {
+                    match eq3(i, j) {
+                        // One definite difference is enough, whatever else the
+                        // lists contain.
+                        Some(false) => return Some(false),
+                        None => unknown = true,
+                        Some(true) => {}
+                    }
+                }
+                if unknown { None } else { Some(true) }
+            }
+            (PropertyValue::Map(x), PropertyValue::Map(y)) => {
+                if x.len() != y.len() || !x.keys().all(|k| y.contains_key(k)) {
+                    return Some(false);
+                }
+                let mut unknown = false;
+                for (key, xv) in x.iter() {
+                    match y.get(key).map(|yv| eq3(xv, yv)) {
+                        Some(Some(false)) | None => return Some(false),
+                        Some(None) => unknown = true,
+                        Some(Some(true)) => {}
+                    }
+                }
+                if unknown { None } else { Some(true) }
+            }
+            _ => {
+                if a == b {
+                    return Some(true);
+                }
+                // 1 and 1.0 are the same number.
+                let as_f64 = |p: &PropertyValue| -> Option<f64> {
+                    match p {
+                        PropertyValue::Integer(i) => Some(*i as f64),
+                        PropertyValue::Float(f) => Some(*f),
+                        _ => None,
+                    }
+                };
+                Some(match (as_f64(a), as_f64(b)) {
+                    (Some(x), Some(y)) => x == y,
+                    _ => false,
+                })
+            }
+        }
+    }
+
+    let mut unknown = false;
+    for item in items.iter() {
+        match eq3(left, item) {
+            Some(true) => return Some(PropertyValue::Boolean(true)),
+            Some(false) => {}
+            None => unknown = true,
+        }
+    }
+
+    // An empty list falls out of this as `false`, which is what Cypher says:
+    // with nothing to compare against there is nothing undecidable.
+    Some(if unknown {
+        PropertyValue::Null
+    } else {
+        PropertyValue::Boolean(false)
+    })
+}
+
+/// Property names in a stable order.
+///
+/// Lexicographic: stable, what a reader expects, and cheap over the handful of
+/// keys a node or map has (#577).
+/// Labels, sorted, as a list of strings.
+///
+/// `Node::labels` is a `HashSet`, whose iteration order varies per process
+/// because `RandomState` seeds each one differently. Returning it raw made
+/// `labels(n)` answer `['L','B']` on one run and `['B','L']` on the next for
+/// the same node — two identical queries over identical data producing
+/// different rows, which is the determinism requirement (LANG-14) failing in
+/// the smallest possible way. It surfaced as a TCK scenario that passed or
+/// failed depending on the run.
+///
+/// Sorted rather than insertion-ordered because insertion order is not
+/// recorded anywhere: a set has no order to preserve, and inventing one that
+/// survives a snapshot round trip would be a storage change. Sorted is
+/// deterministic, and it is the same contract `keys()` already offers.
+fn sorted_labels(node: &crate::graph::Node) -> Vec<PropertyValue> {
+    let mut labels: Vec<&str> = node.labels.iter().map(|l| l.as_str()).collect();
+    labels.sort_unstable();
+    labels.into_iter().map(|l| PropertyValue::String(l.to_string())).collect()
+}
+
+fn sorted_keys(mut keys: Vec<PropertyValue>) -> Vec<PropertyValue> {
+    keys.sort_by(|a, b| match (a, b) {
+        (PropertyValue::String(x), PropertyValue::String(y)) => x.cmp(y),
+        _ => std::cmp::Ordering::Equal,
+    });
+    keys
+}
+
+/// Ordering between two property values, or `None` when Cypher cannot order
+/// them.
+///
+/// Cypher orders numbers against numbers, strings against strings, booleans
+/// against booleans, and temporal values against their own kind. Anything else
+/// is *unknown* — `0 > 'x'` is null, not false and not an error (#607).
+///
+/// This deliberately does not reuse `PropertyValue`'s `Ord`. That order is
+/// total by design because it backs the B-tree property index, so it answers
+/// every comparison confidently, including the ones Cypher says have no
+/// answer. Using it for a query-level comparison is what turned "unknown" into
+/// a definite `false`.
+fn cypher_ordering(left: &PropertyValue, right: &PropertyValue) -> Option<std::cmp::Ordering> {
+    use PropertyValue::*;
+    match (left, right) {
+        (Integer(l), Integer(r)) => Some(l.cmp(r)),
+        (Float(l), Float(r)) => l.partial_cmp(r),
+        (Integer(l), Float(r)) => (*l as f64).partial_cmp(r),
+        (Float(l), Integer(r)) => l.partial_cmp(&(*r as f64)),
+        (String(l), String(r)) => Some(l.cmp(r)),
+        (Boolean(l), Boolean(r)) => Some(l.cmp(r)),
+        (DateTime(l), DateTime(r)) => Some(l.cmp(r)),
+        // A timestamp against a raw epoch integer stays comparable: this is
+        // long-standing behaviour here and the two are the same quantity.
+        (DateTime(l), Integer(r)) | (Integer(l), DateTime(r)) => Some(l.cmp(r)),
+        (
+            Duration { months: m1, days: d1, seconds: s1, nanos: n1 },
+            Duration { months: m2, days: d2, seconds: s2, nanos: n2 },
+        ) => Some(m1.cmp(m2).then(d1.cmp(d2)).then(s1.cmp(s2)).then(n1.cmp(n2))),
+        _ => None,
+    }
+}
+
+/// `STARTS WITH` / `ENDS WITH` / `CONTAINS` over one pair of operands.
+///
+/// Two strings answer the question; anything else is null. Cypher does not
+/// treat `1 STARTS WITH 'a'` as a caller error — the TCK asks for all 36
+/// pairings from `[1, 3.14, true, [], {}, null]` and expects null for every
+/// one (String8/9/10 scenario 8).
+///
+/// This exists because the comparison was implemented twice and both copies
+/// had independently settled on raising instead. Both now call here.
+fn string_position_op(
+    op: StringPositionOp,
+    left: &PropertyValue,
+    right: &PropertyValue,
+) -> PropertyValue {
+    match (left, right) {
+        (PropertyValue::String(l), PropertyValue::String(r)) => {
+            let r = r.as_str();
+            PropertyValue::Boolean(match op {
+                StringPositionOp::StartsWith => l.starts_with(r),
+                StringPositionOp::EndsWith => l.ends_with(r),
+                StringPositionOp::Contains => l.contains(r),
+            })
+        }
+        _ => PropertyValue::Null,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StringPositionOp {
+    StartsWith,
+    EndsWith,
+    Contains,
+}
+
+/// Functions that are asked *about* null and so must see it themselves.
+///
+/// Everything else propagates. Keeping the exceptions explicit — rather than
+/// letting each arm decide — is what stops the rule from drifting apart again:
+/// twenty-two TCK scenarios failed because twenty-two arms each answered the
+/// question separately, and most answered it with a type error.
+const NULL_TOLERANT_FUNCTIONS: &[&str] = &["coalesce", "exists"];
+
 /// Shared function evaluation for scalar functions (not aggregates)
 pub fn eval_function(name: &str, args: &[Value], store: Option<&GraphStore>) -> ExecutionResult<Value> {
-    match name.to_lowercase().as_str() {
+    let lowered = name.to_lowercase();
+
+    // Null in, null out. In Cypher null means "unknown", so a question asked
+    // about it has an unknown answer rather than being a caller error —
+    // `labels(null)` is the row where an OPTIONAL MATCH did not match, and
+    // raising there aborts a query Cypher answers with a null column.
+    if !NULL_TOLERANT_FUNCTIONS.contains(&lowered.as_str())
+        && args.iter().any(|a| matches!(a, Value::Null | Value::Property(PropertyValue::Null)))
+    {
+        return Ok(Value::Null);
+    }
+
+    match lowered.as_str() {
+        // Hierarchy functions (ADR-035) — the direct surface for what the planner
+        // rewrites cannot reach: an order test inside an arbitrary predicate, or a
+        // roll-up in the middle of a larger projection.
+        //
+        //   subsumes(x, y)                  -- is x under y?
+        //   subsumes(x, y, 'idx')           -- ...using a named hierarchy
+        //   hierarchy_rollup(root, 'sum')   -- index-resident fold under root
+        //   hierarchy_rollup(root, 'sum', 'idx')
+        "subsumes" => {
+            let store = store.ok_or_else(|| ExecutionError::RuntimeError(
+                "subsumes() requires graph context".to_string()))?;
+            if args.len() < 2 {
+                return Err(ExecutionError::RuntimeError(
+                    "subsumes(child, ancestor[, index]) takes 2 or 3 arguments".to_string()));
+            }
+            let x = value_node_id(&args[0]).ok_or_else(|| ExecutionError::RuntimeError(
+                "subsumes(): first argument must be a node".to_string()))?;
+            let y = value_node_id(&args[1]).ok_or_else(|| ExecutionError::RuntimeError(
+                "subsumes(): second argument must be a node".to_string()))?;
+            let entry = match args.get(2) {
+                Some(v) => {
+                    let n = extract_string(v)?;
+                    store.hierarchy_index.usable_named(&n).ok_or_else(|| {
+                        ExecutionError::RuntimeError(format!(
+                            "subsumes(): no usable hierarchy index named '{n}'                              (it may be stale — REBUILD it — or declined)"))
+                    })?
+                }
+                None => match store.hierarchy_index.usable_containing(&[x, y]) {
+                    Some(e) => e,
+                    // Both nodes outside every hierarchy: they are not in a subsumption
+                    // relation anyone declared, which is FALSE rather than an error.
+                    None => return Ok(Value::Property(PropertyValue::Boolean(false))),
+                },
+            };
+            let guard = entry.read().unwrap();
+            let answer = guard
+                .index
+                .as_ref()
+                .and_then(|i| i.subsumes_ids(x, y))
+                .unwrap_or(false);
+            Ok(Value::Property(PropertyValue::Boolean(answer)))
+        }
+        "hierarchy_rollup" => {
+            let store = store.ok_or_else(|| ExecutionError::RuntimeError(
+                "hierarchy_rollup() requires graph context".to_string()))?;
+            if args.len() < 2 {
+                return Err(ExecutionError::RuntimeError(
+                    "hierarchy_rollup(root, op[, index]) takes 2 or 3 arguments".to_string()));
+            }
+            let root = value_node_id(&args[0]).ok_or_else(|| ExecutionError::RuntimeError(
+                "hierarchy_rollup(): first argument must be a node".to_string()))?;
+            let op_name = extract_string(&args[1])?;
+            let op = crate::index::hierarchy::RollupOp::parse(&op_name).ok_or_else(|| {
+                ExecutionError::RuntimeError(format!(
+                    "hierarchy_rollup(): unsupported aggregate '{op_name}': expected sum, count, min or max"))
+            })?;
+            let entry = match args.get(2) {
+                Some(v) => {
+                    let n = extract_string(v)?;
+                    store.hierarchy_index.usable_named(&n).ok_or_else(|| {
+                        ExecutionError::RuntimeError(format!(
+                            "hierarchy_rollup(): no usable hierarchy index named '{n}'"))
+                    })?
+                }
+                None => match store.hierarchy_index.usable_containing(&[root]) {
+                    Some(e) => e,
+                    None => return Ok(Value::Property(PropertyValue::Null)),
+                },
+            };
+            let guard = entry.read().unwrap();
+            let value = guard
+                .index
+                .as_ref()
+                .and_then(|i| i.rollup_id(root, op))
+                .unwrap_or(crate::index::hierarchy::RollupValue::Null);
+            Ok(Value::Property(
+                crate::query::executor::hierarchy_ops::rollup_to_property(value),
+            ))
+        }
+        "hierarchy_lca" => {
+            let store = store.ok_or_else(|| ExecutionError::RuntimeError(
+                "hierarchy_lca() requires graph context".to_string()))?;
+            if args.len() < 2 {
+                return Err(ExecutionError::RuntimeError(
+                    "hierarchy_lca(a, b[, index]) takes 2 or 3 arguments".to_string()));
+            }
+            let a = value_node_id(&args[0]).ok_or_else(|| ExecutionError::RuntimeError(
+                "hierarchy_lca(): first argument must be a node".to_string()))?;
+            let b = value_node_id(&args[1]).ok_or_else(|| ExecutionError::RuntimeError(
+                "hierarchy_lca(): second argument must be a node".to_string()))?;
+            let entry = match args.get(2) {
+                Some(v) => {
+                    let n = extract_string(v)?;
+                    store.hierarchy_index.usable_named(&n).ok_or_else(|| {
+                        ExecutionError::RuntimeError(format!(
+                            "hierarchy_lca(): no usable hierarchy index named '{n}'"))
+                    })?
+                }
+                None => match store.hierarchy_index.usable_containing(&[a, b]) {
+                    Some(e) => e,
+                    None => return Ok(Value::Property(PropertyValue::Array(Vec::new()))),
+                },
+            };
+            let guard = entry.read().unwrap();
+            // A DAG can have several incomparable lowest common ancestors, so this is a
+            // list even when a tree would always yield exactly one.
+            let ids = guard
+                .index
+                .as_ref()
+                .and_then(|i| i.lowest_common_ancestors_ids(a, b))
+                .unwrap_or_default();
+            Ok(Value::Property(PropertyValue::Array(
+                ids.into_iter()
+                    .map(|id| PropertyValue::Integer(id.as_u64() as i64))
+                    .collect(),
+            )))
+        }
         // String functions
         "toupper" | "touppercase" => {
             let s = extract_string(&args[0])?;
@@ -849,6 +1409,25 @@ pub fn eval_function(name: &str, args: &[Value], store: Option<&GraphStore>) -> 
         "trim" => {
             let s = extract_string(&args[0])?;
             Ok(Value::Property(PropertyValue::String(s.trim().to_string())))
+        }
+        "split" => {
+            if args.len() < 2 {
+                return Err(ExecutionError::RuntimeError(
+                    "split() requires 2 arguments: split(string, delimiter)".to_string(),
+                ));
+            }
+            let s = extract_string(&args[0])?;
+            let delim = extract_string(&args[1])?;
+            // Cypher splits on an empty delimiter into single characters; Rust's
+            // split("") would additionally yield empty strings at both ends.
+            let parts: Vec<PropertyValue> = if delim.is_empty() {
+                s.chars().map(|c| PropertyValue::String(c.to_string())).collect()
+            } else {
+                s.split(delim.as_str())
+                    .map(|p| PropertyValue::String(p.to_string()))
+                    .collect()
+            };
+            Ok(Value::Property(PropertyValue::Array(parts)))
         }
         "ltrim" => {
             let s = extract_string(&args[0])?;
@@ -893,10 +1472,23 @@ pub fn eval_function(name: &str, args: &[Value], store: Option<&GraphStore>) -> 
             let start = chars.len().saturating_sub(n);
             Ok(Value::Property(PropertyValue::String(chars[start..].iter().collect())))
         }
-        "reverse" => {
-            let s = extract_string(&args[0])?;
-            Ok(Value::Property(PropertyValue::String(s.chars().rev().collect())))
-        }
+        // Cypher's reverse() takes a list as well as a string, and this took
+        // only a string -- `reverse([1,2,3])` answered
+        // `TypeError("Expected string argument")` (#578).
+        "reverse" => match &args[0] {
+            Value::Property(p) if p.as_list_items().is_some() => {
+                let mut reversed = p.as_list_items().unwrap();
+                reversed.reverse();
+                Ok(Value::Property(PropertyValue::Array(reversed)))
+            }
+            Value::Property(PropertyValue::Null) | Value::Null => {
+                Ok(Value::Property(PropertyValue::Null))
+            }
+            other => {
+                let text = extract_string(other)?;
+                Ok(Value::Property(PropertyValue::String(text.chars().rev().collect())))
+            }
+        },
         "tostring" => {
             let val = &args[0];
             let s = match val {
@@ -922,9 +1514,17 @@ pub fn eval_function(name: &str, args: &[Value], store: Option<&GraphStore>) -> 
             match &args[0] {
                 Value::Property(PropertyValue::Integer(i)) => Ok(Value::Property(PropertyValue::Integer(*i))),
                 Value::Property(PropertyValue::Float(f)) => Ok(Value::Property(PropertyValue::Integer(*f as i64))),
-                Value::Property(PropertyValue::String(s)) => {
-                    let i = s.parse::<i64>().map_err(|_| ExecutionError::TypeError(format!("Cannot convert '{}' to integer", s)))?;
-                    Ok(Value::Property(PropertyValue::Integer(i)))
+                // Cypher yields null for a string it cannot parse, rather than
+                // failing the query. Erroring made `toInteger` unusable for the
+                // thing it is mostly used for -- checking whether input is a
+                // number at all (#606).
+                Value::Property(PropertyValue::String(s)) => Ok(Value::Property(
+                    s.parse::<i64>()
+                        .map(PropertyValue::Integer)
+                        .unwrap_or(PropertyValue::Null),
+                )),
+                Value::Null | Value::Property(PropertyValue::Null) => {
+                    Ok(Value::Property(PropertyValue::Null))
                 }
                 _ => Err(ExecutionError::TypeError("Cannot convert to integer".to_string())),
             }
@@ -933,9 +1533,12 @@ pub fn eval_function(name: &str, args: &[Value], store: Option<&GraphStore>) -> 
             match &args[0] {
                 Value::Property(PropertyValue::Float(f)) => Ok(Value::Property(PropertyValue::Float(*f))),
                 Value::Property(PropertyValue::Integer(i)) => Ok(Value::Property(PropertyValue::Float(*i as f64))),
-                Value::Property(PropertyValue::String(s)) => {
-                    let f = s.parse::<f64>().map_err(|_| ExecutionError::TypeError(format!("Cannot convert '{}' to float", s)))?;
-                    Ok(Value::Property(PropertyValue::Float(f)))
+                // Null rather than an error, as with `toInteger` (#606).
+                Value::Property(PropertyValue::String(s)) => Ok(Value::Property(
+                    s.parse::<f64>().map(PropertyValue::Float).unwrap_or(PropertyValue::Null),
+                )),
+                Value::Null | Value::Property(PropertyValue::Null) => {
+                    Ok(Value::Property(PropertyValue::Null))
                 }
                 _ => Err(ExecutionError::TypeError("Cannot convert to float".to_string())),
             }
@@ -944,31 +1547,42 @@ pub fn eval_function(name: &str, args: &[Value], store: Option<&GraphStore>) -> 
         "size" | "length" => {
             match &args[0] {
                 Value::Property(PropertyValue::String(s)) => Ok(Value::Property(PropertyValue::Integer(s.len() as i64))),
-                Value::Property(PropertyValue::Array(a)) => Ok(Value::Property(PropertyValue::Integer(a.len() as i64))),
                 Value::Path { edges, .. } => Ok(Value::Property(PropertyValue::Integer(edges.len() as i64))),
+                // A list of entities -- what a variable-length relationship
+                // variable binds -- is a list, and `size()` counts it (#652).
+                Value::List(items) => Ok(Value::Property(PropertyValue::Integer(items.len() as i64))),
+                Value::Property(p) if p.as_list_items().is_some() => Ok(Value::Property(
+                    PropertyValue::Integer(p.as_list_items().unwrap().len() as i64),
+                )),
                 _ => Err(ExecutionError::TypeError("size() requires string, list, or path".to_string())),
             }
         }
-        // Path functions
+        // Path functions.
+        //
+        // These return the nodes and relationships themselves. They used to
+        // return their **integer ids**, because a `PropertyValue::Array`
+        // cannot hold an entity -- so `nodes(p)` answered `[1, 2]` where
+        // Cypher answers `[(:A), (:B)]`, and anything reading a property off
+        // an element got nothing (#652).
         "nodes" => {
             match &args[0] {
-                Value::Path { nodes, .. } => {
-                    let arr: Vec<PropertyValue> = nodes.iter()
-                        .map(|id| PropertyValue::Integer(id.as_u64() as i64))
-                        .collect();
-                    Ok(Value::Property(PropertyValue::Array(arr)))
-                }
+                Value::Path { nodes, .. } => Ok(Value::List(
+                    nodes.iter().map(|id| Value::NodeRef(*id)).collect(),
+                )),
                 _ => Err(ExecutionError::TypeError("nodes() requires a path".to_string())),
             }
         }
         "relationships" | "rels" => {
             match &args[0] {
-                Value::Path { edges, .. } => {
-                    let arr: Vec<PropertyValue> = edges.iter()
-                        .map(|id| PropertyValue::Integer(id.as_u64() as i64))
-                        .collect();
-                    Ok(Value::Property(PropertyValue::Array(arr)))
-                }
+                Value::Path { edges, .. } => Ok(Value::List(
+                    edges
+                        .iter()
+                        .map(|id| match store.and_then(|s| s.get_edge(*id)) {
+                            Some(e) => Value::EdgeRef(*id, e.source, e.target, e.edge_type.clone()),
+                            None => Value::Null,
+                        })
+                        .collect(),
+                )),
                 _ => Err(ExecutionError::TypeError("relationships() requires a path".to_string())),
             }
         }
@@ -1057,17 +1671,27 @@ pub fn eval_function(name: &str, args: &[Value], store: Option<&GraphStore>) -> 
         }
         "head" => {
             match &args[0] {
-                Value::Property(PropertyValue::Array(arr)) => {
-                    Ok(arr.first().map(|v| Value::Property(v.clone())).unwrap_or(Value::Null))
-                }
+                Value::Property(p) if p.as_list_items().is_some() => Ok(p
+                    .as_list_items()
+                    .unwrap()
+                    .first()
+                    .map(|v| Value::Property(v.clone()))
+                    .unwrap_or(Value::Null)),
+                // A list that holds entities is a Value::List, not a
+                // PropertyValue list — see eval_index.
+                Value::List(items) => Ok(items.first().cloned().unwrap_or(Value::Null)),
                 _ => Err(ExecutionError::TypeError("head() requires list".to_string())),
             }
         }
         "last" => {
             match &args[0] {
-                Value::Property(PropertyValue::Array(arr)) => {
-                    Ok(arr.last().map(|v| Value::Property(v.clone())).unwrap_or(Value::Null))
-                }
+                Value::Property(p) if p.as_list_items().is_some() => Ok(p
+                    .as_list_items()
+                    .unwrap()
+                    .last()
+                    .map(|v| Value::Property(v.clone()))
+                    .unwrap_or(Value::Null)),
+                Value::List(items) => Ok(items.last().cloned().unwrap_or(Value::Null)),
                 _ => Err(ExecutionError::TypeError("last() requires list".to_string())),
             }
         }
@@ -1076,6 +1700,9 @@ pub fn eval_function(name: &str, args: &[Value], store: Option<&GraphStore>) -> 
                 Value::Property(PropertyValue::Array(arr)) => {
                     let tail: Vec<PropertyValue> = arr.iter().skip(1).cloned().collect();
                     Ok(Value::Property(PropertyValue::Array(tail)))
+                }
+                Value::List(items) => {
+                    Ok(Value::List(items.iter().skip(1).cloned().collect()))
                 }
                 _ => Err(ExecutionError::TypeError("tail() requires list".to_string())),
             }
@@ -1088,21 +1715,54 @@ pub fn eval_function(name: &str, args: &[Value], store: Option<&GraphStore>) -> 
                 _ => Err(ExecutionError::TypeError("id() requires node or edge".to_string())),
             }
         }
+        // `n:A:B` as a value, produced by the parser's postfix label check.
+        // True when the node carries *every* named label; null when the
+        // subject is null, following Cypher's three-valued logic.
+        "haslabels" => {
+            let wanted: Vec<String> = match &args[1] {
+                Value::Property(PropertyValue::Array(items)) => items
+                    .iter()
+                    .filter_map(|v| match v {
+                        PropertyValue::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => return Err(ExecutionError::TypeError("hasLabels expects a label list".into())),
+            };
+            let node = match &args[0] {
+                Value::Node(_, n) => Some((**n).clone()),
+                Value::NodeRef(id) => {
+                    let s = store.ok_or_else(|| {
+                        ExecutionError::RuntimeError("hasLabels on NodeRef requires store".into())
+                    })?;
+                    s.get_node(*id).cloned()
+                }
+                Value::Property(PropertyValue::Null) => {
+                    return Ok(Value::Property(PropertyValue::Null))
+                }
+                _ => {
+                    return Err(ExecutionError::TypeError(
+                        "a label test requires a node".to_string(),
+                    ))
+                }
+            };
+            let Some(node) = node else {
+                return Ok(Value::Property(PropertyValue::Null));
+            };
+            let has_all = wanted
+                .iter()
+                .all(|w| node.labels.iter().any(|l| l.as_str() == w));
+            Ok(Value::Property(PropertyValue::Boolean(has_all)))
+        }
         "labels" => {
             match &args[0] {
                 Value::Node(_, node) => {
-                    let labels: Vec<PropertyValue> = node.labels.iter()
-                        .map(|l| PropertyValue::String(l.as_str().to_string()))
-                        .collect();
-                    Ok(Value::Property(PropertyValue::Array(labels)))
+                    Ok(Value::Property(PropertyValue::Array(sorted_labels(node))))
                 }
                 Value::NodeRef(id) => {
                     let s = store.ok_or_else(|| ExecutionError::RuntimeError("labels() on NodeRef requires store".to_string()))?;
                     let node = s.get_node(*id).ok_or_else(|| ExecutionError::RuntimeError(format!("Node {} not found", id.as_u64())))?;
-                    let labels: Vec<PropertyValue> = node.labels.iter()
-                        .map(|l| PropertyValue::String(l.as_str().to_string()))
-                        .collect();
-                    Ok(Value::Property(PropertyValue::Array(labels)))
+                    Ok(Value::Property(PropertyValue::Array(sorted_labels(node))))
                 }
                 _ => Err(ExecutionError::TypeError("labels() requires a node".to_string())),
             }
@@ -1118,27 +1778,51 @@ pub fn eval_function(name: &str, args: &[Value], store: Option<&GraphStore>) -> 
                 _ => Err(ExecutionError::TypeError("type() requires an edge".to_string())),
             }
         }
+        // Sorted, because the underlying maps are `HashMap`s and Rust seeds
+        // their hasher randomly *per process* -- so this returned a different
+        // order on every run of the same query over the same data. Cypher does
+        // not specify an order, which makes any particular one conformant; it
+        // does not make a *different one each time* acceptable. A result that
+        // cannot be diffed, cached or compared across versions undermines
+        // Axiom 3 at the level of the answer rather than the timing (#577).
         "keys" => {
             match &args[0] {
-                Value::Node(_, node) => {
-                    let keys: Vec<PropertyValue> = node.properties.keys()
-                        .map(|k| PropertyValue::String(k.clone()))
-                        .collect();
-                    Ok(Value::Property(PropertyValue::Array(keys)))
+                Value::Node(id, node) => {
+                    // Properties live in row storage *and* in the columnar store, and a
+                    // snapshot import populates only the latter -- so reading
+                    // `node.properties` alone reported an imported node as having no
+                    // properties at all, even while `n.name` returned a value (#333).
+                    let keys: Vec<PropertyValue> = match store {
+                        Some(s) => s
+                            .node_properties_full(*id)
+                            .keys()
+                            .map(|k| PropertyValue::String(k.clone()))
+                            .collect(),
+                        None => node
+                            .properties
+                            .keys()
+                            .map(|k| PropertyValue::String(k.clone()))
+                            .collect(),
+                    };
+                    Ok(Value::Property(PropertyValue::Array(sorted_keys(keys))))
                 }
                 Value::NodeRef(id) => {
                     let s = store.ok_or_else(|| ExecutionError::RuntimeError("keys() on NodeRef requires store".to_string()))?;
-                    let node = s.get_node(*id).ok_or_else(|| ExecutionError::RuntimeError(format!("Node {} not found", id.as_u64())))?;
-                    let keys: Vec<PropertyValue> = node.properties.keys()
+                    if s.get_node(*id).is_none() {
+                        return Err(ExecutionError::RuntimeError(format!("Node {} not found", id.as_u64())));
+                    }
+                    let keys: Vec<PropertyValue> = s
+                        .node_properties_full(*id)
+                        .keys()
                         .map(|k| PropertyValue::String(k.clone()))
                         .collect();
-                    Ok(Value::Property(PropertyValue::Array(keys)))
+                    Ok(Value::Property(PropertyValue::Array(sorted_keys(keys))))
                 }
                 Value::Edge(_, edge) => {
                     let keys: Vec<PropertyValue> = edge.properties.keys()
                         .map(|k| PropertyValue::String(k.clone()))
                         .collect();
-                    Ok(Value::Property(PropertyValue::Array(keys)))
+                    Ok(Value::Property(PropertyValue::Array(sorted_keys(keys))))
                 }
                 Value::EdgeRef(eid, _, _, _) => {
                     let s = store.ok_or_else(|| ExecutionError::RuntimeError("keys() on EdgeRef requires store".to_string()))?;
@@ -1146,9 +1830,19 @@ pub fn eval_function(name: &str, args: &[Value], store: Option<&GraphStore>) -> 
                     let keys: Vec<PropertyValue> = edge.properties.keys()
                         .map(|k| PropertyValue::String(k.clone()))
                         .collect();
-                    Ok(Value::Property(PropertyValue::Array(keys)))
+                    Ok(Value::Property(PropertyValue::Array(sorted_keys(keys))))
                 }
-                _ => Err(ExecutionError::TypeError("keys() requires node or edge".to_string())),
+                // keys() over a map property. Cypher defines keys() on maps as
+                // well as nodes and edges, and without this a map property can
+                // be stored and read whole but never enumerated (#452).
+                Value::Property(PropertyValue::Map(m)) => {
+                    let keys: Vec<PropertyValue> = m
+                        .keys()
+                        .map(|k| PropertyValue::String(k.clone()))
+                        .collect();
+                    Ok(Value::Property(PropertyValue::Array(sorted_keys(keys))))
+                }
+                _ => Err(ExecutionError::TypeError("keys() requires a node, edge, or map".to_string())),
             }
         }
         "exists" => {
@@ -1241,6 +1935,38 @@ pub fn eval_function(name: &str, args: &[Value], store: Option<&GraphStore>) -> 
                     }
                     Value::Property(PropertyValue::Map(map)) => {
                         use chrono::TimeZone;
+
+                        // An epoch, which is what a machine caller has (Axiom 4).
+                        // Handled before the calendar components because it is a
+                        // complete specification on its own -- and because
+                        // without it the map fell through to the defaults below
+                        // and returned 1970-01-01 *silently*, which reads as a
+                        // plausible date rather than a failure (#595).
+                        if let Some(millis) = map.get("epochMillis").and_then(|v| v.as_integer()) {
+                            return Ok(Value::Property(PropertyValue::DateTime(millis)));
+                        }
+                        if let Some(seconds) = map.get("epochSeconds").and_then(|v| v.as_integer()) {
+                            return Ok(Value::Property(PropertyValue::DateTime(seconds * 1000)));
+                        }
+
+                        // A map naming none of the understood keys is a mistake,
+                        // not a request for the epoch. Answering 1970-01-01 for
+                        // it is how the missing `epochMillis` arm stayed
+                        // invisible.
+                        const KNOWN: [&str; 8] = [
+                            "year", "month", "day", "hour", "minute", "second",
+                            "epochMillis", "epochSeconds",
+                        ];
+                        if !map.keys().any(|k| KNOWN.contains(&k.as_str())) {
+                            let mut given: Vec<String> = map.keys().cloned().collect();
+                            given.sort();
+                            return Err(ExecutionError::RuntimeError(format!(
+                                "datetime() understands none of the keys given ({}); expected one of {}",
+                                given.join(", "),
+                                KNOWN.join(", ")
+                            )));
+                        }
+
                         let year = map.get("year").and_then(|v| v.as_integer()).unwrap_or(1970) as i32;
                         let month = map.get("month").and_then(|v| v.as_integer()).unwrap_or(1) as u32;
                         let day = map.get("day").and_then(|v| v.as_integer()).unwrap_or(1) as u32;
@@ -1409,13 +2135,20 @@ pub fn eval_function(name: &str, args: &[Value], store: Option<&GraphStore>) -> 
         // CY-20: properties() — return all properties as a map
         "properties" => {
             match &args[0] {
-                Value::Node(_, node) => {
-                    Ok(Value::Property(PropertyValue::Map(node.properties.clone())))
+                Value::Node(id, node) => {
+                    // See keys(): row storage alone is incomplete after a snapshot import.
+                    let props = match store {
+                        Some(s) => s.node_properties_full(*id),
+                        None => node.properties.clone(),
+                    };
+                    Ok(Value::Property(PropertyValue::Map(props)))
                 }
                 Value::NodeRef(id) => {
                     let s = store.ok_or_else(|| ExecutionError::RuntimeError("properties() on NodeRef requires store".to_string()))?;
-                    let node = s.get_node(*id).ok_or_else(|| ExecutionError::RuntimeError(format!("Node {} not found", id.as_u64())))?;
-                    Ok(Value::Property(PropertyValue::Map(node.properties.clone())))
+                    if s.get_node(*id).is_none() {
+                        return Err(ExecutionError::RuntimeError(format!("Node {} not found", id.as_u64())));
+                    }
+                    Ok(Value::Property(PropertyValue::Map(s.node_properties_full(*id))))
                 }
                 Value::Edge(_, edge) => {
                     Ok(Value::Property(PropertyValue::Map(edge.properties.clone())))
@@ -1885,6 +2618,31 @@ pub trait PhysicalOperator: Send {
     /// Reset the operator to start from the beginning
     fn reset(&mut self);
 
+    /// The predicate this operator filters on, if it is a filter.
+    ///
+    /// Exists so the planner can tell whether a filter it is about to add is
+    /// the one already sitting underneath. `x AND x` is idempotent, so the
+    /// second evaluation is pure cost -- ~130 ms on LDBC IC9, where the same
+    /// compound predicate was evaluated 389,461 times twice over (#519).
+    fn filter_predicate(&self) -> Option<&Expression> {
+        None
+    }
+
+    /// The operators this one pulls from, in the order `describe()` lists
+    /// them.
+    ///
+    /// Defaults to none, which is right for every leaf (scans, DDL, static
+    /// inputs). Operators that hold an input must override it, or a tree walk
+    /// stops at them.
+    ///
+    /// This exists so a pass can rewrite the tree in place — `PROFILE` wraps
+    /// every node to attribute wall-clock (`CH-PROFILE-01`), and it is the
+    /// mutable counterpart of the children `describe()` already returns for
+    /// EXPLAIN.
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        Vec::new()
+    }
+
     /// Returns true if this operator mutates the graph store
     fn is_mutating(&self) -> bool {
         false
@@ -1931,6 +2689,50 @@ impl OperatorDescription {
     }
 }
 
+/// Binding power, matching the parser's precedence ladder.
+///
+/// Kept in step with `PRATT_PARSER` in `query::parser`: OR < XOR < AND < NOT <
+/// comparison < +- < */% < ^. If the two ever disagree, EXPLAIN prints a
+/// predicate that means something the engine did not run, which is the exact
+/// failure #541 describes.
+fn binary_precedence(op: &BinaryOp) -> u8 {
+    match op {
+        BinaryOp::Or => 1,
+        BinaryOp::Xor => 2,
+        BinaryOp::And => 3,
+        BinaryOp::Eq
+        | BinaryOp::Ne
+        | BinaryOp::Lt
+        | BinaryOp::Le
+        | BinaryOp::Gt
+        | BinaryOp::Ge
+        | BinaryOp::In
+        | BinaryOp::StartsWith
+        | BinaryOp::EndsWith
+        | BinaryOp::Contains
+        | BinaryOp::RegexMatch => 4,
+        BinaryOp::Add | BinaryOp::Sub => 5,
+        BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => 6,
+        BinaryOp::Pow => 7,
+    }
+}
+
+/// `expr` rendered, bracketed only where dropping the brackets would reparse
+/// differently.
+///
+/// `bias` is 1 for the side that must not re-associate -- the right operand of
+/// a left-associative operator, the left operand of a right-associative one --
+/// so `a - (b - c)` keeps its brackets while `(a - b) - c` does not need them.
+fn parenthesised(expr: &Expression, parent: u8, bias: u8) -> String {
+    let text = format_expression(expr);
+    match expr {
+        Expression::Binary { op, .. } if binary_precedence(op) + bias <= parent => {
+            format!("({text})")
+        }
+        _ => text,
+    }
+}
+
 /// Format an Expression for EXPLAIN output
 fn format_expression(expr: &Expression) -> String {
     match expr {
@@ -1944,20 +2746,43 @@ fn format_expression(expr: &Expression) -> String {
                 BinaryOp::And => "AND", BinaryOp::Or => "OR",
                 BinaryOp::Add => "+", BinaryOp::Sub => "-",
                 BinaryOp::Mul => "*", BinaryOp::Div => "/", BinaryOp::Mod => "%",
+                BinaryOp::Pow => "^", BinaryOp::Xor => "XOR",
                 BinaryOp::StartsWith => "STARTS WITH", BinaryOp::EndsWith => "ENDS WITH",
                 BinaryOp::Contains => "CONTAINS", BinaryOp::In => "IN",
                 BinaryOp::RegexMatch => "=~",
             };
-            format!("{} {} {}", format_expression(left), op_str, format_expression(right))
+            // Parenthesised where precedence would otherwise change the
+            // meaning. `A AND B AND (C OR D)` printed as `A AND B AND C OR D`,
+            // which reads as `(A AND B AND C) OR D` -- a different predicate,
+            // and one that looks like a P0 wrong answer in a plan that is
+            // actually correct (#541).
+            let parent = binary_precedence(op);
+            let right_assoc = matches!(op, BinaryOp::Pow);
+            // The side that must not re-associate takes the bias: for a
+            // left-associative operator that is the *right* operand, since
+            // `a - (b - c)` differs from `a - b - c` while `(a - b) - c` does
+            // not. Reversed, this brackets every left operand of an AND chain
+            // and leaves `a - (b - c)` unbracketed -- both of which the tests
+            // below caught.
+            let left_str = parenthesised(left, parent, if right_assoc { 0 } else { 1 });
+            let right_str = parenthesised(right, parent, if right_assoc { 1 } else { 0 });
+            format!("{} {} {}", left_str, op_str, right_str)
         }
         Expression::Unary { op, expr } => {
             let op_str = match op {
                 UnaryOp::Not => "NOT", UnaryOp::Minus => "-",
                 UnaryOp::IsNull => "IS NULL", UnaryOp::IsNotNull => "IS NOT NULL",
             };
+            // A unary operator binds tighter than every binary one, so a binary
+            // operand always needs bracketing: `NOT (a AND b)` is not
+            // `NOT a AND b`.
+            let operand = match expr.as_ref() {
+                Expression::Binary { .. } => format!("({})", format_expression(expr)),
+                _ => format_expression(expr),
+            };
             match op {
-                UnaryOp::IsNull | UnaryOp::IsNotNull => format!("{} {}", format_expression(expr), op_str),
-                _ => format!("{} {}", op_str, format_expression(expr)),
+                UnaryOp::IsNull | UnaryOp::IsNotNull => format!("{} {}", operand, op_str),
+                _ => format!("{} {}", op_str, operand),
             }
         }
         Expression::Function { name, args, distinct } => {
@@ -2220,6 +3045,70 @@ impl PhysicalOperator for LabelCountOperator {
     }
 }
 
+/// Edge count operator: resolves `MATCH ()-[r:TYPE]->() RETURN count(r)` from the stats
+/// cache, for one edge type or for all of them.
+///
+/// The *grouped* form (`RETURN type(r), count(r)`) already had an O(1) path, and node label
+/// counts have had one for longer -- but a count filtered to a single edge type fell back to
+/// a full Expand + Aggregate. On a billion-edge federation that is the difference between
+/// answering from metadata and hitting the 120s timeout (#304), while the structurally
+/// simpler grouped query returned instantly.
+pub struct EdgeCountOperator {
+    /// `None` counts every edge, whatever its type.
+    edge_type: Option<String>,
+    alias: String,
+    executed: bool,
+}
+
+impl EdgeCountOperator {
+    pub fn new(edge_type: Option<String>, alias: String) -> Self {
+        Self { edge_type, alias, executed: false }
+    }
+
+    fn count(&self, store: &GraphStore) -> i64 {
+        let stats = store.statistics();
+        match &self.edge_type {
+            Some(t) => stats
+                .edge_type_counts
+                .iter()
+                .find(|(et, _)| et.as_str() == t.as_str())
+                .map(|(_, c)| *c as i64)
+                .unwrap_or(0),
+            None => stats.edge_type_counts.values().map(|c| *c as i64).sum(),
+        }
+    }
+}
+
+impl PhysicalOperator for EdgeCountOperator {
+    fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
+        if self.executed {
+            return Ok(None);
+        }
+        self.executed = true;
+        let mut record = Record::new();
+        record.bind(
+            self.alias.clone(),
+            Value::Property(PropertyValue::Integer(self.count(store))),
+        );
+        Ok(Some(record))
+    }
+
+    fn reset(&mut self) {
+        self.executed = false;
+    }
+
+    fn describe(&self) -> OperatorDescription {
+        OperatorDescription {
+            name: "EdgeCount".to_string(),
+            details: match &self.edge_type {
+                Some(t) => format!("type={}, alias={}", t, self.alias),
+                None => format!("all types, alias={}", self.alias),
+            },
+            children: Vec::new(),
+        }
+    }
+}
+
 /// Edge type count operator: resolves `MATCH ()-[r]->() RETURN type(r), count(r)` from stats cache.
 /// Returns one row per edge type with its count, avoiding a full edge scan.
 pub struct EdgeTypeCountOperator {
@@ -2312,18 +3201,134 @@ impl PhysicalOperator for EdgeTypeCountOperator {
 }
 
 /// Filter operator: WHERE n.age > 30
+/// Rows must be worth at least this much per-row predicate work before a batch
+/// is filtered in parallel.
+///
+/// Fitted to a measured crossover, not chosen. Interleaved A/B over 1,000,000
+/// rows, only the threshold varying (#559):
+///
+/// | predicate                                  | cost | parallel | sequential |
+/// |--------------------------------------------|-----:|---------:|-----------:|
+/// | `i.v > 500`                                |    2 |  404.8ms | **252.0ms**|
+/// | `i.v > 500 AND i.w > 5`                    |    5 |  486.7ms | **327.4ms**|
+/// | `i.name CONTAINS "99"`                     |    5 |  525.7ms | **285.8ms**|
+/// | `toUpper(i.name) CONTAINS "99"`            |   13 |  512.1ms | **363.8ms**|
+/// | 4 conjuncts, two of them string operations |   25 |**461.5ms**|  604.9ms  |
+///
+/// So the crossover sits between 13 and 25, and 20 puts every measured case on
+/// the side that won. The exact figure is host-dependent — it is a ratio
+/// between per-row work and cross-core coordination — so it is a threshold
+/// with a reproducer rather than a constant to be trusted.
+const PARALLEL_PREDICATE_COST: u32 = 20;
+
+/// Roughly what evaluating `expr` costs per row, in units where reading one
+/// property is 1.
+///
+/// This exists because the previous rule went parallel on **batch size**, which
+/// says nothing about how much work a predicate does — and with a batch size of
+/// 65,536, every batch qualified. A `Record` holds `Arc<str>` binding names, so
+/// moving records across threads churns atomic refcounts on cache lines every
+/// thread shares; against a predicate as cheap as one comparison there is
+/// nothing to amortise that against, and parallel filtering lost 1.4-1.8x on
+/// every predicate a real query writes.
+///
+/// Absolute accuracy does not matter. Only the side of `PARALLEL_PREDICATE_COST`
+/// the answer lands on does, so the weights are deliberately coarse.
+fn predicate_cost(expr: &Expression) -> u32 {
+    match expr {
+        // Cost of the elements, plus a little for building the collection.
+        Expression::ListExpr(items) => 1 + items.iter().map(predicate_cost).sum::<u32>(),
+        Expression::MapExpr(entries) => {
+            1 + entries.iter().map(|(_, e)| predicate_cost(e)).sum::<u32>()
+        }
+        // The unit. A scattered column read plus the match to unwrap it.
+        Expression::Property { .. } => 1,
+        // Free: already in the record, or in the expression.
+        Expression::Literal(_) | Expression::Variable(_) | Expression::Parameter(_) => 0,
+        Expression::PathVariable(_) => 0,
+        Expression::Binary { left, op, right } => {
+            // String comparisons scan and often allocate; numeric ones are a
+            // register compare.
+            let op_cost = match op {
+                BinaryOp::Contains
+                | BinaryOp::StartsWith
+                | BinaryOp::EndsWith
+                | BinaryOp::RegexMatch => 4,
+                _ => 1,
+            };
+            op_cost + predicate_cost(left) + predicate_cost(right)
+        }
+        Expression::Unary { expr, .. } => 1 + predicate_cost(expr),
+        // A call allocates its result and usually its arguments.
+        Expression::Function { args, .. } => {
+            8 + args.iter().map(predicate_cost).sum::<u32>()
+        }
+        Expression::Case { operand, when_clauses, else_result } => {
+            1 + operand.as_deref().map(predicate_cost).unwrap_or(0)
+                + when_clauses.iter().map(|(w, t)| predicate_cost(w) + predicate_cost(t)).sum::<u32>()
+                + else_result.as_deref().map(predicate_cost).unwrap_or(0)
+        }
+        Expression::Index { expr, index } => 1 + predicate_cost(expr) + predicate_cost(index),
+        Expression::ListSlice { expr, start, end } => {
+            2 + predicate_cost(expr)
+                + start.as_deref().map(predicate_cost).unwrap_or(0)
+                + end.as_deref().map(predicate_cost).unwrap_or(0)
+        }
+        // These run a query or a loop per row. Whatever the body costs, the
+        // per-row work is large enough that coordination is worth paying.
+        Expression::ExistsSubquery { .. } => 50,
+        Expression::ListComprehension { list_expr, filter, map_expr, .. } => {
+            20 + predicate_cost(list_expr)
+                + filter.as_deref().map(predicate_cost).unwrap_or(0)
+                + predicate_cost(map_expr)
+        }
+        Expression::PredicateFunction { list_expr, predicate, .. } => {
+            20 + predicate_cost(list_expr) + predicate_cost(predicate)
+        }
+        Expression::Reduce { init, list_expr, expression, .. } => {
+            20 + predicate_cost(init) + predicate_cost(list_expr) + predicate_cost(expression)
+        }
+        Expression::PatternComprehension { .. } => 50,
+    }
+}
+
 pub struct FilterOperator {
     /// Input operator
     input: OperatorBox,
     /// Predicate expression
     predicate: Expression,
+    /// Whether this predicate is expensive enough per row to be worth filtering
+    /// across threads. Computed once, from the expression, not from batch size.
+    parallel: bool,
 }
 
 impl FilterOperator {
     /// Create a new filter operator
     pub fn new(input: OperatorBox, predicate: Expression) -> Self {
-        Self { input, predicate }
+        let parallel = Self::predicate_is_parallel(&predicate);
+        Self { input, predicate, parallel }
     }
+
+    /// Whether this predicate is worth filtering across threads.
+    ///
+    /// `SAMYAMA_FILTER_PARALLEL_COST` overrides the threshold. It exists so
+    /// `benches/filter_throughput.rs` can run both sides **interleaved in one
+    /// process**, which is the only way to A/B this reliably: the effect is a
+    /// ratio between per-row work and cross-core coordination, so it moves with
+    /// the host, and comparing two separate benchmark runs measured 16% drift
+    /// on an otherwise idle dedicated box (#529). A threshold fitted from
+    /// across-run numbers would be fitted to noise.
+    ///
+    /// Unset in normal use. `0` forces parallel, a large value forces
+    /// sequential.
+    pub fn predicate_is_parallel(predicate: &Expression) -> bool {
+        let threshold = std::env::var("SAMYAMA_FILTER_PARALLEL_COST")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(PARALLEL_PREDICATE_COST);
+        predicate_cost(predicate) >= threshold
+    }
+
 
     fn evaluate_predicate(&self, record: &Record, _store: &GraphStore) -> ExecutionResult<bool> {
         let result = self.evaluate_expression(&self.predicate, record, _store)?;
@@ -2337,17 +3342,20 @@ impl FilterOperator {
 
     fn evaluate_expression(&self, expr: &Expression, record: &Record, store: &GraphStore) -> ExecutionResult<Value> {
         match expr {
+            // Delegates rather than adding a sixth copy of this logic; the
+            // standalone evaluator is the one implementation (#654).
+            Expression::ListExpr(_) | Expression::MapExpr(_) => {
+                eval_expression(expr, record, store)
+            }
             Expression::Variable(var) => {
                 record.get(var)
                     .cloned()
                     .ok_or_else(|| ExecutionError::VariableNotFound(var.clone()))
             }
             Expression::Property { variable, property } => {
-                let val = record.get(variable)
-                    .ok_or_else(|| ExecutionError::VariableNotFound(variable.clone()))?;
-
-                let prop = val.resolve_property(property, store);
-                Ok(Value::Property(prop))
+                return read_property(record, variable, property, store, false);
+                #[allow(unreachable_code)]
+                Ok(Value::Null)
             }
             Expression::Literal(lit) => Ok(Value::Property(lit.clone())),
             Expression::Binary { left, op, right } => {
@@ -2383,6 +3391,7 @@ impl FilterOperator {
                         match val {
                             Value::Property(PropertyValue::Integer(i)) => Ok(Value::Property(PropertyValue::Integer(-i))),
                             Value::Property(PropertyValue::Float(f)) => Ok(Value::Property(PropertyValue::Float(-f))),
+                            Value::Null | Value::Property(PropertyValue::Null) => Ok(Value::Property(PropertyValue::Null)),
                             _ => Err(ExecutionError::TypeError("Negation requires numeric type".to_string())),
                         }
                     }
@@ -2394,7 +3403,7 @@ impl FilterOperator {
             Expression::Index { expr, index } => {
                 let collection = self.evaluate_expression(expr, record, store)?;
                 let idx = self.evaluate_expression(index, record, store)?;
-                eval_index(collection, idx)
+                eval_index(collection, idx, store)
             }
             Expression::ListSlice { expr, start, end } => {
                 let collection = self.evaluate_expression(expr, record, store)?;
@@ -2452,6 +3461,19 @@ impl FilterOperator {
             _ => return Err(ExecutionError::TypeError("Binary op requires property values".to_string())),
         };
 
+        // Three-valued logic, same rule as `eval_binary_op`: a comparison with a null
+        // operand is unknown, and a WHERE excludes unknown. `null <> 1` evaluating to true
+        // kept every row whose property was merely absent. Note this is a *second*
+        // comparison implementation — the two must agree, and did not.
+        if matches!(
+            op,
+            BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+        ) && (matches!(left_prop, PropertyValue::Null)
+            || matches!(right_prop, PropertyValue::Null))
+        {
+            return Ok(Value::Property(PropertyValue::Null));
+        }
+
         let result = match op {
             BinaryOp::Eq => PropertyValue::Boolean(self.coerced_eq(&left_prop, &right_prop)),
             BinaryOp::Ne => PropertyValue::Boolean(!self.coerced_eq(&left_prop, &right_prop)),
@@ -2461,6 +3483,15 @@ impl FilterOperator {
             BinaryOp::Ge => self.compare_ge(&left_prop, &right_prop)?,
             BinaryOp::And => self.logical_and(&left_prop, &right_prop)?,
             BinaryOp::Or => self.logical_or(&left_prop, &right_prop)?,
+            // Delegated so `^` and XOR have one definition rather than two that
+            // can drift; this evaluator differs from `eval_binary_op` only in
+            // its comparison coercions, which neither operator uses.
+            BinaryOp::Pow | BinaryOp::Xor => {
+                match eval_binary_op(op, Value::Property(left_prop.clone()), Value::Property(right_prop.clone()))? {
+                    Value::Property(p) => p,
+                    other => return Err(ExecutionError::TypeError(format!("unexpected {other:?}"))),
+                }
+            }
             BinaryOp::Add => self.arithmetic_add(&left_prop, &right_prop)?,
             BinaryOp::Sub => self.arithmetic_sub(&left_prop, &right_prop)?,
             BinaryOp::Mul => self.arithmetic_mul(&left_prop, &right_prop)?,
@@ -2503,63 +3534,43 @@ impl FilterOperator {
     }
 
     fn compare_lt(&self, left: &PropertyValue, right: &PropertyValue) -> ExecutionResult<PropertyValue> {
-        match (left, right) {
-            (PropertyValue::Null, _) | (_, PropertyValue::Null) => Ok(PropertyValue::Null),
-            (PropertyValue::Integer(l), PropertyValue::Integer(r)) => Ok(PropertyValue::Boolean(l < r)),
-            (PropertyValue::Float(l), PropertyValue::Float(r)) => Ok(PropertyValue::Boolean(l < r)),
-            (PropertyValue::Integer(l), PropertyValue::Float(r)) => Ok(PropertyValue::Boolean((*l as f64) < *r)),
-            (PropertyValue::Float(l), PropertyValue::Integer(r)) => Ok(PropertyValue::Boolean(*l < (*r as f64))),
-            (PropertyValue::String(l), PropertyValue::String(r)) => Ok(PropertyValue::Boolean(l < r)),
-            (PropertyValue::DateTime(l), PropertyValue::DateTime(r)) => Ok(PropertyValue::Boolean(l < r)),
-            (PropertyValue::DateTime(l), PropertyValue::Integer(r)) => Ok(PropertyValue::Boolean(l < r)),
-            (PropertyValue::Integer(l), PropertyValue::DateTime(r)) => Ok(PropertyValue::Boolean(l < r)),
-            _ => Err(ExecutionError::TypeError("Cannot compare these types".to_string())),
-        }
+        // Incomparable types are null, not an error: raising here aborted
+        // the whole query, so rows that *did* compare never came back (#607).
+        Ok(match cypher_ordering(left, right) {
+            Some(std::cmp::Ordering::Less) => PropertyValue::Boolean(true),
+            Some(_) => PropertyValue::Boolean(false),
+            None => PropertyValue::Null,
+        })
     }
 
     fn compare_le(&self, left: &PropertyValue, right: &PropertyValue) -> ExecutionResult<PropertyValue> {
-        match (left, right) {
-            (PropertyValue::Null, _) | (_, PropertyValue::Null) => Ok(PropertyValue::Null),
-            (PropertyValue::Integer(l), PropertyValue::Integer(r)) => Ok(PropertyValue::Boolean(l <= r)),
-            (PropertyValue::Float(l), PropertyValue::Float(r)) => Ok(PropertyValue::Boolean(l <= r)),
-            (PropertyValue::Integer(l), PropertyValue::Float(r)) => Ok(PropertyValue::Boolean((*l as f64) <= *r)),
-            (PropertyValue::Float(l), PropertyValue::Integer(r)) => Ok(PropertyValue::Boolean(*l <= (*r as f64))),
-            (PropertyValue::String(l), PropertyValue::String(r)) => Ok(PropertyValue::Boolean(l <= r)),
-            (PropertyValue::DateTime(l), PropertyValue::DateTime(r)) => Ok(PropertyValue::Boolean(l <= r)),
-            (PropertyValue::DateTime(l), PropertyValue::Integer(r)) => Ok(PropertyValue::Boolean(l <= r)),
-            (PropertyValue::Integer(l), PropertyValue::DateTime(r)) => Ok(PropertyValue::Boolean(l <= r)),
-            _ => Err(ExecutionError::TypeError("Cannot compare these types".to_string())),
-        }
+        // Incomparable types are null, not an error: raising here aborted
+        // the whole query, so rows that *did* compare never came back (#607).
+        Ok(match cypher_ordering(left, right) {
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal) => PropertyValue::Boolean(true),
+            Some(_) => PropertyValue::Boolean(false),
+            None => PropertyValue::Null,
+        })
     }
 
     fn compare_gt(&self, left: &PropertyValue, right: &PropertyValue) -> ExecutionResult<PropertyValue> {
-        match (left, right) {
-            (PropertyValue::Null, _) | (_, PropertyValue::Null) => Ok(PropertyValue::Null),
-            (PropertyValue::Integer(l), PropertyValue::Integer(r)) => Ok(PropertyValue::Boolean(l > r)),
-            (PropertyValue::Float(l), PropertyValue::Float(r)) => Ok(PropertyValue::Boolean(l > r)),
-            (PropertyValue::Integer(l), PropertyValue::Float(r)) => Ok(PropertyValue::Boolean((*l as f64) > *r)),
-            (PropertyValue::Float(l), PropertyValue::Integer(r)) => Ok(PropertyValue::Boolean(*l > (*r as f64))),
-            (PropertyValue::String(l), PropertyValue::String(r)) => Ok(PropertyValue::Boolean(l > r)),
-            (PropertyValue::DateTime(l), PropertyValue::DateTime(r)) => Ok(PropertyValue::Boolean(l > r)),
-            (PropertyValue::DateTime(l), PropertyValue::Integer(r)) => Ok(PropertyValue::Boolean(l > r)),
-            (PropertyValue::Integer(l), PropertyValue::DateTime(r)) => Ok(PropertyValue::Boolean(l > r)),
-            _ => Err(ExecutionError::TypeError("Cannot compare these types".to_string())),
-        }
+        // Incomparable types are null, not an error: raising here aborted
+        // the whole query, so rows that *did* compare never came back (#607).
+        Ok(match cypher_ordering(left, right) {
+            Some(std::cmp::Ordering::Greater) => PropertyValue::Boolean(true),
+            Some(_) => PropertyValue::Boolean(false),
+            None => PropertyValue::Null,
+        })
     }
 
     fn compare_ge(&self, left: &PropertyValue, right: &PropertyValue) -> ExecutionResult<PropertyValue> {
-        match (left, right) {
-            (PropertyValue::Null, _) | (_, PropertyValue::Null) => Ok(PropertyValue::Null),
-            (PropertyValue::Integer(l), PropertyValue::Integer(r)) => Ok(PropertyValue::Boolean(l >= r)),
-            (PropertyValue::Float(l), PropertyValue::Float(r)) => Ok(PropertyValue::Boolean(l >= r)),
-            (PropertyValue::Integer(l), PropertyValue::Float(r)) => Ok(PropertyValue::Boolean((*l as f64) >= *r)),
-            (PropertyValue::Float(l), PropertyValue::Integer(r)) => Ok(PropertyValue::Boolean(*l >= (*r as f64))),
-            (PropertyValue::String(l), PropertyValue::String(r)) => Ok(PropertyValue::Boolean(l >= r)),
-            (PropertyValue::DateTime(l), PropertyValue::DateTime(r)) => Ok(PropertyValue::Boolean(l >= r)),
-            (PropertyValue::DateTime(l), PropertyValue::Integer(r)) => Ok(PropertyValue::Boolean(l >= r)),
-            (PropertyValue::Integer(l), PropertyValue::DateTime(r)) => Ok(PropertyValue::Boolean(l >= r)),
-            _ => Err(ExecutionError::TypeError("Cannot compare these types".to_string())),
-        }
+        // Incomparable types are null, not an error: raising here aborted
+        // the whole query, so rows that *did* compare never came back (#607).
+        Ok(match cypher_ordering(left, right) {
+            Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal) => PropertyValue::Boolean(true),
+            Some(_) => PropertyValue::Boolean(false),
+            None => PropertyValue::Null,
+        })
     }
 
     fn logical_and(&self, left: &PropertyValue, right: &PropertyValue) -> ExecutionResult<PropertyValue> {
@@ -2589,6 +3600,7 @@ impl FilterOperator {
             (PropertyValue::Integer(l), PropertyValue::Float(r)) => Ok(PropertyValue::Float(*l as f64 + r)),
             (PropertyValue::Float(l), PropertyValue::Integer(r)) => Ok(PropertyValue::Float(l + *r as f64)),
             (PropertyValue::String(l), PropertyValue::String(r)) => Ok(PropertyValue::String(format!("{}{}", l, r))),
+            (PropertyValue::Null, _) | (_, PropertyValue::Null) => Ok(PropertyValue::Null),
             _ => Err(ExecutionError::TypeError("Addition requires numeric or string operands".to_string())),
         }
     }
@@ -2599,6 +3611,7 @@ impl FilterOperator {
             (PropertyValue::Float(l), PropertyValue::Float(r)) => Ok(PropertyValue::Float(l - r)),
             (PropertyValue::Integer(l), PropertyValue::Float(r)) => Ok(PropertyValue::Float(*l as f64 - r)),
             (PropertyValue::Float(l), PropertyValue::Integer(r)) => Ok(PropertyValue::Float(l - *r as f64)),
+            (PropertyValue::Null, _) | (_, PropertyValue::Null) => Ok(PropertyValue::Null),
             _ => Err(ExecutionError::TypeError("Subtraction requires numeric operands".to_string())),
         }
     }
@@ -2609,6 +3622,7 @@ impl FilterOperator {
             (PropertyValue::Float(l), PropertyValue::Float(r)) => Ok(PropertyValue::Float(l * r)),
             (PropertyValue::Integer(l), PropertyValue::Float(r)) => Ok(PropertyValue::Float(*l as f64 * r)),
             (PropertyValue::Float(l), PropertyValue::Integer(r)) => Ok(PropertyValue::Float(l * *r as f64)),
+            (PropertyValue::Null, _) | (_, PropertyValue::Null) => Ok(PropertyValue::Null),
             _ => Err(ExecutionError::TypeError("Multiplication requires numeric operands".to_string())),
         }
     }
@@ -2620,6 +3634,7 @@ impl FilterOperator {
             (PropertyValue::Float(l), PropertyValue::Float(r)) => Ok(PropertyValue::Float(l / r)),
             (PropertyValue::Integer(l), PropertyValue::Float(r)) => Ok(PropertyValue::Float(*l as f64 / r)),
             (PropertyValue::Float(l), PropertyValue::Integer(r)) => Ok(PropertyValue::Float(l / *r as f64)),
+            (PropertyValue::Null, _) | (_, PropertyValue::Null) => Ok(PropertyValue::Null),
             _ => Err(ExecutionError::TypeError("Division requires numeric operands".to_string())),
         }
     }
@@ -2631,39 +3646,26 @@ impl FilterOperator {
             (PropertyValue::Float(l), PropertyValue::Float(r)) => Ok(PropertyValue::Float(l % r)),
             (PropertyValue::Integer(l), PropertyValue::Float(r)) => Ok(PropertyValue::Float(*l as f64 % r)),
             (PropertyValue::Float(l), PropertyValue::Integer(r)) => Ok(PropertyValue::Float(l % *r as f64)),
+            (PropertyValue::Null, _) | (_, PropertyValue::Null) => Ok(PropertyValue::Null),
             _ => Err(ExecutionError::TypeError("Modulo requires numeric operands".to_string())),
         }
     }
 
     fn string_starts_with(&self, left: &PropertyValue, right: &PropertyValue) -> ExecutionResult<PropertyValue> {
-        match (left, right) {
-            (PropertyValue::String(l), PropertyValue::String(r)) => Ok(PropertyValue::Boolean(l.starts_with(r.as_str()))),
-            (PropertyValue::Null, _) | (_, PropertyValue::Null) => Ok(PropertyValue::Null),
-            _ => Err(ExecutionError::TypeError("STARTS WITH requires string operands".to_string())),
-        }
+        Ok(string_position_op(StringPositionOp::StartsWith, left, right))
     }
 
     fn string_ends_with(&self, left: &PropertyValue, right: &PropertyValue) -> ExecutionResult<PropertyValue> {
-        match (left, right) {
-            (PropertyValue::String(l), PropertyValue::String(r)) => Ok(PropertyValue::Boolean(l.ends_with(r.as_str()))),
-            (PropertyValue::Null, _) | (_, PropertyValue::Null) => Ok(PropertyValue::Null),
-            _ => Err(ExecutionError::TypeError("ENDS WITH requires string operands".to_string())),
-        }
+        Ok(string_position_op(StringPositionOp::EndsWith, left, right))
     }
 
     fn string_contains(&self, left: &PropertyValue, right: &PropertyValue) -> ExecutionResult<PropertyValue> {
-        match (left, right) {
-            (PropertyValue::String(l), PropertyValue::String(r)) => Ok(PropertyValue::Boolean(l.contains(r.as_str()))),
-            (PropertyValue::Null, _) | (_, PropertyValue::Null) => Ok(PropertyValue::Null),
-            _ => Err(ExecutionError::TypeError("CONTAINS requires string operands".to_string())),
-        }
+        Ok(string_position_op(StringPositionOp::Contains, left, right))
     }
 
     fn eval_in(&self, left: &PropertyValue, right: &PropertyValue) -> ExecutionResult<PropertyValue> {
-        match right {
-            PropertyValue::Array(arr) => Ok(PropertyValue::Boolean(arr.contains(left))),
-            _ => Err(ExecutionError::TypeError("IN requires a list on the right side".to_string())),
-        }
+        eval_in_list(left, right)
+            .ok_or_else(|| ExecutionError::TypeError("IN requires a list on the right side".to_string()))
     }
 
     fn regex_match(&self, left: &PropertyValue, right: &PropertyValue) -> ExecutionResult<PropertyValue> {
@@ -2681,6 +3683,14 @@ impl FilterOperator {
 }
 
 impl PhysicalOperator for FilterOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.input]
+    }
+
+    fn filter_predicate(&self) -> Option<&Expression> {
+        Some(&self.predicate)
+    }
+
     fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
         while let Some(record) = self.input.next(store)? {
             if self.evaluate_predicate(&record, store)? {
@@ -2696,8 +3706,10 @@ impl PhysicalOperator for FilterOperator {
         while filtered_records.len() < batch_size {
             if let Some(batch) = self.input.next_batch(store, batch_size)? {
                 let records = batch.records;
-                // Parallel filter for large batches (256+ records)
-                if records.len() >= 256 {
+                // Parallel only where the predicate is expensive enough to pay
+                // for moving records across threads (#559). A small batch is
+                // still not worth splitting whatever the predicate costs.
+                if self.parallel && records.len() >= 256 {
                     let predicate = self.predicate.clone();
                     let passed: Vec<Record> = records.into_par_iter()
                         .filter(|record| {
@@ -2741,29 +3753,120 @@ impl PhysicalOperator for FilterOperator {
 }
 
 /// Expand operator: `-[:KNOWS]->`
+/// The path the walk has built so far, with this hop added.
+///
+/// Every expand in a chain binds the *same* path variable, and each one used
+/// to bind a fresh two-node path for its own hop — so the last hop won and
+/// `MATCH p = (a)-[:R]->(b)-[:R]->(c)` produced a path of two nodes with
+/// `length(p) = 1` (#631). The variable-length expand assembles its whole path
+/// in one place and never had the defect; the fixed multi-hop spelling is
+/// built hop by hop, so each hop has to add to what came before.
+///
+/// A path is only continued when it actually ends where this hop starts.
+/// Anything else — a comma-separated pattern, a path variable rebound across
+/// disconnected parts — starts afresh rather than inventing an edge between
+/// two unrelated nodes.
+fn extend_path(
+    base: Option<&Value>,
+    source_id: NodeId,
+    target_id: NodeId,
+    edge_id: crate::graph::EdgeId,
+) -> Value {
+    if let Some(Value::Path { nodes, edges }) = base {
+        if nodes.last() == Some(&source_id) {
+            let mut nodes = nodes.clone();
+            let mut edges = edges.clone();
+            nodes.push(target_id);
+            edges.push(edge_id);
+            return Value::Path { nodes, edges };
+        }
+    }
+    Value::Path {
+        nodes: vec![source_id, target_id],
+        edges: vec![edge_id],
+    }
+}
+
 pub struct ExpandOperator {
     /// Input operator
     input: OperatorBox,
-    /// Source variable
-    source_var: String,
+    /// Source variable.
+    ///
+    /// `Arc<str>` rather than `String` because `Record::bind` takes
+    /// `impl Into<Arc<str>>`: passing a `String` allocates twice per bind --
+    /// once to clone the `String`, once to build the `Arc<str>` from it -- for
+    /// a name that is fixed for the whole query. On IC5 that was 3.4 million
+    /// allocations for the target variable alone (#564).
+    source_var: Arc<str>,
     /// Target variable
-    target_var: String,
+    target_var: Arc<str>,
     /// Edge variable (optional)
-    edge_var: Option<String>,
+    edge_var: Option<Arc<str>>,
     /// Edge types to expand (empty = all types)
     edge_types: Vec<String>,
     /// Target node labels to filter (empty = any label)
     target_labels: Vec<Label>,
+    /// Equality predicates on the *target* node, checked during the adjacency
+    /// walk rather than after it.
+    ///
+    /// LDBC IC11 is the case this exists for. Its plan is
+    /// `Filter(org.name = ...) <- Expand((friend)-[:WORK_AT]->(org))`, so
+    /// every friend-of-friend's employer was materialised into a record and
+    /// then discarded — 11.5x Neo4j, and the only complex read still outside
+    /// the PERF-01 target. Applied here, a non-matching employer never
+    /// becomes a row (#656).
+    target_props: Vec<(String, PropertyValue)>,
+    /// The exact set of nodes the target may be, resolved once at plan time.
+    ///
+    /// `target_props` above still costs a `get_node` and a property compare per
+    /// candidate edge. On LDBC IC11 that is ~29,000 lookups at ~10us each and
+    /// the expand became 74% of the query — the filter moved earlier and got
+    /// *more* expensive per candidate. Resolving `org.name = "..."` to the one
+    /// matching Organisation once, and testing membership here, replaces that
+    /// with a hash lookup (#665).
+    target_ids: Option<std::collections::HashSet<NodeId>>,
     /// Direction
     direction: Direction,
     /// Current input record
     current_record: Option<Record>,
-    /// Current edges as lightweight tuples (EdgeId, source, target, EdgeType) — no Edge clone
-    current_edges: Vec<(crate::graph::EdgeId, NodeId, NodeId, EdgeType)>,
+    /// Current edges as `(EdgeId, source, target)`.
+    ///
+    /// The edge *type* is deliberately absent. It is read only when the
+    /// pattern binds an edge variable, and resolving it means cloning a
+    /// `String`; carrying it here cost one clone per surviving edge — 409,960
+    /// of them on LDBC IC9, whose pattern binds no edge variable at all
+    /// (#520).
+    current_edges: Vec<(crate::graph::EdgeId, NodeId, NodeId)>,
     /// Current edge index
     edge_index: usize,
     /// Path variable name for named paths (CY-04)
     path_variable: Option<String>,
+    /// `edge_types` resolved to interned ids, cached after the first use.
+    /// `Some(vec)` once resolved; the wildcard case never populates it.
+    type_ids: Option<Vec<u16>>,
+    /// Enforce relationship isomorphism: refuse an edge this pattern has
+    /// already traversed, and record the ones it takes (#684).
+    ///
+    /// Off for a single-hop pattern, which cannot violate the rule and should
+    /// not pay for the bookkeeping.
+    track_edges: bool,
+    /// Pin the target to whatever this variable is bound to on the current
+    /// row, resolved per input record rather than at plan time.
+    ///
+    /// A pattern that closes back onto a bound variable — LDBC BI-17's
+    /// `(a)-[:KNOWS]-(b)-[:KNOWS]-(c)-[:KNOWS]-(a)` — is planned as an expand
+    /// into a synthetic `__self_a_2` followed by `__self_a_2 = a`. That is
+    /// correct and enumerates every neighbour of `c` to keep one: ~41 per
+    /// person on SF1, over ~17.8M candidate paths. Pinning here rejects the
+    /// other 40 during the adjacency walk, before a record exists (#195).
+    ///
+    /// Distinct from `target_ids`, which is a plan-time constant set; this one
+    /// changes with every row.
+    target_bound_var: Option<Arc<str>>,
+    /// This expand begins a MATCH clause, so it clears the inherited history
+    /// first. Isomorphism is per-clause — `MATCH (a)-[:R]-(b) MATCH (b)-[:R]-(c)`
+    /// may legitimately reuse the edge.
+    starts_clause: bool,
 }
 
 impl ExpandOperator {
@@ -2778,22 +3881,28 @@ impl ExpandOperator {
     ) -> Self {
         Self {
             input,
-            source_var,
-            target_var,
-            edge_var,
+            source_var: source_var.into(),
+            target_var: target_var.into(),
+            edge_var: edge_var.map(Into::into),
             edge_types,
             target_labels: Vec::new(),
+            target_props: Vec::new(),
+            target_ids: None,
+            track_edges: false,
+            starts_clause: false,
+            target_bound_var: None,
             direction,
             current_record: None,
             current_edges: Vec::new(),
             edge_index: 0,
             path_variable: None,
+            type_ids: None,
         }
     }
 
     /// Set path variable for named path materialization (CY-04)
     pub fn with_path_variable(mut self, var: String) -> Self {
-        self.path_variable = Some(var);
+        self.path_variable = Some(var.into());
         self
     }
 
@@ -2803,52 +3912,222 @@ impl ExpandOperator {
         self
     }
 
+    /// Equality predicates the target node must satisfy, applied during the
+    /// walk. Additive: the planner leaves its own filter in place, so this can
+    /// only reduce what is materialised, never change what is returned.
+    pub fn with_target_props(mut self, props: Vec<(String, PropertyValue)>) -> Self {
+        self.target_props = props;
+        self
+    }
+
+    /// The resolved node set for the target, when the planner could compute it.
+    /// Preferred over `target_props`: an id membership test costs a hash
+    /// lookup where the property check costs a node fetch (#665).
+    /// Pin this expand's target to the node already bound to `var`.
+    pub fn with_target_bound_var(mut self, var: String) -> Self {
+        self.target_bound_var = Some(var.into());
+        self
+    }
+
+    /// Enforce relationship isomorphism for this expand.
+    ///
+    /// `starts_clause` marks the first expand of a MATCH clause, which drops
+    /// any history inherited from an earlier clause.
+    pub fn with_edge_isolation(mut self, starts_clause: bool) -> Self {
+        self.track_edges = true;
+        self.starts_clause = starts_clause;
+        self
+    }
+
+    pub fn with_target_ids(mut self, ids: std::collections::HashSet<NodeId>) -> Self {
+        self.target_ids = Some(ids);
+        self
+    }
+
+    /// The edge-type filter as interned ids, resolved once per query.
+    ///
+    /// `None` means the pattern named no types — the wildcard. A pattern that
+    /// named types none of which exist returns `Some(empty)`, which matches
+    /// nothing; conflating the two makes `-[:NO_SUCH_TYPE]->` follow every
+    /// edge in the graph (#520).
+    fn ensure_type_ids(&mut self, store: &GraphStore) {
+        if self.edge_types.is_empty() || self.type_ids.is_some() {
+            return;
+        }
+        let ids = self
+            .edge_types
+            .iter()
+            .filter_map(|t| store.edge_type_id(&EdgeType::new(t.as_str())))
+            .collect();
+        self.type_ids = Some(ids);
+    }
+
     fn load_edges(&mut self, record: &Record, store: &GraphStore) -> ExecutionResult<()> {
         let source_val = record.get(&self.source_var)
-            .ok_or_else(|| ExecutionError::VariableNotFound(self.source_var.clone()))?;
+            .ok_or_else(|| ExecutionError::VariableNotFound(self.source_var.to_string()))?;
+
+        // Expanding from null yields nothing; it is not an error. An
+        // `OPTIONAL MATCH` that matched nothing binds null, and a following
+        // `MATCH (a)-->(b)` on that row must simply produce no rows — Cypher
+        // says so, and raising "a is not a node" fails the whole query over a
+        // row that should quietly disappear (#671).
+        if matches!(source_val, Value::Null) || matches!(source_val.as_property(), Some(PropertyValue::Null)) {
+            self.current_edges.clear();
+            self.edge_index = 0;
+            return Ok(());
+        }
 
         let node_id = source_val.node_id()
             .ok_or_else(|| ExecutionError::TypeError(format!("{} is not a node", self.source_var)))?;
 
-        // Get edge tuples with owned EdgeType — works for both full and stub edges.
-        // Uses compact edge_type_ids array (DS-07c) when Edge objects are not available.
-        let edges: Vec<(crate::graph::EdgeId, NodeId, NodeId, EdgeType)> = match self.direction {
-            Direction::Outgoing => store.get_outgoing_edge_targets_owned(node_id),
-            Direction::Incoming => store.get_incoming_edge_sources_owned(node_id),
-            Direction::Both => {
-                let mut all = store.get_outgoing_edge_targets_owned(node_id);
-                all.extend(store.get_incoming_edge_sources_owned(node_id));
-                all
+        // Filter on the interned edge-type id *during* the adjacency walk, and
+        // resolve the `EdgeType` string only for the edges that survive.
+        //
+        // This used to materialise every incident edge as
+        // `(EdgeId, NodeId, NodeId, EdgeType)` -- cloning a type string per
+        // edge -- and filter the resulting Vec by comparing those strings. An
+        // LDBC `Person` has ~41 `KNOWS` edges and ~900 others (inbound
+        // `HAS_CREATOR` from every post and comment they wrote, `LIKES`,
+        // `HAS_MEMBER`, `HAS_INTEREST`), so a `[:KNOWS]` expansion cloned ~900
+        // strings to keep 41 (#520).
+        self.ensure_type_ids(store);
+
+        // Refill the existing buffer. Allocating a fresh `Vec` per source
+        // record meant one allocation plus roughly log2(degree) reallocations
+        // as it doubled, and a free of the previous one -- once per source, for
+        // a buffer that is the same shape every time (#564).
+        let mut collected = std::mem::take(&mut self.current_edges);
+        collected.clear();
+        let type_filter = self.type_ids.as_deref();
+
+        // Target-label sets, resolved once per source record rather than per
+        // edge, and applied *during* the walk rather than by a `retain`
+        // afterwards.
+        //
+        // The old code collected every incident edge and then retained the ones
+        // whose target carried the labels, testing each with
+        // `get_node(id).has_label(label)` -- a `Vec` index, a version-chain
+        // walk, a 128-byte `Node`, and a `HashSet<Label>` probe hashing a
+        // *string*. At 2.22M edges visited per LDBC IC9 run that was **26.7% of
+        // the profile**, the single largest symbol, ahead of every property
+        // read. Probing `label_index` by `NodeId` instead is one hash of a u64
+        // (#592).
+        //
+        // A label no node carries yields `None`, which matches nothing -- so
+        // the whole expansion is empty, which is correct and is why the empty
+        // case is distinguished from "no labels required".
+        let label_sets: Option<Vec<&std::collections::HashSet<NodeId>>> =
+            if self.target_labels.is_empty() {
+                None
+            } else {
+                Some(
+                    self.target_labels
+                        .iter()
+                        .map(|l| store.nodes_with_label(l))
+                        .collect::<Option<Vec<_>>>()
+                        .unwrap_or_default(),
+                )
+            };
+        let target_props = &self.target_props;
+        let target_ids = self.target_ids.as_ref();
+        // Relationship isomorphism (#684): an edge this pattern already walked
+        // is not a candidate. Checked here, during the adjacency walk, so a
+        // rejected edge never becomes a record.
+        let used_edges: &[crate::graph::EdgeId] = if self.track_edges && !self.starts_clause {
+            record.used_edge_slice()
+        } else {
+            &[]
+        };
+        // Resolved once per input record: the node the pattern must close on.
+        let pinned_target: Option<NodeId> = self
+            .target_bound_var
+            .as_ref()
+            .and_then(|v| record.get(v))
+            .and_then(|v| v.node_id());
+        let keeps = |target: NodeId, eid: crate::graph::EdgeId| -> bool {
+            // A closing hop can only land on the node it closes onto.
+            if let Some(p) = pinned_target {
+                if target != p {
+                    return false;
+                }
+            }
+            // Relationship isomorphism first: it is a comparison of a few u64s
+            // against a slice that is empty for every single-hop pattern, so it
+            // is cheaper than anything below and rejects the most rows on the
+            // patterns that need it.
+            if used_edges.contains(&eid) {
+                return false;
+            }
+            // Then the cheapest discriminator: if the planner resolved the
+            // target to a known set, membership settles it without touching the node.
+            if let Some(ids) = target_ids {
+                if !ids.contains(&target) {
+                    return false;
+                }
+            }
+            let label_ok = match &label_sets {
+                None => true,
+                // `Some(empty)` means a required label exists on no node.
+                Some(sets) if sets.len() < self.target_labels.len() => false,
+                Some(sets) => sets.iter().all(|s| s.contains(&target)),
+            };
+            if !label_ok {
+                return false;
+            }
+            if target_props.is_empty() {
+                return true;
+            }
+            match store.get_node(target) {
+                Some(node) => target_props
+                    .iter()
+                    .all(|(k, v)| node.get_property(k).map_or(false, |p| p == v)),
+                None => false,
             }
         };
 
-        // Filter by edge type if specified
-        self.current_edges = if self.edge_types.is_empty() {
-            edges
-        } else {
-            edges.into_iter()
-                .filter(|(_, _, _, et)| self.edge_types.iter().any(|t| et.as_str() == t))
-                .collect()
-        };
-
-        // Filter by target node labels if specified
-        if !self.target_labels.is_empty() {
-            self.current_edges.retain(|(_, src, tgt, _)| {
-                let target_id = match self.direction {
-                    Direction::Outgoing => *tgt,
-                    Direction::Incoming => *src,
-                    Direction::Both => {
-                        let source_id = store.get_node(node_id).map(|_| node_id);
-                        if source_id == Some(*src) { *tgt } else { *src }
+        match self.direction {
+            Direction::Outgoing => {
+                store.for_each_outgoing_neighbor(node_id, type_filter, |target, eid| {
+                    if keeps(target, eid) {
+                        collected.push((eid, node_id, target));
                     }
-                };
-                if let Some(node) = store.get_node(target_id) {
-                    self.target_labels.iter().all(|l| node.has_label(l))
-                } else {
-                    false
-                }
-            });
+                });
+            }
+            Direction::Incoming => {
+                store.for_each_incoming_neighbor(node_id, type_filter, |source, eid| {
+                    if keeps(source, eid) {
+                        collected.push((eid, source, node_id));
+                    }
+                });
+            }
+            Direction::Both => {
+                store.for_each_outgoing_neighbor(node_id, type_filter, |target, eid| {
+                    if keeps(target, eid) {
+                        collected.push((eid, node_id, target));
+                    }
+                });
+                store.for_each_incoming_neighbor(node_id, type_filter, |source, eid| {
+                    // A self-relationship is incident to its node twice -- once
+                    // outgoing, once incoming -- and the walk above has already
+                    // taken it. Undirected matching traverses each
+                    // relationship once, so `MATCH ()--()` over a single
+                    // `(a)-[:LOOP]->(a)` is one match and not two (#640).
+                    if source == node_id {
+                        return;
+                    }
+                    if keeps(source, eid) {
+                        collected.push((eid, source, node_id));
+                    }
+                });
+            }
         }
+
+        // No `retain` here any more: the labels were applied during the walk
+        // above, so a non-matching edge was never pushed. The retain also
+        // compacted the vector, and its `Direction::Both` arm ran
+        // `store.get_node(node_id)` per edge purely to recover a value it
+        // already had (#592).
+        self.current_edges = collected;
 
         self.edge_index = 0;
         Ok(())
@@ -2856,14 +4135,25 @@ impl ExpandOperator {
 }
 
 impl PhysicalOperator for ExpandOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.input]
+    }
+
     fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
         loop {
             // If we have edges from current record, return them
             if self.edge_index < self.current_edges.len() {
-                let (edge_id, src, tgt, ref edge_type) = self.current_edges[self.edge_index];
+                let (edge_id, src, tgt) = self.current_edges[self.edge_index];
                 self.edge_index += 1;
 
-                let mut new_record = self.current_record.as_ref().unwrap().clone();
+                // Room for the target, and for the edge and path variables when
+                // the pattern names them -- otherwise the first bind below
+                // reallocates a Vec that was cloned at exact capacity (#562).
+                let extra = 1
+                    + self.edge_var.is_some() as usize
+                    + self.path_variable.is_some() as usize;
+                let mut new_record =
+                    self.current_record.as_ref().unwrap().clone_with_capacity(extra);
 
                 // Determine target node based on direction
                 let target_id = match self.direction {
@@ -2879,7 +4169,12 @@ impl PhysicalOperator for ExpandOperator {
                 new_record.bind(self.target_var.clone(), Value::NodeRef(target_id));
 
                 if let Some(edge_var) = &self.edge_var {
-                    new_record.bind(edge_var.clone(), Value::EdgeRef(edge_id, src, tgt, edge_type.clone()));
+                    // Resolved here rather than carried: only a pattern that
+                    // names the edge ever reads its type.
+                    let edge_type = store
+                        .get_edge_type(edge_id)
+                        .unwrap_or_else(|| EdgeType::new(""));
+                    new_record.bind(edge_var.clone(), Value::EdgeRef(edge_id, src, tgt, edge_type));
                 }
 
                 // CY-04: Materialize named path variable
@@ -2887,10 +4182,18 @@ impl PhysicalOperator for ExpandOperator {
                     let source_id = new_record.get(&self.source_var)
                         .and_then(|v| v.node_id())
                         .unwrap_or(src);
-                    new_record.bind(path_var.clone(), Value::Path {
-                        nodes: vec![source_id, target_id],
-                        edges: vec![edge_id],
-                    });
+                    let extended =
+                        extend_path(new_record.get(path_var), source_id, target_id, edge_id);
+                    new_record.bind(path_var.clone(), extended);
+                }
+
+                // Relationship isomorphism (#684): remember what this pattern
+                // has walked so a later segment cannot take the same edge back.
+                if self.track_edges {
+                    if self.starts_clause {
+                        new_record.clear_used_edges();
+                    }
+                    new_record.mark_edge_used(edge_id);
                 }
 
                 return Ok(Some(new_record));
@@ -2915,8 +4218,15 @@ impl PhysicalOperator for ExpandOperator {
                 let take = (batch_size - expanded_records.len()).min(self.current_edges.len() - self.edge_index);
 
                 for i in 0..take {
-                    let (edge_id, src, tgt, ref edge_type) = self.current_edges[self.edge_index + i];
-                    let mut new_record = self.current_record.as_ref().unwrap().clone();
+                    let (edge_id, src, tgt) = self.current_edges[self.edge_index + i];
+                    // Room for the target, and for the edge and path variables when
+                // the pattern names them -- otherwise the first bind below
+                // reallocates a Vec that was cloned at exact capacity (#562).
+                let extra = 1
+                    + self.edge_var.is_some() as usize
+                    + self.path_variable.is_some() as usize;
+                let mut new_record =
+                    self.current_record.as_ref().unwrap().clone_with_capacity(extra);
 
                     let target_id = match self.direction {
                         Direction::Outgoing => tgt,
@@ -2930,17 +4240,30 @@ impl PhysicalOperator for ExpandOperator {
 
                     new_record.bind(self.target_var.clone(), Value::NodeRef(target_id));
                     if let Some(edge_var) = &self.edge_var {
-                        new_record.bind(edge_var.clone(), Value::EdgeRef(edge_id, src, tgt, edge_type.clone()));
+                        // Resolved here rather than carried: only a pattern
+                        // that names the edge ever reads its type.
+                        let edge_type = store
+                            .get_edge_type(edge_id)
+                            .unwrap_or_else(|| EdgeType::new(""));
+                        new_record.bind(edge_var.clone(), Value::EdgeRef(edge_id, src, tgt, edge_type));
                     }
                     // CY-04: Materialize named path variable in batch mode
                     if let Some(ref path_var) = self.path_variable {
                         let source_id = new_record.get(&self.source_var)
                             .and_then(|v| v.node_id())
                             .unwrap_or(src);
-                        new_record.bind(path_var.clone(), Value::Path {
-                            nodes: vec![source_id, target_id],
-                            edges: vec![edge_id],
-                        });
+                        let extended =
+                            extend_path(new_record.get(path_var), source_id, target_id, edge_id);
+                        new_record.bind(path_var.clone(), extended);
+                    }
+                    // Same isomorphism bookkeeping as the single-row path
+                    // above. Missing it here would make the answer depend on
+                    // whether the plan happened to run batched (#684).
+                    if self.track_edges {
+                        if self.starts_clause {
+                            new_record.clear_used_edges();
+                        }
+                        new_record.mark_edge_used(edge_id);
                     }
                     expanded_records.push(new_record);
                 }
@@ -3010,8 +4333,36 @@ pub struct VarLengthExpandOperator {
     min_hops: usize,
     max_hops: usize,
     path_variable: Option<String>,
+    /// The pattern's own name for the relationships traversed, bound to a
+    /// list of them (#652).
+    rel_variable: Option<String>,
     /// Output records buffered for the current input record.
     pending: std::collections::VecDeque<Record>,
+    /// `edge_types` resolved to interned ids, cached after the first use.
+    ///
+    /// Resolving is a hash lookup per type against the store, and the answer
+    /// cannot change during a query. Empty vec inside the `Some` means "no
+    /// filter"; a requested type the graph has never seen simply contributes
+    /// no id, so it matches nothing -- which is correct.
+    type_ids: Option<Vec<u16>>,
+    /// The target is pinned to exactly this node.
+    ///
+    /// Set when the planner can resolve the far endpoint to a single node at
+    /// plan time — `MATCH (p:Person {id: 42})-[:KNOWS*1..2]-(friend)` read from
+    /// the `friend` side. The question is then not "what is reachable from each
+    /// friend" but "is *this one node* reachable from each friend", and those
+    /// have very different costs.
+    pinned_target: Option<NodeId>,
+    /// Nodes from which `pinned_target` is reachable within the hop bounds,
+    /// computed once on first use.
+    ///
+    /// One BFS outward from the pinned node, reversed, answers the question for
+    /// every input row. Without it each row runs its own BFS: LDBC IC6 feeds
+    /// thousands of candidate friends into this operator and each one expanded
+    /// its own two-hop neighbourhood to discover whether one specific person
+    /// was in it. At SF10 that is the difference between finishing and hitting
+    /// the query timeout.
+    target_reach: Option<std::collections::HashSet<NodeId>>,
 }
 
 impl VarLengthExpandOperator {
@@ -3037,7 +4388,11 @@ impl VarLengthExpandOperator {
             min_hops,
             max_hops,
             path_variable: None,
+            rel_variable: None,
             pending: std::collections::VecDeque::new(),
+            type_ids: None,
+            pinned_target: None,
+            target_reach: None,
         }
     }
 
@@ -3053,49 +4408,186 @@ impl VarLengthExpandOperator {
         self
     }
 
-    /// One-hop neighbours of `node` honouring direction + edge-type filter,
-    /// returned as `(neighbour_node, edge_id)` pairs.
-    fn neighbors(&self, node: NodeId, store: &GraphStore) -> Vec<(NodeId, crate::graph::EdgeId)> {
-        let raw: Vec<(crate::graph::EdgeId, NodeId, NodeId, EdgeType)> = match self.direction {
-            Direction::Outgoing => store.get_outgoing_edge_targets_owned(node),
-            Direction::Incoming => store.get_incoming_edge_sources_owned(node),
+    /// Bind the pattern's relationship variable to the relationships traversed.
+    ///
+    /// `MATCH (a)-[r:T*]->(b)` makes `r` a **list of relationships**, one per
+    /// hop. The variable was simply dropped, so the query failed with
+    /// "Variable not found: r" -- the traversal was right and its own name for
+    /// what it traversed did not exist (#652).
+    pub fn with_rel_variable(mut self, var: String) -> Self {
+        self.rel_variable = Some(var);
+        self
+    }
+
+    /// The edge-type filter as interned ids, resolved once per query.
+    ///
+    /// Returns `None` when the pattern named no types at all -- the wildcard.
+    /// A pattern that named types none of which exist in the graph returns
+    /// `Some(empty)`, which matches nothing. Collapsing those two cases makes
+    /// `-[:NO_SUCH_TYPE*1..3]->` follow every edge in the graph; a test does
+    /// exactly that, and it failed against the first version of this.
+    fn ensure_type_ids(&mut self, store: &GraphStore) {
+        if self.edge_types.is_empty() || self.type_ids.is_some() {
+            return;
+        }
+        let ids = self
+            .edge_types
+            .iter()
+            .filter_map(|t| store.edge_type_id(&EdgeType::new(t.as_str())))
+            .collect();
+        self.type_ids = Some(ids);
+    }
+
+    /// Visit each one-hop neighbour of `node` honouring direction and the
+    /// edge-type filter, without allocating.
+    ///
+    /// This used to build a `Vec` of `(EdgeId, NodeId, NodeId, EdgeType)` per
+    /// node -- three allocations and an `EdgeType` **string clone per incident
+    /// edge** -- and then filter it by comparing those strings. The filter was
+    /// therefore paid *after* materialising every incident edge, which on a
+    /// real graph is most of the cost: an LDBC `Person` has ~41 `KNOWS` edges
+    /// and ~900 others (inbound `HAS_CREATOR` from every post and comment they
+    /// wrote, `LIKES`, `HAS_MEMBER`, `HAS_INTEREST`), so `KNOWS*1..3` from one
+    /// person enumerated ~9.3M edges to traverse 404K (#520).
+    ///
+    /// Filtering on the interned type id inside the walk skips a non-matching
+    /// edge in a compare rather than a string clone.
+    /// Neighbours in an explicitly given direction.
+    ///
+    /// `for_each_neighbor` uses `self.direction`; the reversed BFS needs the
+    /// opposite one, and taking the direction as an argument keeps a second
+    /// near-copy of the match out of the file.
+    fn neighbors_in(
+        node: NodeId,
+        type_ids: Option<&[u16]>,
+        direction: &Direction,
+        store: &GraphStore,
+        visit: &mut impl FnMut(NodeId),
+    ) {
+        let mut with_edge = |nb: NodeId, _e: crate::graph::EdgeId| visit(nb);
+        match direction {
+            Direction::Outgoing => store.for_each_outgoing_neighbor(node, type_ids, &mut with_edge),
+            Direction::Incoming => store.for_each_incoming_neighbor(node, type_ids, &mut with_edge),
             Direction::Both => {
-                let mut all = store.get_outgoing_edge_targets_owned(node);
-                all.extend(store.get_incoming_edge_sources_owned(node));
-                all
+                store.for_each_outgoing_neighbor(node, type_ids, &mut with_edge);
+                store.for_each_incoming_neighbor(node, type_ids, &mut with_edge);
             }
-        };
-        raw.into_iter()
-            .filter(|(_, _, _, et)| {
-                self.edge_types.is_empty() || self.edge_types.iter().any(|t| et.as_str() == t)
-            })
-            .map(|(eid, src, tgt, _)| {
-                let other = match self.direction {
-                    Direction::Outgoing => tgt,
-                    Direction::Incoming => src,
-                    Direction::Both => {
-                        if src == node {
-                            tgt
-                        } else {
-                            src
-                        }
-                    }
-                };
-                (other, eid)
-            })
-            .collect()
+        }
+    }
+
+    fn for_each_neighbor(
+        &self,
+        node: NodeId,
+        type_ids: Option<&[u16]>,
+        store: &GraphStore,
+        mut visit: impl FnMut(NodeId, crate::graph::EdgeId),
+    ) {
+        match self.direction {
+            Direction::Outgoing => store.for_each_outgoing_neighbor(node, type_ids, &mut visit),
+            Direction::Incoming => store.for_each_incoming_neighbor(node, type_ids, &mut visit),
+            Direction::Both => {
+                store.for_each_outgoing_neighbor(node, type_ids, &mut visit);
+                store.for_each_incoming_neighbor(node, type_ids, &mut visit);
+            }
+        }
     }
 
     /// BFS from the source bound in `record`, buffering one output record per
     /// distinct reachable target in `[min_hops, max_hops]`.
+    /// Pin the target to a single node the planner resolved at plan time.
+    ///
+    /// Only valid when the destination really is that one node; the operator
+    /// then answers "can this source reach it" rather than enumerating.
+    pub fn with_pinned_target(mut self, target: NodeId) -> Self {
+        self.pinned_target = Some(target);
+        self
+    }
+
+    /// Can the pinned target be reached from `source` within the hop bounds?
+    ///
+    /// Answered from a set built by one BFS *outward from the target*, walking
+    /// edges in the opposite direction, which is the same relation read the
+    /// other way round. Built once and reused for every input row.
+    ///
+    /// Restricted by the caller to `min_hops <= 1` and no path variable, and
+    /// both restrictions are load-bearing:
+    ///
+    /// * with `min_hops >= 2` a node whose *shortest* distance is 1 may still
+    ///   have a conforming longer walk, and a set keyed on shortest distance
+    ///   would wrongly exclude it;
+    /// * a path variable needs the actual path, which a membership test does
+    ///   not produce.
+    fn target_reaches(&mut self, source: NodeId, store: &GraphStore) -> bool {
+        let target = match self.pinned_target {
+            Some(t) => t,
+            None => return false,
+        };
+        if self.target_reach.is_none() {
+            self.ensure_type_ids(store);
+            let type_ids = self.type_ids.clone();
+            let type_filter = type_ids.as_deref();
+
+            // Reversed: the operator walks source -> target, so reaching the
+            // target from a source means walking target -> source backwards.
+            let reversed = match self.direction {
+                Direction::Outgoing => Direction::Incoming,
+                Direction::Incoming => Direction::Outgoing,
+                Direction::Both => Direction::Both,
+            };
+
+            let mut reach: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+            let mut visited: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+            visited.insert(target);
+            if self.min_hops == 0 {
+                reach.insert(target);
+            }
+            let mut frontier = vec![target];
+            let mut depth = 0usize;
+            while !frontier.is_empty() && depth < self.max_hops {
+                depth += 1;
+                let mut next = Vec::new();
+                for &cur in &frontier {
+                    Self::neighbors_in(cur, type_filter, &reversed, store, &mut |nb| {
+                        if visited.insert(nb) {
+                            next.push(nb);
+                            if depth >= self.min_hops {
+                                reach.insert(nb);
+                            }
+                        }
+                    });
+                }
+                frontier = next;
+            }
+            self.target_reach = Some(reach);
+        }
+        self.target_reach.as_ref().is_some_and(|r| r.contains(&source))
+    }
+
     fn expand_from(&mut self, record: &Record, store: &GraphStore) -> ExecutionResult<()> {
-        let source_id = record
+        let source_val = record
             .get(&self.source_var)
-            .ok_or_else(|| ExecutionError::VariableNotFound(self.source_var.clone()))?
-            .node_id()
-            .ok_or_else(|| {
-                ExecutionError::TypeError(format!("{} is not a node", self.source_var))
-            })?;
+            .ok_or_else(|| ExecutionError::VariableNotFound(self.source_var.clone()))?;
+        // See `ExpandOperator::load_edges`: a null source expands to nothing
+        // rather than failing (#671).
+        if matches!(source_val, Value::Null) || matches!(source_val.as_property(), Some(PropertyValue::Null)) {
+            self.pending.clear();
+            return Ok(());
+        }
+        let source_id = source_val.node_id().ok_or_else(|| {
+            ExecutionError::TypeError(format!("{} is not a node", self.source_var))
+        })?;
+
+        // Pinned target: one membership test instead of a BFS per row. The
+        // planner only sets this when the destination resolves to a single
+        // node, there is no path variable, and `min_hops <= 1`.
+        if let Some(target) = self.pinned_target {
+            if self.target_reaches(source_id, store) && self.emit_ok(target, store) {
+                let empty: std::collections::HashMap<NodeId, (NodeId, crate::graph::EdgeId)> =
+                    std::collections::HashMap::new();
+                self.buffer(record, target, &empty, source_id, store);
+            }
+            return Ok(());
+        }
 
         // parent[node] = (predecessor, edge used) for path reconstruction.
         let mut parent: std::collections::HashMap<NodeId, (NodeId, crate::graph::EdgeId)> =
@@ -3105,8 +4597,15 @@ impl VarLengthExpandOperator {
 
         // Depth 0 endpoint (only relevant when min_hops == 0).
         if self.min_hops == 0 && self.emit_ok(source_id, store) {
-            self.buffer(record, source_id, &parent, source_id);
+            self.buffer(record, source_id, &parent, source_id, store);
         }
+
+        // Cloned rather than borrowed: the BFS below calls `&mut self` methods
+        // to buffer output records, so an outstanding borrow of `self.type_ids`
+        // would not live. This is once per source record, not once per row.
+        self.ensure_type_ids(store);
+        let type_ids: Option<Vec<u16>> = self.type_ids.clone();
+        let type_filter = type_ids.as_deref();
 
         let mut frontier = vec![source_id];
         let mut depth = 0usize;
@@ -3114,13 +4613,21 @@ impl VarLengthExpandOperator {
             depth += 1;
             let mut next = Vec::new();
             for &cur in &frontier {
-                for (nb, eid) in self.neighbors(cur, store) {
+                // The closure borrows the BFS state; buffering an output
+                // record needs `&mut self`, so discovery and emission are
+                // separated. The emission order is unchanged: `next` is filled
+                // in exactly the order the old code emitted in.
+                self.for_each_neighbor(cur, type_filter, store, |nb, eid| {
                     if visited.insert(nb) {
                         parent.insert(nb, (cur, eid));
                         next.push(nb);
-                        if depth >= self.min_hops && self.emit_ok(nb, store) {
-                            self.buffer(record, nb, &parent, source_id);
-                        }
+                    }
+                });
+            }
+            if depth >= self.min_hops {
+                for &nb in &next {
+                    if self.emit_ok(nb, store) {
+                        self.buffer(record, nb, &parent, source_id, store);
                     }
                 }
             }
@@ -3147,12 +4654,39 @@ impl VarLengthExpandOperator {
         target: NodeId,
         parent: &std::collections::HashMap<NodeId, (NodeId, crate::graph::EdgeId)>,
         source: NodeId,
+        store: &GraphStore,
     ) {
         let mut rec = base.clone();
         rec.bind(self.target_var.clone(), Value::NodeRef(target));
-        if let Some(ref pv) = self.path_variable {
+        if self.path_variable.is_some() || self.rel_variable.is_some() {
             let (nodes, edges) = reconstruct_path(parent, source, target);
-            rec.bind(pv.clone(), Value::Path { nodes, edges });
+            if let Some(ref rv) = self.rel_variable {
+                // A list of relationships, not of ids: `r` is the same kind of
+                // thing a single-hop `[r]` binds, one per hop.
+                // Resolved from the store rather than left as placeholders:
+                // an `EdgeRef` carrying a blank type renders as `[:]`, which
+                // is not what any caller means by a relationship.
+                rec.bind(
+                    rv.clone(),
+                    Value::List(
+                        edges
+                            .iter()
+                            .map(|e| match store.get_edge(*e) {
+                                Some(edge) => Value::EdgeRef(
+                                    *e,
+                                    edge.source,
+                                    edge.target,
+                                    edge.edge_type.clone(),
+                                ),
+                                None => Value::Null,
+                            })
+                            .collect(),
+                    ),
+                );
+            }
+            if let Some(ref pv) = self.path_variable {
+                rec.bind(pv.clone(), Value::Path { nodes, edges });
+            }
         }
         self.pending.push_back(rec);
     }
@@ -3182,6 +4716,10 @@ fn reconstruct_path(
 }
 
 impl PhysicalOperator for VarLengthExpandOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.input]
+    }
+
     fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
         loop {
             if let Some(rec) = self.pending.pop_front() {
@@ -3213,8 +4751,20 @@ impl PhysicalOperator for VarLengthExpandOperator {
         OperatorDescription {
             name: "VarLengthExpand".to_string(),
             details: format!(
-                "({})-[:{}*{}..{}]-({})",
-                self.source_var, types, self.min_hops, max, self.target_var
+                "({})-[:{}*{}..{}]-({}){}",
+                self.source_var,
+                types,
+                self.min_hops,
+                max,
+                self.target_var,
+                // Whether the pinned-target path is in use changes the cost of
+                // this operator by orders of magnitude, so it belongs in the
+                // plan. An optimisation you cannot see in EXPLAIN is one nobody
+                // can tell has stopped firing.
+                match self.pinned_target {
+                    Some(t) => format!(" [target pinned to node {}]", t.as_u64()),
+                    None => String::new(),
+                }
             ),
             children: vec![self.input.describe()],
         }
@@ -3237,6 +4787,11 @@ impl ProjectOperator {
 
     fn evaluate_expression(&self, expr: &Expression, record: &Record, store: &GraphStore) -> ExecutionResult<Value> {
         match expr {
+            // Delegates rather than adding a sixth copy of this logic; the
+            // standalone evaluator is the one implementation (#654).
+            Expression::ListExpr(_) | Expression::MapExpr(_) => {
+                eval_expression(expr, record, store)
+            }
             Expression::Variable(var) => {
                 let val = record.get(var)
                     .cloned()
@@ -3246,22 +4801,20 @@ impl ProjectOperator {
                     Value::NodeRef(id) => {
                         let node = store.get_node(id)
                             .ok_or_else(|| ExecutionError::RuntimeError(format!("Node {:?} not found", id)))?;
-                        Ok(Value::Node(id, node.clone()))
+                        Ok(Value::Node(id, Box::new(node.clone())))
                     }
                     Value::EdgeRef(id, ..) => {
                         let edge = store.get_edge(id)
                             .ok_or_else(|| ExecutionError::RuntimeError(format!("Edge {:?} not found", id)))?;
-                        Ok(Value::Edge(id, edge.clone()))
+                        Ok(Value::Edge(id, Box::new(edge.clone())))
                     }
                     other => Ok(other),
                 }
             }
             Expression::Property { variable, property } => {
-                let val = record.get(variable)
-                    .ok_or_else(|| ExecutionError::VariableNotFound(variable.clone()))?;
-
-                let prop = val.resolve_property(property, store);
-                Ok(Value::Property(prop))
+                return read_property(record, variable, property, store, false);
+                #[allow(unreachable_code)]
+                Ok(Value::Null)
             }
             Expression::Literal(lit) => Ok(Value::Property(lit.clone())),
             Expression::Binary { left, op, right } => {
@@ -3285,7 +4838,7 @@ impl ProjectOperator {
             Expression::Index { expr, index } => {
                 let collection = self.evaluate_expression(expr, record, store)?;
                 let idx = self.evaluate_expression(index, record, store)?;
-                eval_index(collection, idx)
+                eval_index(collection, idx, store)
             }
             Expression::ListSlice { expr, start, end } => {
                 let collection = self.evaluate_expression(expr, record, store)?;
@@ -3321,6 +4874,10 @@ impl ProjectOperator {
 }
 
 impl PhysicalOperator for ProjectOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.input]
+    }
+
     fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
         if let Some(record) = self.input.next(store)? {
             let mut new_record = Record::new();
@@ -3438,7 +4995,12 @@ enum AggregatorState {
     Avg { sum: f64, count: i64 },
     Min(Option<PropertyValue>),
     Max(Option<PropertyValue>),
-    Collect(Vec<PropertyValue>),
+    /// `Vec<Value>`, not `Vec<PropertyValue>`: `collect(n)` over nodes is one
+    /// of the most common aggregates in Cypher, and a `PropertyValue` cannot
+    /// hold an entity. `value.as_property()` returned `None` for a node and
+    /// the element was skipped, so `collect(a)` over two nodes produced an
+    /// **empty list** — no error, just nothing (#669).
+    Collect(Vec<Value>),
     CollectDistinct(BTreeSet<PropertyValue>),
     Percentile { values: Vec<f64>, pct: f64, cont: bool },
     StDev { values: Vec<f64>, population: bool },
@@ -3513,6 +5075,24 @@ impl CountDistinctSet {
             Self::Props(s) => s.len(),
         }
     }
+
+    /// Absorb another set. Used when two group identities turn out to share a
+    /// key tuple and their partial aggregates have to become one.
+    fn merge(&mut self, other: Self) {
+        match other {
+            Self::Empty => {}
+            Self::Ids(ids) => {
+                for id in ids {
+                    self.insert_id(id);
+                }
+            }
+            Self::Props(props) => {
+                for p in props {
+                    self.insert_prop(p);
+                }
+            }
+        }
+    }
 }
 
 impl AggregatorState {
@@ -3542,6 +5122,12 @@ impl AggregatorState {
             }
             AggregatorState::CountDistinct(set) => {
                 match value {
+                    // A list is distinguished by its rendering, which is the
+                    // cheapest total order available over mixed element types.
+                    Value::List(items) => set.insert_prop(PropertyValue::String(format!("{items:?}"))),
+                    Value::Map(entries) => {
+                        set.insert_prop(PropertyValue::String(format!("{entries:?}")))
+                    }
                     Value::Property(prop) => {
                         if !prop.is_null() {
                             set.insert_prop(prop.clone());
@@ -3588,8 +5174,16 @@ impl AggregatorState {
                     else if let Some(i) = prop.as_integer() { *sum += i as f64; *count += 1; }
                 }
             }
+            // Aggregates ignore nulls — Cypher's rule, and the reason min/max must SKIP a
+            // null input rather than compare it. Comparing is what broke both, in opposite
+            // directions: while null sorted smallest it won every min(), and once ordering
+            // was corrected so null sorts greatest (#369) it would have won every max().
+            // Neither is a comparator problem; the accumulator simply must not see nulls.
             AggregatorState::Min(curr) => {
                 if let Some(prop) = value.as_property() {
+                    if matches!(prop, PropertyValue::Null) {
+                        return;
+                    }
                     if curr.is_none() || prop < curr.as_ref().unwrap() {
                         *curr = Some(prop.clone());
                     }
@@ -3597,18 +5191,25 @@ impl AggregatorState {
             }
             AggregatorState::Max(curr) => {
                 if let Some(prop) = value.as_property() {
+                    if matches!(prop, PropertyValue::Null) {
+                        return;
+                    }
                     if curr.is_none() || prop > curr.as_ref().unwrap() {
                         *curr = Some(prop.clone());
                     }
                 }
             }
             AggregatorState::Collect(items) => {
-                if let Some(prop) = value.as_property() {
-                    items.push(prop.clone());
+                // collect() drops nulls, like every other aggregate (#358) — otherwise the
+                // list carries holes that every consumer has to filter again.
+                let is_null = matches!(value, Value::Null)
+                    || matches!(value.as_property(), Some(PropertyValue::Null));
+                if !is_null {
+                    items.push(value.clone());
                 }
             }
             AggregatorState::CollectDistinct(set) => {
-                if let Some(prop) = value.as_property() {
+                if let Some(prop) = value.as_property().filter(|p| !matches!(p, PropertyValue::Null)) {
                     if !prop.is_null() {
                         set.insert(prop.clone());
                     }
@@ -3629,6 +5230,66 @@ impl AggregatorState {
         }
     }
 
+    /// Fold another partial aggregate of the same shape into this one.
+    ///
+    /// Every aggregate here is associative and commutative, which is what makes
+    /// grouping on identity and merging afterwards legal: partial states over a
+    /// partition of the input combine to the state over the whole input.
+    /// `collect` is the one to look at twice — list order is the order rows
+    /// arrived, which was already unspecified across groups, and concatenation
+    /// keeps each partial run contiguous.
+    fn merge(&mut self, other: Self) {
+        match (self, other) {
+            (AggregatorState::Count(a), AggregatorState::Count(b)) => *a += b,
+            (AggregatorState::CountDistinct(a), AggregatorState::CountDistinct(b)) => a.merge(b),
+            (
+                AggregatorState::Sum { int_acc, float_acc, int_only },
+                AggregatorState::Sum { int_acc: bi, float_acc: bf, int_only: bint },
+            ) => {
+                if *int_only && bint {
+                    *int_acc += bi;
+                } else {
+                    // Whichever side is still integral has to be promoted
+                    // before the two float accumulators can be added.
+                    if *int_only {
+                        *int_only = false;
+                        *float_acc = *int_acc as f64;
+                    }
+                    *float_acc += if bint { bi as f64 } else { bf };
+                }
+            }
+            (AggregatorState::Avg { sum, count }, AggregatorState::Avg { sum: bs, count: bc }) => {
+                *sum += bs;
+                *count += bc;
+            }
+            (AggregatorState::Min(a), AggregatorState::Min(b)) => {
+                if let Some(b) = b {
+                    if a.is_none() || &b < a.as_ref().unwrap() {
+                        *a = Some(b);
+                    }
+                }
+            }
+            (AggregatorState::Max(a), AggregatorState::Max(b)) => {
+                if let Some(b) = b {
+                    if a.is_none() || &b > a.as_ref().unwrap() {
+                        *a = Some(b);
+                    }
+                }
+            }
+            (AggregatorState::Collect(a), AggregatorState::Collect(b)) => a.extend(b.clone()),
+            (AggregatorState::CollectDistinct(a), AggregatorState::CollectDistinct(b)) => a.extend(b),
+            (AggregatorState::Percentile { values, .. }, AggregatorState::Percentile { values: b, .. }) => {
+                values.extend(b)
+            }
+            (AggregatorState::StDev { values, .. }, AggregatorState::StDev { values: b, .. }) => {
+                values.extend(b)
+            }
+            // Both sides are built from the same `AggregateFunction`, so a
+            // mismatch is a construction bug rather than bad input.
+            (a, b) => debug_assert!(false, "cannot merge {a:?} with {b:?}"),
+        }
+    }
+
     fn result(&self) -> Value {
         match self {
             AggregatorState::Count(c) => Value::Property(PropertyValue::Integer(*c)),
@@ -3646,7 +5307,25 @@ impl AggregatorState {
             }
             AggregatorState::Min(val) => val.clone().map(Value::Property).unwrap_or(Value::Null),
             AggregatorState::Max(val) => val.clone().map(Value::Property).unwrap_or(Value::Null),
-            AggregatorState::Collect(items) => Value::Property(PropertyValue::Array(items.clone())),
+            AggregatorState::Collect(items) => {
+                // A list of scalars stays a `PropertyValue::Array`, exactly as
+                // before, so every existing consumer of that shape is
+                // untouched; only a collection holding entities needs the
+                // wider `Value::List` (#669).
+                if items.iter().all(|v| matches!(v, Value::Property(_))) {
+                    Value::Property(PropertyValue::Array(
+                        items
+                            .iter()
+                            .map(|v| match v {
+                                Value::Property(p) => p.clone(),
+                                _ => PropertyValue::Null,
+                            })
+                            .collect(),
+                    ))
+                } else {
+                    Value::List(items.clone())
+                }
+            }
             AggregatorState::CollectDistinct(set) => Value::Property(PropertyValue::Array(set.iter().cloned().collect())),
             AggregatorState::Percentile { values, pct, cont } => {
                 if values.is_empty() { return Value::Null; }
@@ -3705,13 +5384,16 @@ impl AggregateOperator {
 
     fn evaluate_expression(expr: &Expression, record: &Record, store: &GraphStore) -> ExecutionResult<Value> {
         match expr {
+            // Delegates rather than adding a sixth copy of this logic; the
+            // standalone evaluator is the one implementation (#654).
+            Expression::ListExpr(_) | Expression::MapExpr(_) => {
+                eval_expression(expr, record, store)
+            }
             Expression::Variable(var) => {
                 Ok(record.get(var).cloned().unwrap_or(Value::Null))
             }
             Expression::Property { variable, property } => {
-                let val = record.get(variable).unwrap_or(&Value::Null);
-                let prop = val.resolve_property(property, store);
-                Ok(Value::Property(prop))
+                read_property(record, variable, property, store, true)
             }
             Expression::Literal(lit) => Ok(Value::Property(lit.clone())),
             Expression::Binary { left, op, right } => {
@@ -3735,7 +5417,7 @@ impl AggregateOperator {
             Expression::Index { expr, index } => {
                 let collection = Self::evaluate_expression(expr, record, store)?;
                 let idx = Self::evaluate_expression(index, record, store)?;
-                eval_index(collection, idx)
+                eval_index(collection, idx, store)
             }
             Expression::ListSlice { expr, start, end } => {
                 let collection = Self::evaluate_expression(expr, record, store)?;
@@ -3771,11 +5453,63 @@ impl AggregateOperator {
 }
 
 impl PhysicalOperator for AggregateOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.input]
+    }
+
     fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
         if !self.executed {
             self.execute_all(store)?;
         }
         Ok(self.results.next())
+    }
+
+    /// Pull the input **mutably** before aggregating.
+    ///
+    /// Both this and `WithBarrierOperator` need it, for the same reason: the
+    /// default `next_mut` delegates to `next`, which reads its input
+    /// read-only — so any write operator below a materialising operator never
+    /// ran its mutating path. `MATCH (n) SET n.x = 1 WITH n RETURN n.x` returned the
+    /// *old* value: the query succeeded, the barrier produced rows, and the
+    /// write silently did not happen. That is the real reason the grammar only
+    /// ever allowed writes after the last projection, and it had to be fixed
+    /// before a write before a `WITH` could be planned at all.
+    ///
+    /// The input is drained into a `MaterializedOperator` rather than
+    /// threading `&mut GraphStore` through `execute_all` and its grouping
+    /// helpers: the barrier is the most intricate operator here, and this
+    /// leaves its aggregation untouched. A barrier already materialises its
+    /// whole input, so nothing is buffered that would not have been.
+    fn next_mut(&mut self, store: &mut GraphStore, tenant_id: &str) -> ExecutionResult<Option<Record>> {
+        if !self.executed {
+            let mut rows = Vec::new();
+            while let Some(batch) = self.input.next_batch_mut(store, tenant_id, 65536)? {
+                rows.extend(batch.records);
+            }
+            self.input = Box::new(MaterializedOperator::new(rows));
+            self.execute_all(store)?;
+        }
+        Ok(self.results.next())
+    }
+
+    fn next_batch_mut(
+        &mut self,
+        store: &mut GraphStore,
+        tenant_id: &str,
+        batch_size: usize,
+    ) -> ExecutionResult<Option<RecordBatch>> {
+        let mut records = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            match self.next_mut(store, tenant_id)? {
+                Some(r) => records.push(r),
+                None => break,
+            }
+        }
+        if records.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(RecordBatch { records, columns: vec![] }))
+        }
     }
 
     fn next_batch(&mut self, store: &GraphStore, batch_size: usize) -> ExecutionResult<Option<RecordBatch>> {
@@ -3821,15 +5555,252 @@ impl PhysicalOperator for AggregateOperator {
     }
 }
 
-impl AggregateOperator {
-    fn execute_all(&mut self, store: &GraphStore) -> ExecutionResult<()> {
-        // Fast path: single group-by key avoids Vec allocation per record
-        if self.group_by.len() == 1 {
-            return self.execute_all_single_key(store);
+
+/// Per-row evaluation of one expression, specialised where it is a plain
+/// `x.prop`.
+///
+/// Built once per fold rather than held on the operator, because the operator
+/// borrows `self.aggregates` immutably across the loop and a cursor needs
+/// `&mut` to memoise its column.
+enum RowReader {
+    /// `x.prop` — the column is located once (#557).
+    Cursor(PropertyCursor),
+    /// Anything else: a literal, an arithmetic expression, a function call.
+    General(Expression),
+}
+
+impl RowReader {
+    fn for_expression(expr: &Expression) -> Self {
+        match expr {
+            Expression::Property { variable, property } => {
+                RowReader::Cursor(PropertyCursor::new(variable.as_str(), property.as_str()))
+            }
+            other => RowReader::General(other.clone()),
         }
+    }
+
+    fn read(&mut self, record: &Record, store: &GraphStore) -> ExecutionResult<Value> {
+        match self {
+            RowReader::Cursor(cursor) => Ok(Value::Property(cursor.read(record, store))),
+            RowReader::General(expr) => AggregateOperator::evaluate_expression(expr, record, store),
+        }
+    }
+}
+
+/// The group key of a row, before the key expressions are evaluated.
+///
+/// Grouping on a node's *identity* is at least as fine as grouping on any
+/// tuple of its properties: two rows with the same node necessarily agree on
+/// every property of it. It is not equivalent — two *different* nodes may
+/// share a key tuple — which is why the identity path has a merge step.
+///
+/// The point of the enum is that building one costs nothing for a node: a
+/// `u64` copy, against resolving and cloning a property per row.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum IdentityKey {
+    Node(u64),
+    Edge(u64),
+    /// Anything else. Boxed because `Value` is 144 bytes -- `Value::Node`
+    /// embeds a whole `Node` inline (#570) -- and carrying that inline would
+    /// set the width of every entry in the group table for the sake of a case
+    /// that is reached only where a key expression reads a property of
+    /// something that is not a graph element. That is a degenerate query, not
+    /// a hot path.
+    Other(Box<Value>),
+}
+
+impl IdentityKey {
+    fn of(value: Option<&Value>) -> Self {
+        match value {
+            Some(Value::NodeRef(id)) | Some(Value::Node(id, _)) => IdentityKey::Node(id.0),
+            Some(Value::EdgeRef(id, ..)) | Some(Value::Edge(id, _)) => IdentityKey::Edge(id.0),
+            Some(other) => IdentityKey::Other(Box::new(other.clone())),
+            None => IdentityKey::Other(Box::new(Value::Null)),
+        }
+    }
+
+    /// A `Value` to evaluate the group-by expressions against, rebuilt from the
+    /// key rather than stored beside it.
+    ///
+    /// Keeping a representative `Value` per group cost 144 bytes an entry on
+    /// top of the key, for something the id already determines. `NodeRef`
+    /// resolves properties from the store, which is what a materialised
+    /// `Value::Node` would do here too -- this is the read executor, and a
+    /// node's properties come from the store either way.
+    fn probe_value(&self, store: &GraphStore) -> Value {
+        match self {
+            IdentityKey::Node(id) => Value::NodeRef(NodeId(*id)),
+            IdentityKey::Edge(id) => {
+                let edge_id = crate::graph::EdgeId(*id);
+                match store.get_edge(edge_id) {
+                    Some(edge) => Value::EdgeRef(
+                        edge_id,
+                        edge.source,
+                        edge.target,
+                        edge.edge_type.clone(),
+                    ),
+                    None => Value::Null,
+                }
+            }
+            IdentityKey::Other(value) => (**value).clone(),
+        }
+    }
+}
+
+impl AggregateOperator {
+    /// True when every aggregate can be satisfied by counting rows, so the
+    /// argument expressions never have to be evaluated.
+    ///
+    /// Only `count(*)` qualifies — a literal, which is never null.
+    ///
+    /// `count(var)` used to qualify too, on the reasoning that a bound node or
+    /// edge cannot be null per row. `OPTIONAL MATCH` breaks exactly that: it
+    /// binds the variable to `Null` on a row that did not match, so
+    /// `MATCH (p) OPTIONAL MATCH (p)-[:KNOWS]->(f) RETURN count(f)` counted the
+    /// unmatched rows and reported 1 friend for a person with none (#600).
+    ///
+    /// Giving up the variable case costs little: evaluating one is
+    /// `record.get(var)` at ~4 ns, against a property read at ~17 ns. The fast
+    /// path exists to avoid *property* evaluation (#358), and it still does.
+    fn all_simple_count(aggregates: &[AggregateFunction]) -> bool {
+        aggregates.iter().all(|a| {
+            matches!(a.func, AggregateType::Count)
+                && !a.distinct
+                && matches!(a.expr, Expression::Literal(_))
+        })
+    }
+
+    /// The single variable every group-by key is a property of, if there is one.
+    ///
+    /// `RETURN forum.id, forum.title, count(*)` — LDBC IC5's shape — keys on
+    /// two properties of one node. Evaluating them per row resolves a property
+    /// (and clones a string) 1.7M times to distinguish 96,862 groups that the
+    /// node id already distinguishes.
+    fn identity_group_variable(&self) -> Option<String> {
+        let mut found: Option<&str> = None;
+        for (expr, _) in &self.group_by {
+            match expr {
+                Expression::Property { variable, .. } => match found {
+                    None => found = Some(variable),
+                    Some(v) if v == variable => {}
+                    Some(_) => return None,
+                },
+                _ => return None,
+            }
+        }
+        found.map(|v| v.to_string())
+    }
+
+    /// Group on the identity of `var`, then resolve the key expressions once
+    /// per group rather than once per row (#521).
+    ///
+    /// Two phases, because identity grouping is finer than key grouping:
+    ///
+    /// 1. fold rows into partial aggregates keyed by `var`'s identity — no
+    ///    property resolution, no allocation, a `u64` hash per row;
+    /// 2. resolve each group's key tuple once and merge any groups whose
+    ///    tuples are equal.
+    ///
+    /// Phase 2 is what keeps this exactly equivalent to the general path. Two
+    /// distinct nodes carrying the same `(id, title)` are one group in Cypher,
+    /// and without the merge they would come out as two.
+    fn execute_all_by_identity(&mut self, var: &str, store: &GraphStore) -> ExecutionResult<()> {
+        let all_simple_count = Self::all_simple_count(&self.aggregates);
+        let mut readers: Vec<RowReader> =
+            self.aggregates.iter().map(|a| RowReader::for_expression(&a.expr)).collect();
+
+        // Keyed on identity alone. Phase 2 rebuilds what it needs to resolve
+        // properties against from the key itself, so no `Value` is stored per
+        // group -- which at IC5's 96,862 groups took the table from ~320 bytes
+        // an entry to ~40 (#570).
+        let mut groups: rustc_hash::FxHashMap<IdentityKey, Vec<AggregatorState>> =
+            rustc_hash::FxHashMap::default();
+
+        let batch_size = 65536;
+        let mut batch_count = 0u64;
+        while let Some(batch) = self.input.next_batch(store, batch_size)? {
+            batch_count += 1;
+            if batch_count % 10 == 0 {
+                check_deadline()?;
+            }
+            for record in batch.records {
+                let key = IdentityKey::of(record.get(var));
+                let states = groups.entry(key).or_insert_with(|| {
+                    self.aggregates
+                        .iter()
+                        .map(|agg| AggregatorState::new(&agg.func, agg.distinct))
+                        .collect()
+                });
+
+                if all_simple_count {
+                    for state in states.iter_mut() {
+                        if let AggregatorState::Count(c) = state {
+                            *c += 1;
+                        }
+                    }
+                } else {
+                    for (i, reader) in readers.iter_mut().enumerate() {
+                        let val = reader.read(&record, store)?;
+                        states[i].update(&val);
+                    }
+                }
+            }
+        }
+
+        // Phase 2. Every key expression is a property of `var` (that is what
+        // `identity_group_variable` established), so a record binding `var`
+        // alone is enough to evaluate them.
+        let mut merged: rustc_hash::FxHashMap<Vec<Value>, Vec<AggregatorState>> =
+            rustc_hash::FxHashMap::with_capacity_and_hasher(groups.len(), Default::default());
+        for (key, states) in groups {
+            let mut probe = Record::new();
+            probe.bind(var.to_string(), key.probe_value(store));
+            let mut tuple = Vec::with_capacity(self.group_by.len());
+            for (expr, _) in &self.group_by {
+                tuple.push(Self::evaluate_expression(expr, &probe, store)?);
+            }
+            match merged.entry(tuple) {
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    for (dst, src) in slot.get_mut().iter_mut().zip(states) {
+                        dst.merge(src);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(states);
+                }
+            }
+        }
+
+        let mut output_records = Vec::with_capacity(merged.len());
+        for (tuple, states) in merged {
+            let mut record = Record::new();
+            for (i, (_, alias)) in self.group_by.iter().enumerate() {
+                record.bind(alias.clone(), tuple[i].clone());
+            }
+            for (i, agg) in self.aggregates.iter().enumerate() {
+                record.bind(agg.alias.clone(), states[i].result());
+            }
+            output_records.push(record);
+        }
+
+        self.results = output_records.into_iter();
+        self.executed = true;
+        Ok(())
+    }
+
+    fn execute_all(&mut self, store: &GraphStore) -> ExecutionResult<()> {
         // Fast path: no group-by (global aggregate) — avoids HashMap entirely
         if self.group_by.is_empty() {
             return self.execute_all_no_group(store);
+        }
+        // Fast path: the keys are all properties of one variable, so its
+        // identity groups the rows and the properties are resolved per group.
+        if let Some(var) = self.identity_group_variable() {
+            return self.execute_all_by_identity(&var, store);
+        }
+        // Fast path: single group-by key avoids Vec allocation per record
+        if self.group_by.len() == 1 {
+            return self.execute_all_single_key(store);
         }
 
         // FxHashMap is 2-3x faster than std HashMap on simple keys (no
@@ -3837,6 +5808,17 @@ impl AggregateOperator {
         // each insert ~1M (group_key, aggregator) pairs.
         let mut groups: rustc_hash::FxHashMap<Vec<Value>, Vec<AggregatorState>> =
             rustc_hash::FxHashMap::default();
+        let all_simple_count = Self::all_simple_count(&self.aggregates);
+        let mut key_readers: Vec<RowReader> =
+            self.group_by.iter().map(|(e, _)| RowReader::for_expression(e)).collect();
+        let mut readers: Vec<RowReader> =
+            self.aggregates.iter().map(|a| RowReader::for_expression(&a.expr)).collect();
+
+        // Reused across rows. `entry` needs an owned key, so building the tuple
+        // straight into the map allocated a `Vec` per input row and freed it
+        // again on every hit -- 1.68M allocations for 96,862 groups on IC5.
+        // Probing first means the allocation happens once per group.
+        let mut scratch: Vec<Value> = Vec::with_capacity(self.group_by.len());
 
         let batch_size = 65536;
         let mut batch_count = 0u64;
@@ -3844,18 +5826,29 @@ impl AggregateOperator {
             batch_count += 1;
             if batch_count % 10 == 0 { check_deadline()?; }
             for record in batch.records {
-                let mut key = Vec::with_capacity(self.group_by.len());
-                for (expr, _) in &self.group_by {
-                    key.push(Self::evaluate_expression(expr, &record, store)?);
+                scratch.clear();
+                for reader in key_readers.iter_mut() {
+                    scratch.push(reader.read(&record, store)?);
                 }
 
-                let states = groups.entry(key).or_insert_with(|| {
-                    self.aggregates.iter().map(|agg| AggregatorState::new(&agg.func, agg.distinct)).collect()
-                });
+                let states = match groups.get_mut(&scratch) {
+                    Some(states) => states,
+                    None => groups.entry(scratch.clone()).or_insert_with(|| {
+                        self.aggregates.iter().map(|agg| AggregatorState::new(&agg.func, agg.distinct)).collect()
+                    }),
+                };
 
-                for (i, agg) in self.aggregates.iter().enumerate() {
-                    let val = Self::evaluate_expression(&agg.expr, &record, store)?;
-                    states[i].update(&val);
+                if all_simple_count {
+                    for state in states.iter_mut() {
+                        if let AggregatorState::Count(c) = state {
+                            *c += 1;
+                        }
+                    }
+                } else {
+                    for (i, reader) in readers.iter_mut().enumerate() {
+                        let val = reader.read(&record, store)?;
+                        states[i].update(&val);
+                    }
                 }
             }
         }
@@ -3881,10 +5874,11 @@ impl AggregateOperator {
     fn execute_all_single_key(&mut self, store: &GraphStore) -> ExecutionResult<()> {
         let mut groups: rustc_hash::FxHashMap<Value, Vec<AggregatorState>> =
             rustc_hash::FxHashMap::default();
-        let group_expr = &self.group_by[0].0;
+        let mut key_reader = RowReader::for_expression(&self.group_by[0].0);
+        let mut readers: Vec<RowReader> =
+            self.aggregates.iter().map(|a| RowReader::for_expression(&a.expr)).collect();
 
-        // Check if all aggregates are simple count (non-distinct) — can skip aggregate expression evaluation
-        let all_simple_count = self.aggregates.iter().all(|a| matches!(a.func, AggregateType::Count) && !a.distinct);
+        let all_simple_count = Self::all_simple_count(&self.aggregates);
 
         let batch_size = 65536;
         let mut batch_count = 0u64;
@@ -3892,7 +5886,7 @@ impl AggregateOperator {
             batch_count += 1;
             if batch_count % 10 == 0 { check_deadline()?; }
             for record in batch.records {
-                let key = Self::evaluate_expression(group_expr, &record, store)?;
+                let key = key_reader.read(&record, store)?;
 
                 let states = groups.entry(key).or_insert_with(|| {
                     self.aggregates.iter().map(|agg| AggregatorState::new(&agg.func, agg.distinct)).collect()
@@ -3906,8 +5900,8 @@ impl AggregateOperator {
                         }
                     }
                 } else {
-                    for (i, agg) in self.aggregates.iter().enumerate() {
-                        let val = Self::evaluate_expression(&agg.expr, &record, store)?;
+                    for (i, reader) in readers.iter_mut().enumerate() {
+                        let val = reader.read(&record, store)?;
                         states[i].update(&val);
                     }
                 }
@@ -3936,7 +5930,9 @@ impl AggregateOperator {
             .map(|agg| AggregatorState::new(&agg.func, agg.distinct))
             .collect();
 
-        let all_simple_count = self.aggregates.iter().all(|a| matches!(a.func, AggregateType::Count) && !a.distinct);
+        let all_simple_count = Self::all_simple_count(&self.aggregates);
+        let mut readers: Vec<RowReader> =
+            self.aggregates.iter().map(|a| RowReader::for_expression(&a.expr)).collect();
 
         let batch_size = 65536;
         let mut batch_count = 0u64;
@@ -3954,8 +5950,8 @@ impl AggregateOperator {
                 }
             } else {
                 for record in batch.records {
-                    for (i, agg) in self.aggregates.iter().enumerate() {
-                        let val = Self::evaluate_expression(&agg.expr, &record, store)?;
+                    for (i, reader) in readers.iter_mut().enumerate() {
+                        let val = reader.read(&record, store)?;
                         states[i].update(&val);
                     }
                 }
@@ -3998,6 +5994,13 @@ pub struct AdjacencyCountAggregateOperator {
     /// and emit one record per distinct property-value combination —
     /// avoids the planner-side post-aggregate hash-group entirely.
     group_by_props: Vec<String>,
+    /// The label the pattern requires of the *neighbour*, if any.
+    ///
+    /// A degree is not the number of pattern matches: it counts every edge of
+    /// the type whatever sits at the far end. Without this the operator
+    /// answered `MATCH (p:P)-[:KNOWS]->(f:P) RETURN p.name, count(f)` by
+    /// counting Ada's edge to an `:Animal` as well (#601).
+    neighbor_label: Option<Label>,
     /// `count(DISTINCT neighbor)` semantics. When true, build_grouped_iter
     /// accumulates a HashSet of neighbor NodeIds per group instead of
     /// summing degrees — required when the same neighbor may appear under
@@ -4038,8 +6041,15 @@ impl AdjacencyCountAggregateOperator {
             direction,
             group_by_props: Vec::new(),
             count_distinct: false,
+            neighbor_label: None,
             grouped_iter: None,
         }
+    }
+
+    /// Require the counted neighbour to carry this label.
+    pub fn with_neighbor_label(mut self, label: Option<Label>) -> Self {
+        self.neighbor_label = label;
+        self
     }
 
     /// Enable the in-operator group-by path. When non-empty, the operator
@@ -4097,6 +6107,11 @@ impl AdjacencyCountAggregateOperator {
 
         let rows: Vec<GroupedRow> = groups
             .into_iter()
+            // A required MATCH yields no row for a node the pattern does not
+            // match, so a group whose count is zero must not be emitted. The
+            // detector rejects OPTIONAL MATCH, where the zeros would be
+            // wanted, so this is unconditional (#601).
+            .filter(|(_, (_, count))| *count > 0)
             .map(|(prop_values, (sample_node, count))| GroupedRow {
                 prop_values,
                 count,
@@ -4185,18 +6200,71 @@ impl AdjacencyCountAggregateOperator {
     /// helpers (`incoming_degree_for_type` / `outgoing_degree_for_type`)
     /// which avoid Vec alloc + per-edge EdgeType clone.
     fn degree_filtered(&self, store: &GraphStore, node_id: NodeId) -> usize {
+        let Some(label) = &self.neighbor_label else {
+            // No constraint on the far end, so the degree *is* the match count
+            // and the adjacency index answers in O(1). This is the shape the
+            // operator exists for.
+            return match self.direction {
+                Direction::Outgoing => store.outgoing_degree_for_type(node_id, &self.edge_type),
+                Direction::Incoming => store.incoming_degree_for_type(node_id, &self.edge_type),
+                Direction::Both => {
+                    store.outgoing_degree_for_type(node_id, &self.edge_type)
+                        + store.incoming_degree_for_type(node_id, &self.edge_type)
+                }
+            };
+        };
+
+        // Constrained: walk and count the neighbours that carry the label.
+        // O(degree) rather than O(1), which is what a correct answer costs --
+        // and still cheaper than materialising a row per edge. The membership
+        // probe is one hash of a `NodeId` (#592).
+        let Some(members) = store.nodes_with_label(label) else {
+            // No node carries the label, so nothing matches.
+            return 0;
+        };
+        // `Some(&[])` matches no edge; a wildcard would be `None`, which is not
+        // what an unknown edge type means (#520).
+        let type_ids: Vec<u16> = store.edge_type_id(&self.edge_type).into_iter().collect();
+        let filter = Some(type_ids.as_slice());
+
+        let mut count = 0usize;
         match self.direction {
-            Direction::Outgoing => store.outgoing_degree_for_type(node_id, &self.edge_type),
-            Direction::Incoming => store.incoming_degree_for_type(node_id, &self.edge_type),
+            Direction::Outgoing => {
+                store.for_each_outgoing_neighbor(node_id, filter, |target, _| {
+                    if members.contains(&target) {
+                        count += 1;
+                    }
+                });
+            }
+            Direction::Incoming => {
+                store.for_each_incoming_neighbor(node_id, filter, |source, _| {
+                    if members.contains(&source) {
+                        count += 1;
+                    }
+                });
+            }
             Direction::Both => {
-                store.outgoing_degree_for_type(node_id, &self.edge_type)
-                    + store.incoming_degree_for_type(node_id, &self.edge_type)
+                store.for_each_outgoing_neighbor(node_id, filter, |target, _| {
+                    if members.contains(&target) {
+                        count += 1;
+                    }
+                });
+                store.for_each_incoming_neighbor(node_id, filter, |source, _| {
+                    if members.contains(&source) {
+                        count += 1;
+                    }
+                });
             }
         }
+        count
     }
 }
 
 impl PhysicalOperator for AdjacencyCountAggregateOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.input]
+    }
+
     fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
         // Grouped path: accumulate per-(prop_values) counts on first call,
         // then emit one record per group. Correctness-preserving fast path
@@ -4241,6 +6309,12 @@ impl PhysicalOperator for AdjacencyCountAggregateOperator {
             };
 
             let count = self.degree_filtered(store, node_id);
+            if count == 0 {
+                // A required MATCH yields no row for a node the pattern does
+                // not match. The detector rejects OPTIONAL MATCH, where the
+                // zero would be wanted (#601).
+                continue;
+            }
 
             let mut out = input_record;
             out.bind(
@@ -4295,12 +6369,35 @@ impl LimitOperator {
 }
 
 impl PhysicalOperator for LimitOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.input]
+    }
+
     fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
         if self.count >= self.limit {
             return Ok(None);
         }
 
         if let Some(record) = self.input.next(store)? {
+            self.count += 1;
+            Ok(Some(record))
+        } else {
+            Ok(None)
+        }
+    }
+
+    // A pass-through operator's default `next_mut` delegates to `next`, which
+    // reads its input read-only -- so a LIMIT above a write made the write
+    // operators refuse outright: `UNWIND [...] AS x CREATE (n) RETURN n.num
+    // LIMIT 2` failed with "requires mutable store access". Same defect class
+    // as the barriers in #622 and the joins in #624, in the last two
+    // pass-through operators that still had it (#649).
+    fn next_mut(&mut self, store: &mut GraphStore, tenant_id: &str) -> ExecutionResult<Option<Record>> {
+        if self.count >= self.limit {
+            return Ok(None);
+        }
+
+        if let Some(record) = self.input.next_mut(store, tenant_id)? {
             self.count += 1;
             Ok(Some(record))
         } else {
@@ -4356,6 +6453,14 @@ pub struct SortOperator {
     records: Vec<Record>,
     current: usize,
     executed: bool,
+    /// Upper bound on the rows anything above this operator can observe, from
+    /// a `LIMIT` (plus any `SKIP`) pushed down through `try_push_limit`.
+    ///
+    /// `None` means every row is observable and the whole input must be
+    /// sorted. When it is set, only the first `k` rows in sort order can ever
+    /// be read, so the rest are discarded as they arrive instead of being
+    /// sorted and then thrown away (#518).
+    limit_hint: Option<usize>,
 }
 
 impl SortOperator {
@@ -4366,22 +6471,116 @@ impl SortOperator {
             records: Vec::new(),
             current: 0,
             executed: false,
+            limit_hint: None,
         }
+    }
+
+    /// The sort key for one record: each `ORDER BY` expression evaluated once.
+    ///
+    /// This is the whole of the fix in #518. The comparator used to evaluate
+    /// both sides' expressions on **every comparison**, so a sort of n rows
+    /// performed ~2·n·log₂(n) evaluations rather than n. On LDBC IC9 that was
+    /// 389,461 rows -> ~14.5 million property resolutions where 389,461 would
+    /// do, and `Sort` was 68.6% of the query.
+    fn key_of(&self, record: &Record, store: &GraphStore) -> Vec<PropertyValue> {
+        self.sort_items
+            .iter()
+            .map(|(expr, _)| {
+                // Errors are folded to Null, which is what the comparator did
+                // before and what ORDER BY over a missing property means.
+                Self::evaluate_expression(expr, record, store)
+                    .unwrap_or(Value::Null)
+                    .as_property()
+                    .cloned()
+                    .unwrap_or(PropertyValue::Null)
+            })
+            .collect()
+    }
+
+    /// `key_of`, but reading each `x.prop` key through a cursor that located
+    /// its column once (#557).
+    ///
+    /// Only plain property expressions take the cursor; anything else -- an
+    /// arithmetic expression, a function call -- falls back to `key_of`'s
+    /// walker, and produces the same value either way.
+    fn key_of_cached(
+        readers: &mut [PropertyCursor],
+        sort_items: &[(Expression, bool)],
+        record: &Record,
+        store: &GraphStore,
+    ) -> Vec<PropertyValue> {
+        let mut key = Vec::with_capacity(sort_items.len());
+        let mut cursor = readers.iter_mut();
+        for (expr, _) in sort_items {
+            match expr {
+                Expression::Property { .. } => {
+                    let c = cursor.next().expect("one cursor per property key");
+                    key.push(c.read(record, store));
+                }
+                other => key.push(
+                    Self::evaluate_expression(other, record, store)
+                        .unwrap_or(Value::Null)
+                        .as_property()
+                        .cloned()
+                        .unwrap_or(PropertyValue::Null),
+                ),
+            }
+        }
+        key
+    }
+
+    /// Compare two precomputed keys under the per-column sort directions.
+    fn cmp_keys(a: &[PropertyValue], b: &[PropertyValue], items: &[(Expression, bool)]) -> std::cmp::Ordering {
+        for (i, (_, ascending)) in items.iter().enumerate() {
+            let (Some(x), Some(y)) = (a.get(i), b.get(i)) else {
+                continue;
+            };
+            let ord = x.cmp(y);
+            if ord != std::cmp::Ordering::Equal {
+                return if *ascending { ord } else { ord.reverse() };
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+
+    /// Keep only the `k` smallest rows under the sort order, discarding the
+    /// rest.
+    ///
+    /// `select_nth_unstable_by` partitions in O(n) rather than sorting, so
+    /// trimming a buffer is cheaper than sorting it and is done repeatedly as
+    /// the input streams in. Rows tied with the k-th are dropped along with
+    /// the rest of the tail; Cypher does not define a tie-break for
+    /// `ORDER BY … LIMIT`, so any k of a tied set is a valid answer, but two
+    /// runs may therefore disagree about *which* — the same latitude the
+    /// unstable sort below already takes.
+    fn trim_to(keyed: &mut Vec<(Vec<PropertyValue>, Record)>, k: usize, items: &[(Expression, bool)]) {
+        if k == 0 {
+            keyed.clear();
+            return;
+        }
+        if keyed.len() <= k {
+            return;
+        }
+        keyed.select_nth_unstable_by(k - 1, |a, b| Self::cmp_keys(&a.0, &b.0, items));
+        keyed.truncate(k);
     }
 
     fn evaluate_expression(expr: &Expression, record: &Record, store: &GraphStore) -> ExecutionResult<Value> {
         match expr {
+            // Delegates rather than adding a sixth copy of this logic; the
+            // standalone evaluator is the one implementation (#654).
+            Expression::ListExpr(_) | Expression::MapExpr(_) => {
+                eval_expression(expr, record, store)
+            }
             Expression::Variable(var) => {
                 record.get(var)
                     .cloned()
                     .ok_or_else(|| ExecutionError::VariableNotFound(var.clone()))
             }
             Expression::Property { variable, property } => {
-                let val = record.get(variable)
-                    .ok_or_else(|| ExecutionError::VariableNotFound(variable.clone()))?;
-
-                let prop = val.resolve_property(property, store);
-                Ok(Value::Property(prop))
+                return read_property(record, variable, property, store, false);
+                #[allow(unreachable_code)]
+                Ok(Value::Null)
             }
             Expression::Literal(lit) => Ok(Value::Property(lit.clone())),
             Expression::Binary { left, op, right } => {
@@ -4405,7 +6604,7 @@ impl SortOperator {
             Expression::Index { expr, index } => {
                 let collection = Self::evaluate_expression(expr, record, store)?;
                 let idx = Self::evaluate_expression(index, record, store)?;
-                eval_index(collection, idx)
+                eval_index(collection, idx, store)
             }
             Expression::ListSlice { expr, start, end } => {
                 let collection = Self::evaluate_expression(expr, record, store)?;
@@ -4441,6 +6640,27 @@ impl SortOperator {
 }
 
 impl PhysicalOperator for SortOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.input]
+    }
+
+    /// Accept the hint, and stop it here.
+    ///
+    /// A sort does not change cardinality, so it is safe for it to know that
+    /// only the first `n` rows will ever be read -- that is exactly a top-N.
+    /// It is *not* safe to pass the hint further down: the input must still
+    /// produce every row, or the sort would be ordering an arbitrary prefix.
+    ///
+    /// Returning `true` records that the hint was consumed rather than
+    /// ignored, which is what the contract on this method means.
+    fn try_push_limit(&mut self, n: usize) -> bool {
+        self.limit_hint = Some(match self.limit_hint {
+            Some(existing) => existing.min(n),
+            None => n,
+        });
+        true
+    }
+
     fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
         if !self.executed {
             self.execute_all(store)?;
@@ -4476,6 +6696,8 @@ impl PhysicalOperator for SortOperator {
         self.records.clear();
         self.current = 0;
         self.executed = false;
+        // `limit_hint` is deliberately kept: it is a property of the plan the
+        // planner built, not state from a previous execution.
     }
 
     fn describe(&self) -> OperatorDescription {
@@ -4492,30 +6714,53 @@ impl PhysicalOperator for SortOperator {
 
 impl SortOperator {
     fn execute_all(&mut self, store: &GraphStore) -> ExecutionResult<()> {
-        // Materialize all records in batches
+        // Decorate-sort-undecorate: evaluate each ORDER BY expression once per
+        // row and sort the resulting keys, rather than re-evaluating both
+        // sides inside the comparator on every one of the ~n·log₂(n)
+        // comparisons (#518).
         let batch_size = 65536;
+        let bound = self.limit_hint;
+
+        // With a bound, the buffer is trimmed back to k whenever it grows
+        // past a working size, so peak memory is O(k) rather than O(n). The
+        // floor keeps the trimming amortised: for a small k the partition
+        // would otherwise run on nearly every batch.
+        let trim_at = bound.map(|k| k.saturating_mul(2).max(4096));
+
+        // One cursor per property-valued sort key, in the order those keys
+        // appear, so `key_of_cached` can walk the two together.
+        let mut readers: Vec<PropertyCursor> = self
+            .sort_items
+            .iter()
+            .filter_map(|(expr, _)| match expr {
+                Expression::Property { variable, property } => {
+                    Some(PropertyCursor::new(variable.as_str(), property.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+
+        let mut keyed: Vec<(Vec<PropertyValue>, Record)> = Vec::new();
         while let Some(batch) = self.input.next_batch(store, batch_size)? {
-            self.records.extend(batch.records);
-        }
-
-        // Sort
-        let sort_items = &self.sort_items;
-        self.records.sort_by(|a, b| {
-            for (expr, ascending) in sort_items {
-                let val_a = Self::evaluate_expression(expr, a, store).unwrap_or(Value::Null);
-                let val_b = Self::evaluate_expression(expr, b, store).unwrap_or(Value::Null);
-
-                let prop_a = val_a.as_property().unwrap_or(&PropertyValue::Null);
-                let prop_b = val_b.as_property().unwrap_or(&PropertyValue::Null);
-
-                let ord = prop_a.cmp(prop_b);
-                if ord != std::cmp::Ordering::Equal {
-                    return if *ascending { ord } else { ord.reverse() };
+            keyed.reserve(batch.records.len());
+            for record in batch.records {
+                let key = Self::key_of_cached(&mut readers, &self.sort_items, &record, store);
+                keyed.push((key, record));
+            }
+            if let (Some(k), Some(threshold)) = (bound, trim_at) {
+                if keyed.len() >= threshold {
+                    Self::trim_to(&mut keyed, k, &self.sort_items);
                 }
             }
-            std::cmp::Ordering::Equal
-        });
+        }
+        if let Some(k) = bound {
+            Self::trim_to(&mut keyed, k, &self.sort_items);
+        }
 
+        let sort_items = &self.sort_items;
+        keyed.sort_by(|a, b| Self::cmp_keys(&a.0, &b.0, sort_items));
+
+        self.records = keyed.into_iter().map(|(_, record)| record).collect();
         self.executed = true;
         Ok(())
     }
@@ -4741,6 +6986,9 @@ pub struct CartesianProductOperator {
     left_index: usize,
     current_right: Option<Record>,
     left_materialized: bool,
+    /// Set once the left input has been drained through `next_mut`.
+    /// Without it a second call would re-drain an already-consumed side.
+    left_drained_mut: bool,
 }
 
 impl CartesianProductOperator {
@@ -4752,6 +7000,7 @@ impl CartesianProductOperator {
             left_index: 0,
             current_right: None,
             left_materialized: false,
+            left_drained_mut: false,
         }
     }
 
@@ -4771,6 +7020,10 @@ impl CartesianProductOperator {
 }
 
 impl PhysicalOperator for CartesianProductOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.left, &mut self.right]
+    }
+
     fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
         self.materialize_left(store)?;
         if self.left_records.is_empty() {
@@ -4840,6 +7093,30 @@ impl PhysicalOperator for CartesianProductOperator {
         }
     }
 
+
+    // A clause pipeline can put writes on the left of a join: `CREATE (n:C)
+    // WITH n MATCH (a:A) RETURN a, n` plans the CREATE below this operator.
+    // Draining that side with the read-only `next` makes the write operators
+    // refuse — they cannot reach a mutable store — so the left input is drained
+    // once with `next_mut` and replaced by its own rows. Everything below has
+    // then already run, and the read-only path is correct for the rest.
+    fn next_mut(&mut self, store: &mut GraphStore, tenant_id: &str) -> ExecutionResult<Option<Record>> {
+        if !self.left_drained_mut {
+            let mut rows = Vec::new();
+            let mut count = 0u64;
+            while let Some(record) = self.left.next_mut(store, tenant_id)? {
+                rows.push(record);
+                count += 1;
+                if count % 10000 == 0 {
+                    check_deadline()?;
+                }
+            }
+            self.left = Box::new(MaterializedOperator::new(rows));
+            self.left_drained_mut = true;
+        }
+        self.next(store)
+    }
+
     fn reset(&mut self) {
         self.left.reset();
         self.right.reset();
@@ -4862,25 +7139,42 @@ impl PhysicalOperator for CartesianProductOperator {
 pub struct JoinOperator {
     left: OperatorBox,
     right: OperatorBox,
-    join_var: String,
-    left_records: HashMap<Value, Vec<Record>>,
+    /// **Every** variable shared between the two sides, not just one.
+    ///
+    /// Joining on a single shared variable silently drops the correlation carried by the
+    /// others and returns a cartesian product across them. The planner used to pass the
+    /// first element of a `HashSet` intersection, so which correlation was enforced — and
+    /// therefore whether the answer was right — varied between runs of the same query on
+    /// the same data (#360).
+    join_vars: Vec<String>,
+    left_records: HashMap<Vec<Value>, Vec<Record>>,
     right_records: Vec<Record>,
     current_right_index: usize,
     current_left_list_index: usize,
     materialized: bool,
+    /// Set once the left input has been drained through `next_mut`.
+    /// Without it a second call would re-drain an already-consumed side.
+    left_drained_mut: bool,
 }
 
 impl JoinOperator {
-    pub fn new(left: OperatorBox, right: OperatorBox, join_var: String) -> Self {
+    /// The composite key: every join variable's value, in a fixed order. `None` when the
+    /// record does not bind them all, in which case it cannot match anything.
+    fn key_of(record: &Record, vars: &[String]) -> Option<Vec<Value>> {
+        vars.iter().map(|v| record.get(v).cloned()).collect()
+    }
+
+    pub fn new(left: OperatorBox, right: OperatorBox, join_vars: Vec<String>) -> Self {
         Self {
             left,
             right,
-            join_var,
+            join_vars,
             left_records: HashMap::new(),
             right_records: Vec::new(),
             current_right_index: 0,
             current_left_list_index: 0,
             materialized: false,
+            left_drained_mut: false,
         }
     }
 
@@ -4892,8 +7186,8 @@ impl JoinOperator {
         // Materialize left into a hash map (with periodic timeout check)
         let mut count = 0u64;
         while let Some(record) = self.left.next(store)? {
-            if let Some(val) = record.get(&self.join_var) {
-                self.left_records.entry(val.clone()).or_default().push(record);
+            if let Some(key) = Self::key_of(&record, &self.join_vars) {
+                self.left_records.entry(key).or_default().push(record);
             }
             count += 1;
             if count % 10000 == 0 { check_deadline()?; }
@@ -4913,13 +7207,17 @@ impl JoinOperator {
 }
 
 impl PhysicalOperator for JoinOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.left, &mut self.right]
+    }
+
     fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
         self.materialize(store)?;
 
         while self.current_right_index < self.right_records.len() {
             let right_record = &self.right_records[self.current_right_index];
-            if let Some(join_val) = right_record.get(&self.join_var) {
-                if let Some(left_list) = self.left_records.get(join_val) {
+            if let Some(join_key) = Self::key_of(right_record, &self.join_vars) {
+                if let Some(left_list) = self.left_records.get(&join_key) {
                     if self.current_left_list_index < left_list.len() {
                         let left_record = &left_list[self.current_left_list_index];
                         self.current_left_list_index += 1;
@@ -4948,8 +7246,8 @@ impl PhysicalOperator for JoinOperator {
 
         while results.len() < batch_size && self.current_right_index < self.right_records.len() {
             let right_record = &self.right_records[self.current_right_index];
-            if let Some(join_val) = right_record.get(&self.join_var) {
-                if let Some(left_list) = self.left_records.get(join_val) {
+            if let Some(join_key) = Self::key_of(right_record, &self.join_vars) {
+                if let Some(left_list) = self.left_records.get(&join_key) {
                     let take = (batch_size - results.len()).min(left_list.len() - self.current_left_list_index);
                     
                     for i in 0..take {
@@ -4983,6 +7281,30 @@ impl PhysicalOperator for JoinOperator {
         }
     }
 
+
+    // A clause pipeline can put writes on the left of a join: `CREATE (n:C)
+    // WITH n MATCH (a:A) RETURN a, n` plans the CREATE below this operator.
+    // Draining that side with the read-only `next` makes the write operators
+    // refuse — they cannot reach a mutable store — so the left input is drained
+    // once with `next_mut` and replaced by its own rows. Everything below has
+    // then already run, and the read-only path is correct for the rest.
+    fn next_mut(&mut self, store: &mut GraphStore, tenant_id: &str) -> ExecutionResult<Option<Record>> {
+        if !self.left_drained_mut {
+            let mut rows = Vec::new();
+            let mut count = 0u64;
+            while let Some(record) = self.left.next_mut(store, tenant_id)? {
+                rows.push(record);
+                count += 1;
+                if count % 10000 == 0 {
+                    check_deadline()?;
+                }
+            }
+            self.left = Box::new(MaterializedOperator::new(rows));
+            self.left_drained_mut = true;
+        }
+        self.next(store)
+    }
+
     fn reset(&mut self) {
         self.left.reset();
         self.right.reset();
@@ -4996,7 +7318,7 @@ impl PhysicalOperator for JoinOperator {
     fn describe(&self) -> OperatorDescription {
         OperatorDescription {
             name: "HashJoin".to_string(),
-            details: format!("on={}", self.join_var),
+            details: format!("on={}", self.join_vars.join(",")),
             children: vec![self.left.describe(), self.right.describe()],
         }
     }
@@ -5008,37 +7330,67 @@ impl PhysicalOperator for JoinOperator {
 pub struct LeftOuterJoinOperator {
     left: OperatorBox,
     right: OperatorBox,
-    join_var: String,
+    /// Every shared variable — see [`JoinOperator::join_vars`] (#360).
+    join_vars: Vec<String>,
     right_only_vars: Vec<String>,
+    /// A predicate spanning both sides, evaluated **inside** the join.
+    ///
+    /// `OPTIONAL MATCH (x)-[:E1]->(y) WHERE x.val < y.val` scopes its WHERE to
+    /// the optional match. Applied as an ordinary filter above the join it
+    /// deletes the null-filled rows the OPTIONAL MATCH exists to produce —
+    /// `MATCH (x:X) OPTIONAL MATCH ... WHERE y.val > 4` returned one row where
+    /// Cypher returns three. A pair failing this predicate is *not a match*,
+    /// so the left row is still emitted with nulls (#667).
+    join_predicate: Option<Expression>,
     // Materialized data
     left_records: Vec<Record>,
-    right_hash: HashMap<Value, Vec<Record>>,
+    right_hash: HashMap<Vec<Value>, Vec<Record>>,
     // Iteration state
     current_left_idx: usize,
     current_right_match_idx: usize,
     null_emitted: bool,
+    /// Whether any right row for the current left row satisfied
+    /// `join_predicate`. A left row whose every candidate fails it has *no
+    /// match*, so it is still emitted with nulls (#667).
+    any_match_for_left: bool,
     materialized: bool,
+    /// Set once the left input has been drained through `next_mut`.
+    /// Without it a second call would re-drain an already-consumed side.
+    left_drained_mut: bool,
 }
 
 impl LeftOuterJoinOperator {
     pub fn new(
         left: OperatorBox,
         right: OperatorBox,
-        join_var: String,
+        join_vars: Vec<String>,
         right_only_vars: Vec<String>,
     ) -> Self {
         Self {
             left,
             right,
-            join_var,
+            join_vars,
             right_only_vars,
+            join_predicate: None,
             left_records: Vec::new(),
             right_hash: HashMap::new(),
             current_left_idx: 0,
             current_right_match_idx: 0,
             null_emitted: false,
+            any_match_for_left: false,
             materialized: false,
+            left_drained_mut: false,
         }
+    }
+
+    /// A predicate that must hold for a left/right pair to count as a match.
+    ///
+    /// Rows failing it are not filtered out — the left row is emitted with the
+    /// right side null, which is what distinguishes a join condition from a
+    /// WHERE above the join (#667).
+    pub fn with_join_predicate(mut self, predicate: Expression) -> Self {
+        self.join_predicate = Some(predicate);
+        self
     }
 
     fn materialize(&mut self, store: &GraphStore) -> ExecutionResult<()> {
@@ -5057,7 +7409,7 @@ impl LeftOuterJoinOperator {
         // Materialize right into a hash map by join variable
         count = 0;
         while let Some(record) = self.right.next(store)? {
-            if let Some(val) = record.get(&self.join_var) {
+            if let Some(val) = JoinOperator::key_of(&record, &self.join_vars) {
                 self.right_hash.entry(val.clone()).or_default().push(record);
             }
             count += 1;
@@ -5070,22 +7422,50 @@ impl LeftOuterJoinOperator {
 }
 
 impl PhysicalOperator for LeftOuterJoinOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.left, &mut self.right]
+    }
+
     fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
         self.materialize(store)?;
 
         while self.current_left_idx < self.left_records.len() {
             let left_record = &self.left_records[self.current_left_idx];
 
-            if let Some(join_val) = left_record.get(&self.join_var) {
-                if let Some(right_list) = self.right_hash.get(join_val) {
+            if let Some(join_val) = JoinOperator::key_of(left_record, &self.join_vars) {
+                if let Some(right_list) = self.right_hash.get(&join_val) {
                     // Has right matches — emit merged records
-                    if self.current_right_match_idx < right_list.len() {
+                    while self.current_right_match_idx < right_list.len() {
                         let right_record = &right_list[self.current_right_match_idx];
                         self.current_right_match_idx += 1;
 
                         let mut merged = left_record.clone();
                         for (key, value) in right_record.bindings() {
                             merged.bind(key.clone(), value.clone());
+                        }
+                        // A pair failing the join predicate is not a match.
+                        // Skipping it here rather than filtering above the join
+                        // is the whole point: the left row survives, with nulls,
+                        // if nothing else matches (#667).
+                        if let Some(pred) = &self.join_predicate {
+                            let holds = matches!(
+                                eval_expression(pred, &merged, store)?,
+                                Value::Property(PropertyValue::Boolean(true))
+                            );
+                            if !holds {
+                                continue;
+                            }
+                        }
+                        self.any_match_for_left = true;
+                        return Ok(Some(merged));
+                    }
+                    // Every candidate failed the predicate: this left row has no
+                    // match at all, so it gets the null treatment.
+                    if !self.any_match_for_left && !self.null_emitted {
+                        self.null_emitted = true;
+                        let mut merged = left_record.clone();
+                        for var in &self.right_only_vars {
+                            merged.bind(var.clone(), Value::Null);
                         }
                         return Ok(Some(merged));
                     }
@@ -5113,6 +7493,7 @@ impl PhysicalOperator for LeftOuterJoinOperator {
             self.current_left_idx += 1;
             self.current_right_match_idx = 0;
             self.null_emitted = false;
+            self.any_match_for_left = false;
         }
 
         Ok(None)
@@ -5133,6 +7514,30 @@ impl PhysicalOperator for LeftOuterJoinOperator {
         }
     }
 
+
+    // A clause pipeline can put writes on the left of a join: `CREATE (n:C)
+    // WITH n MATCH (a:A) RETURN a, n` plans the CREATE below this operator.
+    // Draining that side with the read-only `next` makes the write operators
+    // refuse — they cannot reach a mutable store — so the left input is drained
+    // once with `next_mut` and replaced by its own rows. Everything below has
+    // then already run, and the read-only path is correct for the rest.
+    fn next_mut(&mut self, store: &mut GraphStore, tenant_id: &str) -> ExecutionResult<Option<Record>> {
+        if !self.left_drained_mut {
+            let mut rows = Vec::new();
+            let mut count = 0u64;
+            while let Some(record) = self.left.next_mut(store, tenant_id)? {
+                rows.push(record);
+                count += 1;
+                if count % 10000 == 0 {
+                    check_deadline()?;
+                }
+            }
+            self.left = Box::new(MaterializedOperator::new(rows));
+            self.left_drained_mut = true;
+        }
+        self.next(store)
+    }
+
     fn reset(&mut self) {
         self.left.reset();
         self.right.reset();
@@ -5147,7 +7552,7 @@ impl PhysicalOperator for LeftOuterJoinOperator {
     fn describe(&self) -> OperatorDescription {
         OperatorDescription {
             name: "LeftOuterJoin".to_string(),
-            details: format!("on={}", self.join_var),
+            details: format!("on={}", self.join_vars.join(",")),
             children: vec![self.left.describe(), self.right.describe()],
         }
     }
@@ -5156,7 +7561,7 @@ impl PhysicalOperator for LeftOuterJoinOperator {
 /// Create node operator: CREATE (n:Person {name: "Alice"})
 pub struct CreateNodeOperator {
     /// Nodes to create (label, properties, variable)
-    nodes_to_create: Vec<(Vec<Label>, HashMap<String, PropertyValue>, Option<String>)>,
+    nodes_to_create: Vec<(Vec<Label>, HashMap<String, PropertyValue>, Option<String>, Option<HashMap<String, Expression>>)>,
     /// Created node IDs (for returning)
     created_nodes: Vec<(NodeId, Option<String>)>,
     /// Current index for iteration
@@ -5167,7 +7572,14 @@ pub struct CreateNodeOperator {
 
 impl CreateNodeOperator {
     /// Create a new CreateNodeOperator
-    pub fn new(nodes: Vec<(Vec<Label>, HashMap<String, PropertyValue>, Option<String>)>) -> Self {
+    pub fn new(
+        nodes: Vec<(
+            Vec<Label>,
+            HashMap<String, PropertyValue>,
+            Option<String>,
+            Option<HashMap<String, Expression>>,
+        )>,
+    ) -> Self {
         Self {
             nodes_to_create: nodes,
             created_nodes: Vec::new(),
@@ -5188,22 +7600,42 @@ impl PhysicalOperator for CreateNodeOperator {
     fn next_mut(&mut self, store: &mut GraphStore, tenant_id: &str) -> ExecutionResult<Option<Record>> {
         // First call: create all nodes
         if !self.executed {
-            for (labels, properties, variable) in &self.nodes_to_create {
-                // Use first label as primary, or empty string if none
-                let primary_label = labels.first()
-                    .map(|l| l.clone())
-                    .unwrap_or_else(|| Label::new(""));
+            for (labels, properties, variable, property_exprs) in &self.nodes_to_create {
+                // The whole label set at once, which for `CREATE ({...})` is
+                // empty. Passing a "primary" label meant an unlabelled node was
+                // created with `Label("")` (#625).
+                let node_id = store.create_node_with_labels(labels.iter().cloned());
 
-                let node_id = store.create_node(primary_label);
-
-                // Add additional labels
-                for label in labels.iter().skip(1) {
-                    let _ = store.add_label_to_node(tenant_id, node_id, label.clone());
+                // A CREATE with no input row has nothing bound, so a non-literal value can
+                // only be a constant (`{n: 1 + 2}`). Anything referring to a variable is an
+                // error rather than a silent null -- quietly storing nothing for a property
+                // is the failure this change exists to remove.
+                let mut evaluated: HashMap<String, PropertyValue> = HashMap::new();
+                if let Some(exprs) = property_exprs {
+                    let empty = Record::new();
+                    for (key, expr) in exprs {
+                        match eval_expression(expr, &empty, store) {
+                            Ok(Value::Property(p)) => {
+                                evaluated.insert(key.clone(), p);
+                            }
+                            _ => {
+                                let _ = store.delete_node(tenant_id, node_id);
+                                return Err(ExecutionError::RuntimeError(format!(
+                                    "CREATE property `{key}` refers to a variable that is not bound here; bind it first with MATCH, WITH or UNWIND"
+                                )));
+                            }
+                        }
+                    }
                 }
 
                 // Set properties using store.set_node_property to trigger indexing
-                for (key, value) in properties {
-                    let _ = store.set_node_property(tenant_id, node_id, key.clone(), value.clone());
+                for (key, value) in properties.iter().chain(evaluated.iter()) {
+                    if let Err(e) = store.set_node_property(tenant_id, node_id, key.clone(), value.clone())
+                    {
+                        // A rejected property must not leave a half-built node behind.
+                        let _ = store.delete_node(tenant_id, node_id);
+                        return Err(ExecutionError::GraphError(e.to_string()));
+                    }
                 }
 
                 self.created_nodes.push((node_id, variable.clone()));
@@ -5229,7 +7661,7 @@ impl PhysicalOperator for CreateNodeOperator {
             Some(var) => var.clone(),
             None => format!("__created_node_{}", self.current - 1),
         };
-        record.bind(bind_name, Value::Node(*node_id, node.clone()));
+        record.bind(bind_name, Value::Node(*node_id, Box::new(node.clone())));
 
         Ok(Some(record))
     }
@@ -5354,6 +7786,13 @@ impl PhysicalOperator for CreateVectorIndexOperator {
 
         store.create_vector_index(self.label.as_str(), &self.property_key, self.dimensions, metric)
             .map_err(|e| ExecutionError::GraphError(e.to_string()))?;
+
+        // Backfill nodes that already carry the embedding. Registering the index without
+        // populating it leaves every search returning nothing on a graph that was loaded
+        // before the index was declared — which is the normal order for a bulk import
+        // followed by DDL. `rebuild_vector_index` reads both the inline map and the
+        // columnar store, so it covers whichever tier the vectors landed in.
+        store.rebuild_vector_index();
 
         self.executed = true;
         
@@ -5562,6 +8001,80 @@ impl PhysicalOperator for DropIndexOperator {
             name: "DropIndex".to_string(),
             details: format!(":{}({})", self.label.as_str(), self.property),
             children: Vec::new(),
+        }
+    }
+}
+
+/// `RETURN DISTINCT` — deduplicate whole result rows.
+///
+/// Sits above the projection, so it sees exactly the columns the user asked for and
+/// deduplicates on the tuple of those values. Deduplicating anywhere lower would be wrong:
+/// two rows that differ only in a column that is not projected are the *same* row as far
+/// as `DISTINCT` is concerned.
+///
+/// Streaming rather than materializing: a row is emitted the first time its key is seen
+/// and dropped thereafter, so `DISTINCT ... LIMIT k` stops as soon as `k` distinct rows
+/// exist instead of building the whole result first.
+///
+/// Null is a value here. openCypher deduplicates `NULL` against `NULL` even though
+/// `NULL = NULL` is unknown in a predicate — `DISTINCT` uses equivalence, not equality —
+/// and [`Value`]'s `Eq`/`Hash` already implement that, along with comparing nodes and
+/// edges by identity so a materialized `Node` and a lazy `NodeRef` for the same node
+/// deduplicate against each other.
+pub struct DistinctOperator {
+    input: OperatorBox,
+    seen: HashSet<Vec<(std::sync::Arc<str>, Value)>>,
+}
+
+impl DistinctOperator {
+    /// Wrap `input`, emitting each distinct row once.
+    pub fn new(input: OperatorBox) -> Self {
+        Self {
+            input,
+            seen: HashSet::new(),
+        }
+    }
+
+    /// The deduplication key: every binding, ordered by column name so that two records
+    /// that bound the same columns in a different order still collide.
+    fn key(record: &Record) -> Vec<(std::sync::Arc<str>, Value)> {
+        record.dedup_key()
+    }
+}
+
+impl PhysicalOperator for DistinctOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.input]
+    }
+
+    fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
+        while let Some(record) = self.input.next(store)? {
+            if self.seen.insert(Self::key(&record)) {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
+    fn next_mut(&mut self, store: &mut GraphStore, tenant_id: &str) -> ExecutionResult<Option<Record>> {
+        while let Some(record) = self.input.next_mut(store, tenant_id)? {
+            if self.seen.insert(Self::key(&record)) {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
+    fn reset(&mut self) {
+        self.seen.clear();
+        self.input.reset();
+    }
+
+    fn describe(&self) -> OperatorDescription {
+        OperatorDescription {
+            name: "Distinct".to_string(),
+            details: String::new(),
+            children: vec![self.input.describe()],
         }
     }
 }
@@ -5869,6 +8382,10 @@ impl CreateEdgeOperator {
 }
 
 impl PhysicalOperator for CreateEdgeOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        self.input.iter_mut().collect()
+    }
+
     fn next(&mut self, _store: &GraphStore) -> ExecutionResult<Option<Record>> {
         Err(ExecutionError::RuntimeError(
             "CreateEdgeOperator requires mutable store access. Use next_mut instead.".to_string()
@@ -5925,7 +8442,7 @@ impl PhysicalOperator for CreateEdgeOperator {
             Some(var) => var.clone(),
             None => format!("__created_edge_{}", self.current - 1),
         };
-        record.bind(bind_name, Value::Edge(*edge_id, edge.clone()));
+        record.bind(bind_name, Value::Edge(*edge_id, Box::new(edge.clone())));
 
         Ok(Some(record))
     }
@@ -5950,8 +8467,14 @@ impl PhysicalOperator for CreateEdgeOperator {
 pub struct CreateNodesAndEdgesOperator {
     /// Node creation operator
     node_operator: OperatorBox,
-    /// Edges to create: (source_var, target_var, edge_type, properties, edge_var)
-    edges_to_create: Vec<(String, String, EdgeType, HashMap<String, PropertyValue>, Option<String>)>,
+    /// Edges to create: (source_var, target_var, edge_type, literal properties,
+    /// edge_var, property expressions).
+    ///
+    /// The expressions are the row-dependent half -- `{num: x}` from an UNWIND.
+    /// Without them `CREATE ()-[r:R {num: x}]->()` made the relationship and
+    /// left `r.num` null, which is a wrong answer rather than a missing one
+    /// (#649). The node side of this operator has carried them since #467.
+    edges_to_create: Vec<EdgeToCreate>,
     /// Variable to NodeId mapping (built during node creation)
     var_to_node_id: HashMap<String, NodeId>,
     /// Created edges
@@ -5968,7 +8491,7 @@ impl CreateNodesAndEdgesOperator {
     /// Create a new CreateNodesAndEdgesOperator
     pub fn new(
         node_operator: OperatorBox,
-        edges_to_create: Vec<(String, String, EdgeType, HashMap<String, PropertyValue>, Option<String>)>,
+        edges_to_create: Vec<EdgeToCreate>,
     ) -> Self {
         Self {
             node_operator,
@@ -5983,6 +8506,10 @@ impl CreateNodesAndEdgesOperator {
 }
 
 impl PhysicalOperator for CreateNodesAndEdgesOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.node_operator]
+    }
+
     fn next(&mut self, _store: &GraphStore) -> ExecutionResult<Option<Record>> {
         Err(ExecutionError::RuntimeError(
             "CreateNodesAndEdgesOperator requires mutable store access. Use next_mut instead.".to_string()
@@ -5996,8 +8523,8 @@ impl PhysicalOperator for CreateNodesAndEdgesOperator {
                 // Extract variable and node from record
                 for (var, value) in record.bindings().iter() {
                     if let Value::Node(node_id, node) = value {
-                        self.var_to_node_id.insert(var.clone(), *node_id);
-                        self.results.push((Some(var.clone()), Value::Node(*node_id, node.clone())));
+                        self.var_to_node_id.insert(var.to_string(), *node_id);
+                        self.results.push((Some(var.to_string()), Value::Node(*node_id, node.clone())));
                     }
                 }
             }
@@ -6006,7 +8533,9 @@ impl PhysicalOperator for CreateNodesAndEdgesOperator {
 
         // Phase 1: Create all edges
         if self.phase == 1 {
-            for (source_var, target_var, edge_type, properties, edge_var) in &self.edges_to_create {
+            for (source_var, target_var, edge_type, properties, edge_var, _exprs) in
+                &self.edges_to_create
+            {
                 let source_id = self.var_to_node_id.get(source_var)
                     .ok_or_else(|| ExecutionError::VariableNotFound(source_var.clone()))?;
                 let target_id = self.var_to_node_id.get(target_var)
@@ -6023,7 +8552,7 @@ impl PhysicalOperator for CreateNodesAndEdgesOperator {
                 // Always track created edges for persistence (even without variable names)
                 if let Some(edge) = store.get_edge(edge_id) {
                     let var_name = edge_var.clone().or_else(|| Some(format!("__created_edge_{}", self.created_edges.len())));
-                    self.results.push((var_name, Value::Edge(edge_id, edge.clone())));
+                    self.results.push((var_name, Value::Edge(edge_id, Box::new(edge.clone()))));
                     self.created_edges.push((edge_id, edge, edge_var.clone()));
                 }
             }
@@ -6067,11 +8596,33 @@ impl PhysicalOperator for CreateNodesAndEdgesOperator {
 /// Operator for MATCH...CREATE queries
 /// Example: `MATCH (a:Trial {id: 'NCT001'}), (b:Condition {mesh_id: 'D001'}) CREATE (a)-[:STUDIES]->(b)`
 /// This operator takes matched nodes and creates edges between them
+/// `(source_var, target_var, edge_type, literal properties, edge_var,
+/// property expressions)` for one relationship a CREATE has to build.
+pub type EdgeToCreate = (
+    String,
+    String,
+    EdgeType,
+    HashMap<String, PropertyValue>,
+    Option<String>,
+    Option<HashMap<String, Expression>>,
+);
+
 pub struct MatchCreateEdgeOperator {
     /// Input operator (MATCH results)
     input: OperatorBox,
-    /// Edges to create: (source_var, target_var, edge_type, properties, edge_var)
-    edges_to_create: Vec<(String, String, EdgeType, HashMap<String, PropertyValue>, Option<String>)>,
+    /// Nodes in the CREATE pattern that the MATCH did not bind, and must therefore be
+    /// created fresh for every matched row: (handle, labels, properties). Previously these
+    /// were ignored entirely, so `MATCH (p) CREATE (p)-[:R]->(c:C {..})` created neither
+    /// the node nor the edge and reported success.
+    nodes_to_create: Vec<(String, Vec<Label>, HashMap<String, PropertyValue>, Option<HashMap<String, Expression>>)>,
+    /// Edges to create: (source_var, target_var, edge_type, literal properties,
+    /// edge_var, property expressions).
+    ///
+    /// The expressions are the row-dependent half -- `{num: x}` from an UNWIND.
+    /// Without them `CREATE ()-[r:R {num: x}]->()` made the relationship and
+    /// left `r.num` null, which is a wrong answer rather than a missing one
+    /// (#649). The node side of this operator has carried them since #467.
+    edges_to_create: Vec<EdgeToCreate>,
     /// Whether edges have been created for current batch
     done: bool,
     /// Results to return
@@ -6084,10 +8635,22 @@ impl MatchCreateEdgeOperator {
     /// Create a new MatchCreateEdgeOperator
     pub fn new(
         input: OperatorBox,
-        edges_to_create: Vec<(String, String, EdgeType, HashMap<String, PropertyValue>, Option<String>)>,
+        edges_to_create: Vec<EdgeToCreate>,
+    ) -> Self {
+        Self::with_nodes(input, Vec::new(), edges_to_create)
+    }
+
+    /// As `new`, plus the CREATE-pattern nodes the MATCH did not bind. Those are created
+    /// once per matched row, then bound under their handle so the edge wiring below can
+    /// reference them exactly like a matched variable.
+    pub fn with_nodes(
+        input: OperatorBox,
+        nodes_to_create: Vec<(String, Vec<Label>, HashMap<String, PropertyValue>, Option<HashMap<String, Expression>>)>,
+        edges_to_create: Vec<EdgeToCreate>,
     ) -> Self {
         Self {
             input,
+            nodes_to_create,
             edges_to_create,
             done: false,
             results: Vec::new(),
@@ -6097,6 +8660,10 @@ impl MatchCreateEdgeOperator {
 }
 
 impl PhysicalOperator for MatchCreateEdgeOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.input]
+    }
+
     fn next(&mut self, _store: &GraphStore) -> ExecutionResult<Option<Record>> {
         Err(ExecutionError::RuntimeError(
             "MatchCreateEdgeOperator requires mutable store access. Use next_mut instead.".to_string()
@@ -6107,8 +8674,48 @@ impl PhysicalOperator for MatchCreateEdgeOperator {
         // First pass: process all matched records and create edges
         if !self.done {
             while let Some(record) = self.input.next_mut(store, tenant_id)? {
+                // CREATE runs once per matched row, so any pattern node the MATCH did not
+                // bind is a *new* node for this row. Bind it under its handle first; the
+                // edge wiring below then treats it exactly like a matched variable.
+                let mut record = record;
+                for (handle, labels, properties, property_exprs) in &self.nodes_to_create {
+                    let node_id = store.create_node_with_labels(labels.iter().cloned());
+                    // Non-literal property values (`{id: row.id}`) are evaluated against
+                    // this row, so each created node gets the value belonging to its own
+                    // match rather than a constant.
+                    let mut evaluated: HashMap<String, PropertyValue> = HashMap::new();
+                    if let Some(exprs) = property_exprs {
+                        for (key, expr) in exprs {
+                            let value = eval_expression(expr, &record, store)?;
+                            let pv = match value {
+                                Value::Property(p) => p,
+                                Value::Null => PropertyValue::Null,
+                                other => {
+                                    return Err(ExecutionError::TypeError(format!(
+                                        "property `{key}` must be a scalar, got {other:?}"
+                                    )))
+                                }
+                            };
+                            evaluated.insert(key.clone(), pv);
+                        }
+                    }
+                    for (key, value) in properties.iter().chain(evaluated.iter()) {
+                        if let Err(e) = store.set_node_property(tenant_id, node_id, key.clone(), value.clone())
+                        {
+                            // A rejected property must not leave a half-built node behind.
+                            let _ = store.delete_node(tenant_id, node_id);
+                            return Err(ExecutionError::GraphError(e.to_string()));
+                        }
+                    }
+                    if let Some(node) = store.get_node(node_id) {
+                        record.bind(handle.clone(), Value::Node(node_id, Box::new(node.clone())));
+                    }
+                }
+
                 // For each matched record, create the specified edges
-                for (source_var, target_var, edge_type, properties, _edge_var) in &self.edges_to_create {
+                for (source_var, target_var, edge_type, properties, edge_var, property_exprs) in
+                    &self.edges_to_create
+                {
                     // Get source node ID from record bindings
                     let source_id = match record.get(source_var).and_then(|v| v.node_id()) {
                         Some(id) => id,
@@ -6129,13 +8736,57 @@ impl PhysicalOperator for MatchCreateEdgeOperator {
                     for (key, value) in properties {
                         store.set_edge_property_sparse(edge_id, key.clone(), value.clone());
                     }
+                    // Property values that are expressions rather than
+                    // literals -- crucially including the loop variable. These
+                    // live in `property_exprs`, and not evaluating them made
+                    // `CREATE ()-[r:R {num: x}]->()` build the right number of
+                    // relationships with none of the data (#649), the same
+                    // defect the node side had in #467.
+                    if let Some(exprs) = property_exprs {
+                        for (key, expr) in exprs {
+                            if let Value::Property(pv) = eval_expression(expr, &record, store)? {
+                                store.set_edge_property_sparse(edge_id, key.clone(), pv);
+                            }
+                        }
+                    }
+
+                    // Property values that are expressions rather than
+                    // literals -- crucially including the loop variable. These
+                    // live in `property_exprs`, and not evaluating them made
+                    // `CREATE ()-[r:R {num: x}]->()` build the right number of
+                    // relationships with none of the data (#649), the same
+                    // defect the node side had in #467.
+                    if let Some(exprs) = property_exprs {
+                        for (key, expr) in exprs {
+                            if let Value::Property(pv) = eval_expression(expr, &record, store)? {
+                                store.set_edge_property_sparse(edge_id, key.clone(), pv);
+                            }
+                        }
+                    }
 
                     // Build result record with the created edge
                     let mut result_record = record.clone();
                     if let Some(edge) = store.get_edge(edge_id) {
-                        result_record.bind("_edge".to_string(), Value::Edge(edge_id, edge));
+                        let value = Value::Edge(edge_id, Box::new(edge));
+                        // Under the pattern's own name as well as the internal
+                        // one. Binding only `_edge` meant
+                        // `CREATE ()-[r:R {num: x}]->() RETURN r.num` could not
+                        // find `r`: the edge existed, with the right
+                        // properties, under a name the query never wrote
+                        // (#649).
+                        if let Some(var) = edge_var {
+                            result_record.bind(var.clone(), value.clone());
+                        }
+                        result_record.bind("_edge".to_string(), value);
                     }
                     self.results.push(result_record);
+                }
+
+                // A CREATE that only adds nodes (no relationship segment) still produced a
+                // row for this match; without this the row -- and any RETURN over it --
+                // would vanish.
+                if self.edges_to_create.is_empty() {
+                    self.results.push(record);
                 }
             }
             self.done = true;
@@ -6188,6 +8839,10 @@ impl MatchMergeEdgeOperator {
 }
 
 impl PhysicalOperator for MatchMergeEdgeOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.input]
+    }
+
     fn next(&mut self, _store: &GraphStore) -> ExecutionResult<Option<Record>> {
         Err(ExecutionError::RuntimeError("MatchMergeEdgeOperator requires mutable store access".to_string()))
     }
@@ -6222,7 +8877,7 @@ impl PhysicalOperator for MatchMergeEdgeOperator {
                         }
                         if let Some(ref ev) = edge_var {
                             if let Some(edge) = store.get_edge(edge_id) {
-                                result_record.bind(ev.clone(), Value::Edge(edge_id, edge.clone()));
+                                result_record.bind(ev.clone(), Value::Edge(edge_id, Box::new(edge.clone())));
                             }
                         }
                     } else {
@@ -6245,7 +8900,7 @@ impl PhysicalOperator for MatchMergeEdgeOperator {
 
                         if let Some(ref ev) = edge_var {
                             if let Some(edge) = store.get_edge(edge_id) {
-                                result_record.bind(ev.clone(), Value::Edge(edge_id, edge.clone()));
+                                result_record.bind(ev.clone(), Value::Edge(edge_id, Box::new(edge.clone())));
                             }
                         }
                     }
@@ -6299,6 +8954,44 @@ impl PhysicalOperator for SingleRowOperator {
     }
 }
 
+/// Emits a fixed, already-computed set of records.
+///
+/// Used as the source when a `CALL {}` subquery has been executed and its
+/// results become the input stream for the enclosing query.
+pub struct MaterializedOperator {
+    records: Vec<Record>,
+    idx: usize,
+}
+
+impl MaterializedOperator {
+    /// Create an operator that replays `records` in order.
+    pub fn new(records: Vec<Record>) -> Self {
+        Self { records, idx: 0 }
+    }
+}
+
+impl PhysicalOperator for MaterializedOperator {
+    fn next(&mut self, _store: &GraphStore) -> ExecutionResult<Option<Record>> {
+        if self.idx >= self.records.len() {
+            Ok(None)
+        } else {
+            let r = self.records[self.idx].clone();
+            self.idx += 1;
+            Ok(Some(r))
+        }
+    }
+
+    fn reset(&mut self) { self.idx = 0; }
+
+    fn describe(&self) -> OperatorDescription {
+        OperatorDescription {
+            name: "Materialized".to_string(),
+            details: format!("{} rows", self.records.len()),
+            children: Vec::new(),
+        }
+    }
+}
+
 /// Algorithm operator: CALL algo.pageRank(...)
 pub struct AlgorithmOperator {
     /// Procedure name
@@ -6314,6 +9007,35 @@ pub struct AlgorithmOperator {
 }
 
 impl AlgorithmOperator {
+    /// Every algorithm this operator dispatches, with its calling convention.
+    ///
+    /// `Unknown algorithm: algo.bfs` gave the caller nothing to go on -- the
+    /// name they wanted (`algo.shortestPath`) is not guessable from it, and
+    /// the procedures do not share an argument shape either, so even the right
+    /// name fails on the first attempt. Listing both removes two rounds of
+    /// trial and error.
+    fn available() -> &'static str {
+        "pageRank({config}), shortestPath(source, target), weightedPath(source, target, weightProperty), \
+maxFlow(source, sink [, capacityProperty]), mst([weightProperty]), cdlp([label, edgeType, config]), \
+lcc([label, edgeType]), wcc(), scc(), triangleCount(), or.solve({config})"
+    }
+
+    /// Error for a procedure name that does not dispatch, naming what does.
+    fn unknown_algorithm(name: &str) -> ExecutionError {
+        let hint = match name.to_lowercase().replace("algo.", "").as_str() {
+            "bfs" | "breadthfirstsearch" => " -- for an unweighted path, use algo.shortestPath",
+            "dijkstra" | "shortestpathweighted" => " -- for a weighted path, use algo.weightedPath",
+            "pagerank2" | "prank" => " -- did you mean algo.pageRank?",
+            "louvain" | "labelpropagation" => " -- for community detection, use algo.cdlp",
+            "connectedcomponents" | "components" => " -- use algo.wcc or algo.scc",
+            _ => "",
+        };
+        ExecutionError::RuntimeError(format!(
+            "Unknown algorithm: {name}{hint}. Available: {}",
+            Self::available()
+        ))
+    }
+
     pub fn new(name: String, args: Vec<crate::query::ast::Expression>) -> Self {
         Self {
             name,
@@ -6362,7 +9084,7 @@ impl AlgorithmOperator {
             let node_id = NodeId::new(algo_id);
             let mut record = Record::new();
             if let Some(node) = store.get_node(node_id) {
-                record.bind("node".to_string(), Value::Node(node_id, node.clone()));
+                record.bind("node".to_string(), Value::Node(node_id, Box::new(node.clone())));
                 record.bind("score".to_string(), Value::Property(PropertyValue::Float(score)));
                 self.results.push(record);
             }
@@ -6456,7 +9178,7 @@ impl AlgorithmOperator {
             let nid = NodeId::new(node_id);
             let mut record = Record::new();
             if let Some(node) = store.get_node(nid) {
-                record.bind("node".to_string(), Value::Node(nid, node.clone()));
+                record.bind("node".to_string(), Value::Node(nid, Box::new(node.clone())));
                 record.bind("componentId".to_string(), Value::Property(PropertyValue::Integer(component_id as i64)));
                 self.results.push(record);
             }
@@ -6507,7 +9229,7 @@ impl AlgorithmOperator {
             let nid = NodeId::new(node_id);
             let mut record = Record::new();
             if let Some(node) = store.get_node(nid) {
-                record.bind("node".to_string(), Value::Node(nid, node.clone()));
+                record.bind("node".to_string(), Value::Node(nid, Box::new(node.clone())));
                 record.bind(
                     "communityId".to_string(),
                     Value::Property(PropertyValue::Integer(community_id as i64)),
@@ -6553,7 +9275,7 @@ impl AlgorithmOperator {
             let nid = NodeId::new(node_id);
             let mut record = Record::new();
             if let Some(node) = store.get_node(nid) {
-                record.bind("node".to_string(), Value::Node(nid, node.clone()));
+                record.bind("node".to_string(), Value::Node(nid, Box::new(node.clone())));
                 record.bind(
                     "coefficient".to_string(),
                     Value::Property(PropertyValue::Float(coeff)),
@@ -6834,10 +9556,10 @@ impl AlgorithmOperator {
             
             let mut record = Record::new();
             if let Some(node_u) = store.get_node(u) {
-                record.bind("source".to_string(), Value::Node(u, node_u.clone()));
+                record.bind("source".to_string(), Value::Node(u, Box::new(node_u.clone())));
             }
             if let Some(node_v) = store.get_node(v) {
-                record.bind("target".to_string(), Value::Node(v, node_v.clone()));
+                record.bind("target".to_string(), Value::Node(v, Box::new(node_v.clone())));
             }
             record.bind("weight".to_string(), Value::Property(PropertyValue::Float(w)));
             self.results.push(record);
@@ -6868,7 +9590,7 @@ impl AlgorithmOperator {
             let nid = NodeId::new(node_id);
             let mut record = Record::new();
             if let Some(node) = store.get_node(nid) {
-                record.bind("node".to_string(), Value::Node(nid, node.clone()));
+                record.bind("node".to_string(), Value::Node(nid, Box::new(node.clone())));
                 record.bind("componentId".to_string(), Value::Property(PropertyValue::Integer(component_id as i64)));
                 self.results.push(record);
             }
@@ -6885,22 +9607,58 @@ impl AlgorithmOperator {
     }
 }
 
+impl AlgorithmOperator {
+    /// Canonical form of a procedure name for algorithm dispatch.
+    ///
+    /// Dispatch matched `"algo.pageRank"` exactly, so `algo.pagerank` -- the spelling
+    /// anyone would try first -- reported "Unknown algorithm" while the algorithm was
+    /// there all along (#198). The namespace is optional and the name is matched
+    /// case-insensitively, so `pagerank`, `algo.pagerank`, `algo.pageRank` and
+    /// `samyama.pageRank` all reach the same implementation.
+    pub fn canonical_name(name: &str) -> String {
+        let bare = name
+            .strip_prefix("algo.")
+            .or_else(|| name.strip_prefix("samyama."))
+            .or_else(|| name.strip_prefix("gds."))
+            .unwrap_or(name);
+        bare.to_ascii_lowercase()
+    }
+
+    /// Is this a name the algorithm operator can run?
+    pub fn is_algorithm(name: &str) -> bool {
+        matches!(
+            Self::canonical_name(name).as_str(),
+            "pagerank"
+                | "shortestpath"
+                | "wcc"
+                | "scc"
+                | "weightedpath"
+                | "maxflow"
+                | "mst"
+                | "trianglecount"
+                | "cdlp"
+                | "lcc"
+                | "or.solve"
+        )
+    }
+}
+
 impl PhysicalOperator for AlgorithmOperator {
     fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
         if !self.executed {
-            match self.name.as_str() {
-                "algo.pageRank" => self.execute_pagerank(store)?,
-                "algo.shortestPath" => self.execute_shortest_path(store)?,
-                "algo.wcc" => self.execute_wcc(store)?,
-                "algo.scc" => self.execute_scc(store)?,
-                "algo.weightedPath" => self.execute_weighted_path(store)?,
-                "algo.maxFlow" => self.execute_max_flow(store)?,
-                "algo.mst" => self.execute_mst(store)?,
-                "algo.triangleCount" => self.execute_triangle_count(store)?,
-                "algo.cdlp" => self.execute_cdlp(store)?,
-                "algo.lcc" => self.execute_lcc(store)?,
-                "algo.or.solve" => return Err(ExecutionError::RuntimeError("algo.or.solve requires write access (MutQueryExecutor)".to_string())),
-                _ => return Err(ExecutionError::RuntimeError(format!("Unknown algorithm: {}", self.name))),
+            match Self::canonical_name(&self.name).as_str() {
+                "pagerank" => self.execute_pagerank(store)?,
+                "shortestpath" => self.execute_shortest_path(store)?,
+                "wcc" => self.execute_wcc(store)?,
+                "scc" => self.execute_scc(store)?,
+                "weightedpath" => self.execute_weighted_path(store)?,
+                "maxflow" => self.execute_max_flow(store)?,
+                "mst" => self.execute_mst(store)?,
+                "trianglecount" => self.execute_triangle_count(store)?,
+                "cdlp" => self.execute_cdlp(store)?,
+                "lcc" => self.execute_lcc(store)?,
+                "or.solve" => return Err(ExecutionError::RuntimeError("algo.or.solve requires write access (MutQueryExecutor)".to_string())),
+                _ => return Err(Self::unknown_algorithm(&self.name)),
             }
             self.executed = true;
         }
@@ -6916,22 +9674,22 @@ impl PhysicalOperator for AlgorithmOperator {
 
     fn next_mut(&mut self, store: &mut GraphStore, tenant_id: &str) -> ExecutionResult<Option<Record>> {
          if !self.executed {
-            match self.name.as_str() {
-                "algo.or.solve" => self.execute_or_solve(store, tenant_id)?,
+            match Self::canonical_name(&self.name).as_str() {
+                "or.solve" => self.execute_or_solve(store, tenant_id)?,
                 // For read-only algos, we can just call the immutable implementations
                 // But we need to borrow store immutably.
                 // Since we have &mut store, we can reborrow as &store
-                "algo.pageRank" => self.execute_pagerank(store)?,
-                "algo.shortestPath" => self.execute_shortest_path(store)?,
-                "algo.wcc" => self.execute_wcc(store)?,
-                "algo.scc" => self.execute_scc(store)?,
-                "algo.weightedPath" => self.execute_weighted_path(store)?,
-                "algo.maxFlow" => self.execute_max_flow(store)?,
-                "algo.mst" => self.execute_mst(store)?,
-                "algo.triangleCount" => self.execute_triangle_count(store)?,
-                "algo.cdlp" => self.execute_cdlp(store)?,
-                "algo.lcc" => self.execute_lcc(store)?,
-                _ => return Err(ExecutionError::RuntimeError(format!("Unknown algorithm: {}", self.name))),
+                "pagerank" => self.execute_pagerank(store)?,
+                "shortestpath" => self.execute_shortest_path(store)?,
+                "wcc" => self.execute_wcc(store)?,
+                "scc" => self.execute_scc(store)?,
+                "weightedpath" => self.execute_weighted_path(store)?,
+                "maxflow" => self.execute_max_flow(store)?,
+                "mst" => self.execute_mst(store)?,
+                "trianglecount" => self.execute_triangle_count(store)?,
+                "cdlp" => self.execute_cdlp(store)?,
+                "lcc" => self.execute_lcc(store)?,
+                _ => return Err(Self::unknown_algorithm(&self.name)),
             }
             self.executed = true;
         }
@@ -6970,6 +9728,23 @@ impl SkipOperator {
 }
 
 impl PhysicalOperator for SkipOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.input]
+    }
+
+    /// Widen the hint by this operator's own skip before passing it on.
+    ///
+    /// If something above needs `n` rows and this operator discards the first
+    /// `k`, the subtree has to produce `n + k`. Forwarding `n` unchanged would
+    /// make a bounded sort below keep too few rows and silently lose the tail
+    /// of the page (#518).
+    ///
+    /// Before this, `SkipOperator` used the default and blocked the hint
+    /// entirely, so nothing below a SKIP ever terminated early.
+    fn try_push_limit(&mut self, n: usize) -> bool {
+        self.input.try_push_limit(n.saturating_add(self.skip))
+    }
+
     fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
         while self.skipped < self.skip {
             if self.input.next(store)?.is_some() {
@@ -6981,28 +9756,53 @@ impl PhysicalOperator for SkipOperator {
         self.input.next(store)
     }
 
-    fn next_batch(&mut self, store: &GraphStore, batch_size: usize) -> ExecutionResult<Option<RecordBatch>> {
+    // See `LimitOperator::next_mut`: skipping a row still has to *produce* it,
+    // and producing it may be a write (#649).
+    fn next_mut(&mut self, store: &mut GraphStore, tenant_id: &str) -> ExecutionResult<Option<Record>> {
         while self.skipped < self.skip {
-            if let Some(batch) = self.input.next_batch(store, batch_size)? {
-                for record in batch.records {
-                    self.skipped += 1;
-                    if self.skipped >= self.skip {
-                        // We may have extra records in this batch — collect remaining
-                        let mut remaining = vec![record];
-                        // Continue pulling from current batch not possible since we consumed it,
-                        // but we've finished skipping
-                        break;
-                    }
-                }
-                if self.skipped >= self.skip {
-                    // Start fresh from next batch
-                    break;
-                }
+            if self.input.next_mut(store, tenant_id)?.is_some() {
+                self.skipped += 1;
             } else {
                 return Ok(None);
             }
         }
-        self.input.next_batch(store, batch_size)
+        self.input.next_mut(store, tenant_id)
+    }
+
+    fn next_batch(&mut self, store: &GraphStore, batch_size: usize) -> ExecutionResult<Option<RecordBatch>> {
+        // Return the *remainder* of the batch the skip lands in.
+        //
+        // The previous version consumed a whole batch to count off `skip`
+        // records and then discarded it, rows past the boundary included,
+        // before asking the input for another batch it had already exhausted.
+        // `execute_plan` pulls 1024 rows at a time, so any result of 1024 rows
+        // or fewer arrives in one batch and `SKIP n` returned nothing at all
+        // (#523).
+        //
+        // `SKIP … LIMIT` hid it: `LimitOperator` requests exactly as many rows
+        // as remain under its limit, so with `SKIP 2 LIMIT 2` the skip
+        // consumed a 2-row batch and the next request returned the right two.
+        // The boundary aligning with the batch size is not a partial fix.
+        loop {
+            let Some(batch) = self.input.next_batch(store, batch_size)? else {
+                return Ok(None);
+            };
+
+            let available = batch.records.len();
+            if self.skipped + available <= self.skip {
+                // The whole batch falls inside the skip.
+                self.skipped += available;
+                continue;
+            }
+
+            let drop = self.skip - self.skipped;
+            self.skipped += drop;
+            let records: Vec<Record> = batch.records.into_iter().skip(drop).collect();
+            if records.is_empty() {
+                continue;
+            }
+            return Ok(Some(RecordBatch { records, columns: batch.columns }));
+        }
     }
 
     fn reset(&mut self) {
@@ -7033,6 +9833,10 @@ impl DeleteOperator {
 }
 
 impl PhysicalOperator for DeleteOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.input]
+    }
+
     fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
         self.input.next(store)
     }
@@ -7090,15 +9894,53 @@ impl PhysicalOperator for DeleteOperator {
 pub struct SetPropertyOperator {
     input: OperatorBox,
     items: Vec<(String, String, Expression)>, // (variable, property, value_expr)
+    /// Whole-entity assignments: `(variable, merge, value)`. `merge` is `+=`.
+    entity_items: Vec<(String, bool, Expression)>,
 }
 
 impl SetPropertyOperator {
     pub fn new(input: OperatorBox, items: Vec<(String, String, Expression)>) -> Self {
-        Self { input, items }
+        Self { input, items, entity_items: Vec::new() }
+    }
+
+    /// With whole-entity assignments (`SET n = {…}`, `SET n += {…}`).
+    pub fn with_entity_items(
+        input: OperatorBox,
+        items: Vec<(String, String, Expression)>,
+        entity_items: Vec<(String, bool, Expression)>,
+    ) -> Self {
+        Self { input, items, entity_items }
+    }
+
+    /// The properties a right-hand side contributes.
+    ///
+    /// A map contributes its entries; a node or relationship contributes its
+    /// own properties, which is what makes `SET a = b` a copy. Anything else
+    /// is a type error rather than a silent no-op — assigning a scalar to an
+    /// entity has no sensible meaning and guessing one would hide the mistake.
+    fn source_properties(
+        value: &Value,
+        store: &GraphStore,
+    ) -> ExecutionResult<HashMap<String, PropertyValue>> {
+        match value {
+            Value::Property(PropertyValue::Map(m)) => Ok(m.clone().into_iter().collect()),
+            Value::Node(id, _) | Value::NodeRef(id) => {
+                Ok(store.node_properties_full(*id).into_iter().collect())
+            }
+            Value::Edge(_, e) => Ok(e.properties.clone().into_iter().collect()),
+            Value::Property(PropertyValue::Null) => Ok(HashMap::new()),
+            other => Err(ExecutionError::TypeError(format!(
+                "SET <entity> = expects a map or another entity, got {other:?}"
+            ))),
+        }
     }
 }
 
 impl PhysicalOperator for SetPropertyOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.input]
+    }
+
     fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
         self.input.next(store)
     }
@@ -7111,6 +9953,43 @@ impl PhysicalOperator for SetPropertyOperator {
                     Ok(v) => match v {
                         Value::Property(pv) => pv,
                         Value::Null => PropertyValue::Null,
+                        // Degrades to ids, as the node and edge arms below do:
+                        // a `PropertyValue` cannot hold an entity.
+                        Value::Map(entries) => PropertyValue::Map(
+                            entries
+                                .iter()
+                                .map(|(k, v)| {
+                                    (
+                                        k.clone(),
+                                        match v {
+                                            Value::Property(p) => p.clone(),
+                                            Value::NodeRef(id) | Value::Node(id, _) => {
+                                                PropertyValue::Integer(id.as_u64() as i64)
+                                            }
+                                            Value::EdgeRef(id, ..) | Value::Edge(id, _) => {
+                                                PropertyValue::Integer(id.as_u64() as i64)
+                                            }
+                                            _ => PropertyValue::Null,
+                                        },
+                                    )
+                                })
+                                .collect(),
+                        ),
+                        Value::List(items) => PropertyValue::Array(
+                            items
+                                .iter()
+                                .map(|i| match i {
+                                    Value::Property(p) => p.clone(),
+                                    Value::NodeRef(id) | Value::Node(id, _) => {
+                                        PropertyValue::Integer(id.as_u64() as i64)
+                                    }
+                                    Value::EdgeRef(id, ..) | Value::Edge(id, _) => {
+                                        PropertyValue::Integer(id.as_u64() as i64)
+                                    }
+                                    _ => PropertyValue::Null,
+                                })
+                                .collect(),
+                        ),
                         Value::NodeRef(id) => PropertyValue::Integer(id.as_u64() as i64),
                         Value::Node(id, _) => PropertyValue::Integer(id.as_u64() as i64),
                         Value::EdgeRef(id, ..) => PropertyValue::Integer(id.as_u64() as i64),
@@ -7128,13 +10007,146 @@ impl PhysicalOperator for SetPropertyOperator {
                 if let Some(node_val) = record.get(var) {
                     match node_val {
                         Value::NodeRef(id) | Value::Node(id, _) => {
-                            let _ = store.set_node_property(tenant_id, *id, prop.clone(), val.clone());
+                            store.set_node_property(tenant_id, *id, prop.clone(), val.clone())
+                                .map_err(|e| ExecutionError::GraphError(e.to_string()))?;
                         }
                         Value::EdgeRef(id, ..) | Value::Edge(id, _) => {
                             let _ = store.set_edge_property(*id, prop.clone(), val.clone());
                         }
                         _ => {}
                     }
+                }
+            }
+
+            // Whole-entity assignment. Evaluated after the per-property items
+            // so that `SET n.a = 1, n = {b: 2}` behaves as written rather than
+            // as ordered by implementation detail.
+            for (var, merge, expr) in &self.entity_items {
+                let Some(target) = record.get(var).cloned() else { continue };
+                let value = eval_expression(expr, &record, store)?;
+                let incoming = Self::source_properties(&value, store)?;
+
+                match target {
+                    Value::NodeRef(id) | Value::Node(id, _) => {
+                        if !merge {
+                            // `=` replaces: every property not in the incoming
+                            // map goes away. Removing them first, then writing,
+                            // keeps the two spellings from differing only in
+                            // leftovers.
+                            for key in store.node_properties_full(id).keys().cloned().collect::<Vec<_>>() {
+                                if !incoming.contains_key(&key) {
+                                    let _ = store.remove_node_property(id, &key);
+                                }
+                            }
+                        }
+                        for (k, v) in incoming {
+                            store
+                                .set_node_property(tenant_id, id, k, v)
+                                .map_err(|e| ExecutionError::GraphError(e.to_string()))?;
+                        }
+                    }
+                    Value::EdgeRef(id, ..) | Value::Edge(id, _) => {
+                        if !merge {
+                            let existing: Vec<String> = store
+                                .get_edge(id)
+                                .map(|e| e.properties.keys().cloned().collect())
+                                .unwrap_or_default();
+                            for key in existing {
+                                if !incoming.contains_key(&key) {
+                                    let _ = store.remove_edge_property(id, &key);
+                                }
+                            }
+                        }
+                        for (k, v) in incoming {
+                            let _ = store.set_edge_property(id, k, v);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            Ok(Some(record))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn next_batch(&mut self, store: &GraphStore, batch_size: usize) -> ExecutionResult<Option<RecordBatch>> {
+        self.input.next_batch(store, batch_size)
+    }
+
+    fn reset(&mut self) {
+        self.input.reset();
+    }
+
+    fn describe(&self) -> OperatorDescription {
+        let mut sets: Vec<String> = self.items.iter().map(|(v, p, e)| format!("{}.{} = {}", v, p, format_expression(e))).collect();
+        sets.extend(self.entity_items.iter().map(|(v, merge, e)| {
+            format!("{} {} {}", v, if *merge { "+=" } else { "=" }, format_expression(e))
+        }));
+        OperatorDescription {
+            name: "SetProperty".to_string(),
+            details: sets.join(", "),
+            children: vec![self.input.describe()],
+        }
+    }
+
+    fn is_mutating(&self) -> bool { true }
+}
+
+/// Remove property operator: REMOVE n.name
+/// Adds and removes labels on the nodes flowing through it.
+///
+/// One operator for both directions because they share everything but the
+/// call: each must go through `GraphStore`, which maintains `label_index`.
+/// A label added to the node but not to the index is invisible to
+/// `MATCH (n:Label)` and to expansion filtering (#592) -- that is, invisible
+/// to exactly the queries that look for it.
+///
+/// Before this existed the planner matched only `RemoveItem::Property` and
+/// **dropped** `RemoveItem::Label` while still reporting the statement as a
+/// successful write, so `REMOVE n:Label` was a silent no-op (#596).
+pub struct LabelMutationOperator {
+    input: OperatorBox,
+    /// `(variable, label)` pairs to add.
+    add: Vec<(String, Label)>,
+    /// `(variable, label)` pairs to remove.
+    remove: Vec<(String, Label)>,
+}
+
+impl LabelMutationOperator {
+    pub fn new(input: OperatorBox, add: Vec<(String, Label)>, remove: Vec<(String, Label)>) -> Self {
+        Self { input, add, remove }
+    }
+}
+
+impl PhysicalOperator for LabelMutationOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.input]
+    }
+
+    fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
+        self.input.next(store)
+    }
+
+    fn next_mut(&mut self, store: &mut GraphStore, tenant_id: &str) -> ExecutionResult<Option<Record>> {
+        if let Some(record) = self.input.next_mut(store, tenant_id)? {
+            for (var, label) in &self.add {
+                if let Some(Value::NodeRef(id)) | Some(Value::Node(id, _)) = record.get(var) {
+                    let id = *id;
+                    store
+                        .add_label_to_node(tenant_id, id, label.clone())
+                        .map_err(|e| ExecutionError::RuntimeError(e.to_string()))?;
+                }
+            }
+            for (var, label) in &self.remove {
+                if let Some(Value::NodeRef(id)) | Some(Value::Node(id, _)) = record.get(var) {
+                    let id = *id;
+                    // A label the node does not carry is a no-op, which is
+                    // Cypher's answer and not an error.
+                    store
+                        .remove_label_from_node(id, label)
+                        .map_err(|e| ExecutionError::RuntimeError(e.to_string()))?;
                 }
             }
             Ok(Some(record))
@@ -7152,18 +10164,20 @@ impl PhysicalOperator for SetPropertyOperator {
     }
 
     fn describe(&self) -> OperatorDescription {
-        let sets: Vec<String> = self.items.iter().map(|(v, p, e)| format!("{}.{} = {}", v, p, format_expression(e))).collect();
+        let mut parts: Vec<String> = self
+            .add
+            .iter()
+            .map(|(v, l)| format!("+{}:{}", v, l.as_str()))
+            .collect();
+        parts.extend(self.remove.iter().map(|(v, l)| format!("-{}:{}", v, l.as_str())));
         OperatorDescription {
-            name: "SetProperty".to_string(),
-            details: sets.join(", "),
+            name: "LabelMutation".to_string(),
+            details: parts.join(", "),
             children: vec![self.input.describe()],
         }
     }
-
-    fn is_mutating(&self) -> bool { true }
 }
 
-/// Remove property operator: REMOVE n.name
 pub struct RemovePropertyOperator {
     input: OperatorBox,
     items: Vec<(String, String)>, // (variable, property)
@@ -7176,6 +10190,10 @@ impl RemovePropertyOperator {
 }
 
 impl PhysicalOperator for RemovePropertyOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.input]
+    }
+
     fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
         self.input.next(store)
     }
@@ -7184,16 +10202,19 @@ impl PhysicalOperator for RemovePropertyOperator {
         if let Some(record) = self.input.next_mut(store, tenant_id)? {
             for (var, prop) in &self.items {
                 if let Some(node_val) = record.get(var) {
+                    // Through the store, so *both* the column and the row are
+                    // cleared. Removing from the row alone left the value
+                    // readable, because `resolve_property` reads the column
+                    // first -- so REMOVE reported success and did nothing
+                    // (#594).
                     match node_val {
                         Value::NodeRef(id) | Value::Node(id, _) => {
-                            if let Some(node) = store.get_node_mut(*id) {
-                                node.remove_property(prop);
-                            }
+                            let id = *id;
+                            store.remove_node_property(id, prop);
                         }
                         Value::EdgeRef(id, ..) | Value::Edge(id, _) => {
-                            if let Some(props) = store.get_edge_properties_mut(*id) {
-                                props.remove(prop);
-                            }
+                            let id = *id;
+                            store.remove_edge_property(id, prop);
                         }
                         _ => {}
                     }
@@ -7241,6 +10262,10 @@ impl UnwindOperator {
 }
 
 impl PhysicalOperator for UnwindOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.input]
+    }
+
     fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
         loop {
             if self.buffer_idx < self.buffer.len() {
@@ -7256,6 +10281,20 @@ impl PhysicalOperator for UnwindOperator {
 
             let list_val = eval_expression(&self.expression, &record, store)?;
 
+            // A `Value::List` is what a collection literal containing
+            // expressions evaluates to (#654). Without this arm `UNWIND
+            // [date({...})] AS d` iterated nothing and returned no rows --
+            // success, with the loop body never running.
+            if let Value::List(values) = list_val {
+                self.buffer.clear();
+                self.buffer_idx = 0;
+                for value in values {
+                    let mut new_record = record.clone();
+                    new_record.bind(self.variable.clone(), value);
+                    self.buffer.push(new_record);
+                }
+                continue;
+            }
             let items = match list_val {
                 Value::Property(PropertyValue::Array(arr)) => arr,
                 Value::Property(PropertyValue::Vector(vec)) => {
@@ -7302,9 +10341,20 @@ impl PhysicalOperator for UnwindOperator {
 
 /// MERGE operator - upsert: match or create pattern
 pub struct MergeOperator {
+    /// Upstream rows, when this MERGE runs inside a clause pipeline.
+    ///
+    /// `None` is the established shape — a leaf that runs once. With an input
+    /// the clause runs **per incoming row**, which is what
+    /// `UNWIND [...] AS x MERGE (:N {v: x})` means, and it must keep the row's
+    /// existing bindings so `... WITH a MERGE (a)-[:R]->(b)` can see `a`.
+    input: Option<OperatorBox>,
     pattern: Pattern,
     on_create_set: Vec<(String, String, Expression)>,
     on_match_set: Vec<(String, String, Expression)>,
+    /// `(variable, labels)` from `ON CREATE SET n:Label`.
+    on_create_labels: Vec<(String, Vec<Label>)>,
+    /// `(variable, labels)` from `ON MATCH SET n:Label`.
+    on_match_labels: Vec<(String, Vec<Label>)>,
     executed: bool,
 }
 
@@ -7313,8 +10363,297 @@ impl MergeOperator {
         pattern: Pattern,
         on_create_set: Vec<(String, String, Expression)>,
         on_match_set: Vec<(String, String, Expression)>,
+        on_create_labels: Vec<(String, Vec<Label>)>,
+        on_match_labels: Vec<(String, Vec<Label>)>,
     ) -> Self {
-        Self { pattern, on_create_set, on_match_set, executed: false }
+        Self {
+            input: None,
+            pattern,
+            on_create_set,
+            on_match_set,
+            on_create_labels,
+            on_match_labels,
+            executed: false,
+        }
+    }
+
+    /// Run this MERGE once per row of `input`, extending each row.
+    pub fn with_input(mut self, input: OperatorBox) -> Self {
+        self.input = Some(input);
+        self
+    }
+
+    /// Add the labels an `ON CREATE` / `ON MATCH` branch asks for.
+    ///
+    /// Resolved through the record rather than against a single variable name,
+    /// because a MERGE pattern binds several variables and the branch may name
+    /// any of them.
+    fn apply_labels(
+        items: &[(String, Vec<Label>)],
+        record: &Record,
+        store: &mut GraphStore,
+        tenant_id: &str,
+    ) {
+        for (var, labels) in items {
+            let node_id = match record.get(var) {
+                Some(Value::NodeRef(id)) => *id,
+                Some(Value::Node(id, _)) => *id,
+                _ => continue,
+            };
+            for label in labels {
+                let _ = store.add_label_to_node(tenant_id, node_id, label.clone());
+            }
+        }
+    }
+
+    /// Does a node satisfy the pattern's labels and inline properties?
+
+    /// A pattern's properties with every expression resolved against this row.
+    ///
+    /// `property_exprs` holds the values that are not literals -- `{v: x}` from
+    /// an UNWIND, `{id: row.id}` from a batch upsert, `{name: a.name}` from a
+    /// bound node. MERGE did not evaluate them at all, so it matched on the
+    /// labels alone and `UNWIND ['a','b'] AS x MERGE (n:N {v: x})` found the
+    /// first `:N` for every row and created **one** node instead of two. The
+    /// planner refused the query outright rather than answer it wrongly; this
+    /// is what makes it answerable (#642).
+    ///
+    /// The resolved map is used for matching *and* for creation, which is the
+    /// property that matters: a MERGE that searched on one set of values and
+    /// wrote another would create a node its own pattern could not find, and
+    /// running the query twice would make two.
+    fn resolved_props(
+        literals: Option<&HashMap<String, PropertyValue>>,
+        exprs: Option<&HashMap<String, Expression>>,
+        record: &Record,
+        store: &GraphStore,
+    ) -> ExecutionResult<Option<HashMap<String, PropertyValue>>> {
+        let has_exprs = exprs.map_or(false, |e| !e.is_empty());
+        if !has_exprs {
+            return Ok(literals.cloned());
+        }
+        let mut out = literals.cloned().unwrap_or_default();
+        for (key, expr) in exprs.into_iter().flatten() {
+            match eval_expression(expr, record, store)? {
+                Value::Property(pv) => {
+                    out.insert(key.clone(), pv);
+                }
+                Value::Null => {
+                    out.insert(key.clone(), PropertyValue::Null);
+                }
+                other => {
+                    return Err(ExecutionError::TypeError(format!(
+                        "MERGE property `{key}` must be a scalar value, got {other:?}"
+                    )));
+                }
+            }
+        }
+        Ok(Some(out))
+    }
+
+    fn node_matches(node: &crate::graph::Node, labels: &[Label], props: Option<&HashMap<String, PropertyValue>>) -> bool {
+        if !labels.iter().all(|l| node.labels.contains(l)) {
+            return false;
+        }
+        match props {
+            Some(required) => required
+                .iter()
+                .all(|(k, v)| node.properties.get(k).map_or(false, |pv| pv == v)),
+            None => true,
+        }
+    }
+
+    /// MERGE over a pattern that contains relationships: find the whole pattern or create
+    /// the whole pattern.
+    ///
+    /// Note this creates *fresh* nodes when the pattern as a whole is absent, even where
+    /// nodes with the same labels and properties already exist -- openCypher's documented
+    /// behaviour, and the reason the idiomatic way to add an edge between existing nodes is
+    /// to bind them first (`MATCH (a),(b) MERGE (a)-[:R]->(b)`), which reuses them.
+    fn merge_path(
+        &self,
+        path: &crate::query::ast::PathPattern,
+        base: Record,
+        store: &mut GraphStore,
+        tenant_id: &str,
+    ) -> ExecutionResult<Option<Record>> {
+        // Flatten the path into nodes and the relationships between them.
+        let mut pattern_nodes: Vec<&crate::query::ast::NodePattern> = vec![&path.start];
+        // (from_index, to_index, type, properties, variable)
+        let mut pattern_rels: Vec<(usize, usize, EdgeType, HashMap<String, PropertyValue>, Option<String>)> = Vec::new();
+        for segment in &path.segments {
+            pattern_nodes.push(&segment.node);
+            let to = pattern_nodes.len() - 1;
+            let from = to - 1;
+            let edge_type = segment
+                .edge
+                .types
+                .first()
+                .cloned()
+                .unwrap_or_else(|| EdgeType::new("RELATED_TO"));
+            let props = Self::resolved_props(
+                segment.edge.properties.as_ref(),
+                segment.edge.property_exprs.as_ref(),
+                &base,
+                store,
+            )?
+            .unwrap_or_default();
+            let (a, b) = match segment.edge.direction {
+                Direction::Incoming => (to, from),
+                Direction::Outgoing | Direction::Both => (from, to),
+            };
+            pattern_rels.push((a, b, edge_type, props, segment.edge.variable.clone()));
+        }
+
+        // Candidate node ids per pattern position. A pattern node with no label has no
+        // cheap candidate set, so it cannot participate in a match and the pattern is
+        // treated as absent (i.e. created).
+        //
+        // Resolved once per pattern node, before the search, because the same
+        // values decide both what is matched and what would be created.
+        let mut node_props: Vec<Option<HashMap<String, PropertyValue>>> =
+            Vec::with_capacity(pattern_nodes.len());
+        for np in &pattern_nodes {
+            node_props.push(Self::resolved_props(
+                np.properties.as_ref(),
+                np.property_exprs.as_ref(),
+                &base,
+                store,
+            )?);
+        }
+
+        let mut candidates: Vec<Vec<NodeId>> = Vec::with_capacity(pattern_nodes.len());
+        for (i, np) in pattern_nodes.iter().enumerate() {
+            let mut ids = Vec::new();
+            if let Some(first_label) = np.labels.first() {
+                for node in store.get_nodes_by_label(first_label) {
+                    if Self::node_matches(node, &np.labels, node_props[i].as_ref()) {
+                        ids.push(node.id);
+                    }
+                }
+            }
+            candidates.push(ids);
+        }
+
+        // Backtracking search for an assignment satisfying every relationship. Patterns are
+        // a handful of nodes, so this stays trivial.
+        let found = if candidates.iter().any(|c| c.is_empty()) {
+            None
+        } else {
+            let mut assignment: Vec<NodeId> = Vec::with_capacity(pattern_nodes.len());
+            Self::search(&candidates, &pattern_rels, store, &mut assignment)
+        };
+
+        // Seeded from the incoming row so a MERGE inside a clause
+        // pipeline keeps the bindings its predecessors produced.
+        let mut record = base;
+
+        if let Some(assignment) = found {
+            for (i, np) in pattern_nodes.iter().enumerate() {
+                if let Some(var) = &np.variable {
+                    record.bind(var.clone(), Value::NodeRef(assignment[i]));
+                }
+            }
+            let sets = self.on_match_set.clone();
+            self.apply_sets(&sets, &record, store, tenant_id)?;
+            let labels = self.on_match_labels.clone();
+            Self::apply_labels(&labels, &record, store, tenant_id);
+            return Ok(Some(record));
+        }
+
+        // Create the entire pattern.
+        let mut created: Vec<NodeId> = Vec::with_capacity(pattern_nodes.len());
+        for (i, np) in pattern_nodes.iter().enumerate() {
+            // `MERGE ({...})` has no labels, and defaulting to "Node" gave the
+            // node a label the query never wrote (#625).
+            let node_id = store.create_node_with_labels(np.labels.iter().cloned());
+            if let Some(required) = node_props[i].as_ref() {
+                for (k, v) in required {
+                    if let Err(e) = store.set_node_property(tenant_id, node_id, k.clone(), v.clone())
+                    {
+                        // A rejected property must not leave a half-built node behind.
+                        let _ = store.delete_node(tenant_id, node_id);
+                        return Err(ExecutionError::GraphError(e.to_string()));
+                    }
+                }
+            }
+            if let Some(var) = &np.variable {
+                record.bind(var.clone(), Value::NodeRef(node_id));
+            }
+            created.push(node_id);
+        }
+        for (from, to, edge_type, props, _var) in &pattern_rels {
+            let edge_id = store
+                .create_edge(created[*from], created[*to], edge_type.clone())
+                .map_err(|e| ExecutionError::GraphError(e.to_string()))?;
+            for (k, v) in props {
+                store.set_edge_property_sparse(edge_id, k.clone(), v.clone());
+            }
+        }
+
+        let sets = self.on_create_set.clone();
+        self.apply_sets(&sets, &record, store, tenant_id)?;
+        Ok(Some(record))
+    }
+
+    /// Assign candidate nodes position by position, keeping only assignments whose
+    /// relationships all exist in the store.
+    fn search(
+        candidates: &[Vec<NodeId>],
+        rels: &[(usize, usize, EdgeType, HashMap<String, PropertyValue>, Option<String>)],
+        store: &GraphStore,
+        assignment: &mut Vec<NodeId>,
+    ) -> Option<Vec<NodeId>> {
+        let i = assignment.len();
+        if i == candidates.len() {
+            return Some(assignment.clone());
+        }
+        for &cand in &candidates[i] {
+            // A pattern node cannot bind to a node already used at another position.
+            if assignment.contains(&cand) {
+                continue;
+            }
+            assignment.push(cand);
+            // Check every relationship whose endpoints are now both assigned.
+            let ok = rels.iter().all(|(from, to, ty, _p, _v)| {
+                if *from > i || *to > i {
+                    return true;
+                }
+                let src = assignment[*from];
+                let dst = assignment[*to];
+                store
+                    .get_outgoing_edge_targets(src)
+                    .iter()
+                    .any(|(_eid, _s, t, et)| *t == dst && et == ty)
+            });
+            if ok {
+                if let Some(found) = Self::search(candidates, rels, store, assignment) {
+                    return Some(found);
+                }
+            }
+            assignment.pop();
+        }
+        None
+    }
+
+    /// Apply ON CREATE / ON MATCH SET items for any variable bound by the pattern.
+    fn apply_sets(
+        &self,
+        sets: &[(String, String, Expression)],
+        record: &Record,
+        store: &mut GraphStore,
+        tenant_id: &str,
+    ) -> ExecutionResult<()> {
+        for (var, prop, expr) in sets {
+            let Some(node_id) = record.get(var).and_then(|v| v.node_id()) else {
+                continue;
+            };
+            let val = eval_expression(expr, record, store)?;
+            if let Value::Property(pv) = val {
+                let _ = store.set_node_property(tenant_id, node_id, prop.clone(), pv);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -7326,18 +10665,53 @@ impl PhysicalOperator for MergeOperator {
     }
 
     fn next_mut(&mut self, store: &mut GraphStore, tenant_id: &str) -> ExecutionResult<Option<Record>> {
-        if self.executed {
-            return Ok(None);
-        }
-        self.executed = true;
+        // With an upstream, the clause runs once per incoming row and each row
+        // seeds the merge; without one it is a leaf that runs exactly once.
+        // Taking the input out first keeps the borrow checker happy while the
+        // merge body holds `&mut store`.
+        let base = match self.input.take() {
+            Some(mut input) => {
+                let row = input.next_mut(store, tenant_id)?;
+                self.input = Some(input);
+                match row {
+                    Some(r) => r,
+                    None => return Ok(None),
+                }
+            }
+            None => {
+                if self.executed {
+                    return Ok(None);
+                }
+                self.executed = true;
+                Record::new()
+            }
+        };
 
         let path = self.pattern.paths.first()
             .ok_or_else(|| ExecutionError::PlanningError("MERGE pattern has no paths".to_string()))?;
 
+        // A MERGE pattern containing relationships is match-or-create over the *whole*
+        // pattern, per openCypher: if the entire pattern does not already exist, the
+        // entire pattern is created. Previously only `path.start` was considered and the
+        // segments were ignored outright, so `MERGE (a:X {..})-[:R]->(b:X {..})` matched
+        // the first node, created no relationship, and reported success.
+        if !path.segments.is_empty() {
+            return self.merge_path(path, base, store, tenant_id);
+        }
+
         let start = &path.start;
         let start_var = start.variable.clone().unwrap_or_else(|| "n".to_string());
         let labels = &start.labels;
-        let props = start.properties.as_ref();
+        // The same map decides what is matched and what is created, so a value
+        // that came from the row cannot make MERGE search for one thing and
+        // write another.
+        let resolved = Self::resolved_props(
+            start.properties.as_ref(),
+            start.property_exprs.as_ref(),
+            &base,
+            store,
+        )?;
+        let props = resolved.as_ref();
 
         // Search for existing nodes matching labels + properties
         let mut matched_node_id = None;
@@ -7360,7 +10734,7 @@ impl PhysicalOperator for MergeOperator {
         }
 
         let node_id;
-        let mut record = Record::new();
+        let mut record = base;
 
         if let Some(existing_id) = matched_node_id {
             node_id = existing_id;
@@ -7374,19 +10748,18 @@ impl PhysicalOperator for MergeOperator {
                     }
                 }
             }
+            Self::apply_labels(&self.on_match_labels, &record, store, tenant_id);
         } else {
-            let label_str = labels.first().map(|l| l.as_str()).unwrap_or("Node");
-            node_id = store.create_node(label_str);
-
-            for label in labels.iter().skip(1) {
-                if let Some(node) = store.get_node_mut(node_id) {
-                    node.labels.insert(label.clone());
-                }
-            }
+            node_id = store.create_node_with_labels(labels.iter().cloned());
 
             if let Some(required_props) = props {
                 for (k, v) in required_props {
-                    let _ = store.set_node_property(tenant_id, node_id, k.clone(), v.clone());
+                    if let Err(e) = store.set_node_property(tenant_id, node_id, k.clone(), v.clone())
+                    {
+                        // A rejected property must not leave a half-built node behind.
+                        let _ = store.delete_node(tenant_id, node_id);
+                        return Err(ExecutionError::GraphError(e.to_string()));
+                    }
                 }
             }
 
@@ -7400,6 +10773,7 @@ impl PhysicalOperator for MergeOperator {
                     }
                 }
             }
+            Self::apply_labels(&self.on_create_labels, &record, store, tenant_id);
         }
 
         Ok(Some(record))
@@ -7443,6 +10817,10 @@ impl ForeachOperator {
 }
 
 impl PhysicalOperator for ForeachOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.input]
+    }
+
     fn next(&mut self, _store: &GraphStore) -> ExecutionResult<Option<Record>> {
         Err(ExecutionError::RuntimeError(
             "ForeachOperator requires mutable store access. Use next_mut instead.".to_string()
@@ -7488,13 +10866,43 @@ impl PhysicalOperator for ForeachOperator {
                 // Execute CREATE operations
                 for pattern in &self.create_patterns {
                     for path in &pattern.paths {
-                        let label_str = path.start.labels.first()
-                            .map(|l| l.as_str())
-                            .unwrap_or("Node");
-                        let node_id = store.create_node(label_str);
+                        // A relationship pattern would need the surrounding
+                        // variables joined up; creating just the start node
+                        // would silently produce an orphan instead of an edge.
+                        if !path.segments.is_empty() {
+                            return Err(ExecutionError::RuntimeError(
+                                "CREATE of a relationship pattern inside FOREACH is not supported"
+                                    .to_string(),
+                            ));
+                        }
+
+                        let node_id =
+                            store.create_node_with_labels(path.start.labels.iter().cloned());
                         if let Some(props) = &path.start.properties {
                             for (k, v) in props {
                                 let _ = store.set_node_property(tenant_id, node_id, k.to_string(), v.clone());
+                            }
+                        }
+                        // Property values that are expressions rather than
+                        // literals -- crucially including the loop variable
+                        // itself. These live in `property_exprs`, and not
+                        // evaluating them meant `CREATE (:T {i: i})` created
+                        // the node and silently dropped `i` (#467): the right
+                        // number of nodes, none of the data.
+                        if let Some(prop_exprs) = &path.start.property_exprs {
+                            for (k, expr) in prop_exprs {
+                                let val = eval_expression(expr, &inner_record, store)?;
+                                let prop_val = match val {
+                                    Value::Property(p) => p,
+                                    Value::Null => PropertyValue::Null,
+                                    other => {
+                                        return Err(ExecutionError::TypeError(format!(
+                                            "FOREACH CREATE: property `{k}` evaluated to {other:?}, \
+which cannot be stored as a property value"
+                                        )))
+                                    }
+                                };
+                                let _ = store.set_node_property(tenant_id, node_id, k.to_string(), prop_val);
                             }
                         }
                     }
@@ -7534,6 +10942,9 @@ pub struct ShortestPathOperator {
     all_paths: bool,  // false = shortestPath, true = allShortestPaths
     results: std::vec::IntoIter<Record>,
     executed: bool,
+    /// `edge_types` resolved to interned ids, cached after the first use.
+    /// `None` from `type_ids()` means the pattern named no types.
+    type_ids: Option<Vec<u16>>,
 }
 
 impl ShortestPathOperator {
@@ -7556,11 +10967,48 @@ impl ShortestPathOperator {
             all_paths,
             results: Vec::new().into_iter(),
             executed: false,
+            type_ids: None,
+        }
+    }
+
+    /// The edge-type filter as interned ids. `None` is the wildcard; an
+    /// unknown type yields `Some(empty)`, which matches nothing.
+    fn ensure_type_ids(&mut self, store: &GraphStore) {
+        if self.edge_types.is_empty() || self.type_ids.is_some() {
+            return;
+        }
+        let ids = self
+            .edge_types
+            .iter()
+            .filter_map(|t| store.edge_type_id(&EdgeType::new(t.as_str())))
+            .collect();
+        self.type_ids = Some(ids);
+    }
+
+    fn for_each_neighbor(
+        &self,
+        node: NodeId,
+        type_ids: Option<&[u16]>,
+        store: &GraphStore,
+        mut visit: impl FnMut(NodeId, crate::graph::EdgeId),
+    ) {
+        match self.direction {
+            Direction::Outgoing => store.for_each_outgoing_neighbor(node, type_ids, &mut visit),
+            Direction::Incoming => store.for_each_incoming_neighbor(node, type_ids, &mut visit),
+            Direction::Both => {
+                store.for_each_outgoing_neighbor(node, type_ids, &mut visit);
+                store.for_each_incoming_neighbor(node, type_ids, &mut visit);
+            }
         }
     }
 
     fn execute_all(&mut self, store: &GraphStore) -> ExecutionResult<()> {
         let mut all_results = Vec::new();
+        // Cloned rather than borrowed: the loop below pulls from `self.input`,
+        // which needs `&mut self`. Once per query, not once per row.
+        self.ensure_type_ids(store);
+        let type_ids = self.type_ids.clone();
+        let type_filter = type_ids.as_deref();
 
         while let Some(record) = self.input.next(store)? {
             let source_id = record.get(&self.source_var)
@@ -7571,7 +11019,7 @@ impl ShortestPathOperator {
                 .ok_or_else(|| ExecutionError::RuntimeError("shortestPath target not a node".to_string()))?;
 
             // BFS to find shortest path(s)
-            let paths = self.bfs_shortest(store, source_id, target_id);
+            let paths = self.bfs_shortest(store, source_id, target_id, type_filter);
 
             if self.all_paths {
                 for path in paths {
@@ -7601,79 +11049,172 @@ impl ShortestPathOperator {
         Ok(())
     }
 
-    fn bfs_shortest(&self, store: &GraphStore, source: NodeId, target: NodeId) -> Vec<(Vec<NodeId>, Vec<crate::graph::EdgeId>)> {
-        use std::collections::VecDeque;
-
+    /// Every shortest path from `source` to `target`, or one of them.
+    ///
+    /// # What this replaced, and why it timed out
+    ///
+    /// The previous implementation carried a full `Vec<NodeId>` and
+    /// `Vec<EdgeId>` on every queue entry and — for `allShortestPaths` —
+    /// **disabled the visited set entirely**:
+    ///
+    /// ```text
+    /// if !visited.contains(&next_node) || self.all_paths {
+    ///     if !self.all_paths { visited.insert(next_node); }
+    /// ```
+    ///
+    /// So it enumerated every *walk* of length ≤ d rather than every shortest
+    /// path, cloning both path vectors at each expansion, and materialised a
+    /// full `Edge` per incident edge to read its type. On LDBC with the
+    /// endpoints three hops apart and an average undirected degree around 41,
+    /// that is on the order of 41³ ≈ 69,000 walks, each enumerating ~900
+    /// incident edges as owned `Edge` objects. It did not finish inside 120 s
+    /// (#516).
+    ///
+    /// # What this does
+    ///
+    /// The textbook two-phase approach:
+    ///
+    /// 1. **A level BFS** that records, for each node, its distance and *all*
+    ///    predecessors that reach it at that distance — a shortest-path DAG.
+    ///    Each node is expanded once, so this is O(V + E), and it stops at the
+    ///    level where the target appears.
+    /// 2. **Backtracking** from the target through that DAG to enumerate
+    ///    paths. The cost is proportional to the paths actually returned
+    ///    rather than to the walks that might have led anywhere.
+    ///
+    /// Neighbours come from the allocation-free visitor with the edge type
+    /// filtered on its interned id, so an incident edge of the wrong type
+    /// costs a comparison rather than an `Edge` clone (#520).
+    fn bfs_shortest(
+        &self,
+        store: &GraphStore,
+        source: NodeId,
+        target: NodeId,
+        type_ids: Option<&[u16]>,
+    ) -> Vec<(Vec<NodeId>, Vec<crate::graph::EdgeId>)> {
         if source == target {
             return vec![(vec![source], vec![])];
         }
 
-        let mut queue: VecDeque<(NodeId, Vec<NodeId>, Vec<crate::graph::EdgeId>)> = VecDeque::new();
-        let mut visited: HashSet<NodeId> = HashSet::new();
-        let mut results = Vec::new();
-        let mut found_distance: Option<usize> = None;
+        // Phase 1: level BFS building the shortest-path DAG.
+        let mut dist: rustc_hash::FxHashMap<NodeId, u32> = rustc_hash::FxHashMap::default();
+        let mut preds: rustc_hash::FxHashMap<NodeId, Vec<(NodeId, crate::graph::EdgeId)>> =
+            rustc_hash::FxHashMap::default();
+        dist.insert(source, 0);
 
-        queue.push_back((source, vec![source], vec![]));
-        visited.insert(source);
+        let mut frontier = vec![source];
+        let mut depth = 0u32;
+        let mut reached = false;
 
-        while let Some((current, path_nodes, path_edges)) = queue.pop_front() {
-            if let Some(max_dist) = found_distance {
-                if path_nodes.len() > max_dist {
-                    break;
-                }
+        while !frontier.is_empty() && !reached {
+            depth += 1;
+            let mut next = Vec::new();
+            for &current in &frontier {
+                self.for_each_neighbor(current, type_ids, store, |neighbour, edge_id| {
+                    match dist.get(&neighbour) {
+                        None => {
+                            dist.insert(neighbour, depth);
+                            preds.entry(neighbour).or_default().push((current, edge_id));
+                            next.push(neighbour);
+                            if neighbour == target {
+                                reached = true;
+                            }
+                        }
+                        // Another predecessor at the *same* distance is another
+                        // shortest way in, and `allShortestPaths` wants it. A
+                        // node already seen at a shorter distance is not.
+                        Some(&d) if d == depth && self.all_paths => {
+                            preds.entry(neighbour).or_default().push((current, edge_id));
+                        }
+                        _ => {}
+                    }
+                });
             }
-
-            let edges = match self.direction {
-                Direction::Outgoing => store.get_outgoing_edges(current),
-                Direction::Incoming => store.get_incoming_edges(current),
-                Direction::Both => {
-                    let mut all = store.get_outgoing_edges(current);
-                    all.extend(store.get_incoming_edges(current));
-                    all
-                }
-            };
-
-            for edge in &edges {
-                if !self.edge_types.is_empty() && !self.edge_types.iter().any(|t| t == edge.edge_type.as_str()) {
-                    continue;
-                }
-                let next_node = if edge.source == current { edge.target } else { edge.source };
-
-                if next_node == target {
-                    let mut new_nodes = path_nodes.clone();
-                    new_nodes.push(target);
-                    let mut new_edges = path_edges.clone();
-                    new_edges.push(edge.id);
-
-                    if found_distance.is_none() {
-                        found_distance = Some(new_nodes.len());
-                    }
-                    results.push((new_nodes, new_edges));
-
-                    if !self.all_paths {
-                        return results;
-                    }
-                    continue;
-                }
-
-                if !visited.contains(&next_node) || self.all_paths {
-                    if !self.all_paths {
-                        visited.insert(next_node);
-                    }
-                    let mut new_nodes = path_nodes.clone();
-                    new_nodes.push(next_node);
-                    let mut new_edges = path_edges.clone();
-                    new_edges.push(edge.id);
-                    queue.push_back((next_node, new_nodes, new_edges));
-                }
-            }
+            frontier = next;
         }
 
+        if !reached {
+            return Vec::new();
+        }
+
+        // Phase 2: walk the DAG backwards from the target.
+        let mut results = Vec::new();
+        let mut nodes_rev = vec![target];
+        let mut edges_rev = Vec::new();
+        self.collect_paths(
+            target,
+            source,
+            &preds,
+            &mut nodes_rev,
+            &mut edges_rev,
+            &mut results,
+        );
         results
+    }
+
+    /// Depth-first backtrack through the predecessor DAG, emitting one path
+    /// per distinct chain. Stops after the first path when only one is wanted.
+    fn collect_paths(
+        &self,
+        current: NodeId,
+        source: NodeId,
+        preds: &rustc_hash::FxHashMap<NodeId, Vec<(NodeId, crate::graph::EdgeId)>>,
+        nodes_rev: &mut Vec<NodeId>,
+        edges_rev: &mut Vec<crate::graph::EdgeId>,
+        results: &mut Vec<(Vec<NodeId>, Vec<crate::graph::EdgeId>)>,
+    ) {
+        if !self.all_paths && !results.is_empty() {
+            return;
+        }
+        if current == source {
+            let mut nodes: Vec<NodeId> = nodes_rev.clone();
+            nodes.reverse();
+            let mut edges: Vec<crate::graph::EdgeId> = edges_rev.clone();
+            edges.reverse();
+            results.push((nodes, edges));
+            return;
+        }
+        let Some(parents) = preds.get(&current) else {
+            return;
+        };
+        for &(parent, edge_id) in parents {
+            nodes_rev.push(parent);
+            edges_rev.push(edge_id);
+            self.collect_paths(parent, source, preds, nodes_rev, edges_rev, results);
+            nodes_rev.pop();
+            edges_rev.pop();
+            if !self.all_paths && !results.is_empty() {
+                return;
+            }
+        }
     }
 }
 
 impl PhysicalOperator for ShortestPathOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.input]
+    }
+
+    /// Without this, EXPLAIN and PROFILE rendered a shortest-path plan as
+    /// `Unknown` — the operator inherited the trait's default. A plan nobody
+    /// can read is a plan nobody profiles, which is how #516 went unexamined.
+    fn describe(&self) -> OperatorDescription {
+        let kind = if self.all_paths { "AllShortestPaths" } else { "ShortestPath" };
+        let types = if self.edge_types.is_empty() {
+            String::new()
+        } else {
+            format!(":{}", self.edge_types.join("|"))
+        };
+        OperatorDescription {
+            name: kind.to_string(),
+            details: format!(
+                "({})-[{}*]-({}), {:?}",
+                self.source_var, types, self.target_var, self.direction
+            ),
+            children: vec![self.input.describe()],
+        }
+    }
+
     fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
         if !self.executed {
             self.execute_all(store)?;
@@ -7758,13 +11299,16 @@ impl WithBarrierOperator {
 
     fn evaluate_expression(expr: &Expression, record: &Record, store: &GraphStore) -> ExecutionResult<Value> {
         match expr {
+            // Delegates rather than adding a sixth copy of this logic; the
+            // standalone evaluator is the one implementation (#654).
+            Expression::ListExpr(_) | Expression::MapExpr(_) => {
+                eval_expression(expr, record, store)
+            }
             Expression::Variable(var) => {
                 Ok(record.get(var).cloned().unwrap_or(Value::Null))
             }
             Expression::Property { variable, property } => {
-                let val = record.get(variable).unwrap_or(&Value::Null);
-                let prop = val.resolve_property(property, store);
-                Ok(Value::Property(prop))
+                read_property(record, variable, property, store, true)
             }
             Expression::Literal(lit) => Ok(Value::Property(lit.clone())),
             Expression::Binary { left, op, right } => {
@@ -7788,7 +11332,7 @@ impl WithBarrierOperator {
             Expression::Index { expr, index } => {
                 let collection = Self::evaluate_expression(expr, record, store)?;
                 let idx = Self::evaluate_expression(index, record, store)?;
-                eval_index(collection, idx)
+                eval_index(collection, idx, store)
             }
             Expression::ListSlice { expr, start, end } => {
                 let collection = Self::evaluate_expression(expr, record, store)?;
@@ -7922,11 +11466,8 @@ impl WithBarrierOperator {
         if self.distinct {
             let mut seen: HashSet<Vec<Value>> = HashSet::new();
             output_records.retain(|record| {
-                let mut key: Vec<(String, Value)> = record.bindings().iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                key.sort_by(|a, b| a.0.cmp(&b.0));
-                let vals: Vec<Value> = key.into_iter().map(|(_, v)| v).collect();
+                let vals: Vec<Value> =
+                    record.dedup_key().into_iter().map(|(_, v)| v).collect();
                 seen.insert(vals)
             });
         }
@@ -7970,6 +11511,35 @@ impl WithBarrierOperator {
 }
 
 impl PhysicalOperator for WithBarrierOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.input]
+    }
+
+    /// Pull the input **mutably** before materialising.
+    ///
+    /// A barrier reads its whole input before emitting anything. Doing that
+    /// read-only meant a write below a `WITH` silently did not happen:
+    /// `MATCH (n) SET n.x = 1 WITH n RETURN n.x` returned the *old* value, the
+    /// query succeeded, and the store was unchanged. That is the real reason
+    /// the grammar only ever allowed writes after the last projection — not
+    /// syntax, but that mutability never reached below a barrier.
+    ///
+    /// The input is drained into a `MaterializedOperator` rather than
+    /// threading `&mut GraphStore` through `execute_all` and its grouping
+    /// helpers, which are the most intricate code in this file. A barrier
+    /// materialises its whole input anyway, so nothing is buffered that would
+    /// not have been.
+    fn next_mut(&mut self, store: &mut GraphStore, tenant_id: &str) -> ExecutionResult<Option<Record>> {
+        if !self.executed {
+            let mut rows = Vec::new();
+            while let Some(batch) = self.input.next_batch_mut(store, tenant_id, 65536)? {
+                rows.extend(batch.records);
+            }
+            self.input = Box::new(MaterializedOperator::new(rows));
+            self.execute_all(store)?;
+        }
+        Ok(self.results.next())
+    }
     fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
         if !self.executed {
             self.execute_all(store)?;
@@ -8056,6 +11626,10 @@ impl ExpandIntoOperator {
 }
 
 impl PhysicalOperator for ExpandIntoOperator {
+    fn children_mut(&mut self) -> Vec<&mut OperatorBox> {
+        vec![&mut self.input]
+    }
+
     fn next(&mut self, store: &GraphStore) -> ExecutionResult<Option<Record>> {
         loop {
             let record = match self.input.next(store)? {
@@ -8136,6 +11710,12 @@ pub struct NodeByIdOperator {
     node_ids: Vec<NodeId>,
     position: usize,
     variable: String,
+    /// Labels the pattern required, checked per id.
+    ///
+    /// A scan by id bypasses the label index, so `MATCH (n:Person) WHERE
+    /// id(n) = 5` would otherwise match a node of any label that happens to
+    /// hold that id (#538).
+    labels: Vec<Label>,
 }
 
 impl NodeByIdOperator {
@@ -8144,7 +11724,14 @@ impl NodeByIdOperator {
             node_ids,
             position: 0,
             variable,
+            labels: Vec::new(),
         }
+    }
+
+    /// Require the node to carry every one of these labels.
+    pub fn with_labels(mut self, labels: Vec<Label>) -> Self {
+        self.labels = labels;
+        self
     }
 }
 
@@ -8154,8 +11741,12 @@ impl PhysicalOperator for NodeByIdOperator {
             let node_id = self.node_ids[self.position];
             self.position += 1;
 
-            // Verify node still exists
-            if store.has_node(node_id) {
+            // Verify the node still exists and carries the pattern's labels.
+            let matches = match store.get_node(node_id) {
+                Some(node) => self.labels.iter().all(|l| node.has_label(l)),
+                None => false,
+            };
+            if matches {
                 let mut record = Record::new();
                 record.bind(self.variable.clone(), Value::NodeRef(node_id));
                 return Ok(Some(record));
@@ -8955,8 +12546,13 @@ mod tests {
 
     #[test]
     fn test_eval_function_tostring_null() {
+        // null in, null out — *not* the four-character string "null", which
+        // would be indistinguishable from a genuine value and would make
+        // `toString(x) = 'null'` true for a missing property. The TCK has no
+        // scenario pinning this one, so it was checked against Neo4j 5
+        // directly: `toString(null) IS NULL` -> true.
         let result = eval_function("tostring", &[Value::Null], None).unwrap();
-        assert_eq!(result, Value::Property(PropertyValue::String("null".to_string())));
+        assert_eq!(result, Value::Null);
     }
 
     #[test]
@@ -8973,8 +12569,9 @@ mod tests {
 
     #[test]
     fn test_eval_function_tointeger_bad_string() {
+        // Null rather than an error, matching Cypher (#606).
         let result = eval_function("tointeger", &[Value::Property(PropertyValue::String("bad".to_string()))], None);
-        assert!(result.is_err());
+        assert_eq!(result.unwrap(), Value::Property(PropertyValue::Null));
     }
 
     #[test]
@@ -9006,8 +12603,9 @@ mod tests {
 
     #[test]
     fn test_eval_function_tofloat_bad_string() {
+        // Null rather than an error, matching Cypher (#606).
         let result = eval_function("tofloat", &[Value::Property(PropertyValue::String("bad".to_string()))], None);
-        assert!(result.is_err());
+        assert_eq!(result.unwrap(), Value::Property(PropertyValue::Null));
     }
 
     #[test]
@@ -9167,14 +12765,19 @@ mod tests {
             nodes: vec![NodeId::new(1), NodeId::new(2)],
             edges: vec![EdgeId::new(10)],
         };
+        // The nodes themselves, not their ids. This asserted an
+        // `Array([1, 2])` -- which is what the function used to return,
+        // because a `PropertyValue` cannot hold a node. An id is a
+        // plausible-looking answer that no property access can be read from
+        // (#652).
         let result = eval_function("nodes", &[path], None).unwrap();
         match result {
-            Value::Property(PropertyValue::Array(arr)) => {
-                assert_eq!(arr.len(), 2);
-                assert_eq!(arr[0].as_integer(), Some(1));
-                assert_eq!(arr[1].as_integer(), Some(2));
+            Value::List(items) => {
+                assert_eq!(items.len(), 2);
+                assert!(matches!(items[0], Value::NodeRef(id) if id.as_u64() == 1));
+                assert!(matches!(items[1], Value::NodeRef(id) if id.as_u64() == 2));
             }
-            _ => panic!("Expected Array"),
+            other => panic!("expected a list of nodes, got {other:?}"),
         }
     }
 
@@ -9191,13 +12794,13 @@ mod tests {
             nodes: vec![NodeId::new(1), NodeId::new(2)],
             edges: vec![EdgeId::new(10)],
         };
+        // With no store to resolve against, the element is `Null` rather
+        // than an invented edge -- the shape is a list either way, which is
+        // what changed (#652).
         let result = eval_function("relationships", &[path], None).unwrap();
         match result {
-            Value::Property(PropertyValue::Array(arr)) => {
-                assert_eq!(arr.len(), 1);
-                assert_eq!(arr[0].as_integer(), Some(10));
-            }
-            _ => panic!("Expected Array"),
+            Value::List(items) => assert_eq!(items.len(), 1),
+            other => panic!("expected a list of relationships, got {other:?}"),
         }
     }
 
@@ -9465,12 +13068,17 @@ mod tests {
     }
 
     #[test]
-    fn test_binary_op_starts_with_type_error() {
+    fn test_binary_op_starts_with_non_string_is_null() {
+        // Not an error: `1 STARTS WITH 'x'` is null. openCypher TCK String8/9/10
+        // scenario 8 asks for all 36 pairings drawn from
+        // `[1, 3.14, true, [], {}, null]` and expects null for every one, and
+        // Neo4j 5 agrees (`(1 STARTS WITH 'x') IS NULL` -> true). This test
+        // previously asserted the refusal the engine happened to implement.
         let result = eval_binary_op(&BinaryOp::StartsWith,
             Value::Property(PropertyValue::Integer(1)),
             Value::Property(PropertyValue::String("x".to_string())),
         );
-        assert!(result.is_err());
+        assert_eq!(result.unwrap(), Value::Property(PropertyValue::Null));
     }
 
     #[test]
@@ -9492,12 +13100,17 @@ mod tests {
     }
 
     #[test]
-    fn test_binary_op_ends_with_type_error() {
+    fn test_binary_op_ends_with_non_string_is_null() {
+        // Not an error: `1 ENDS WITH 'x'` is null. openCypher TCK String8/9/10
+        // scenario 8 asks for all 36 pairings drawn from
+        // `[1, 3.14, true, [], {}, null]` and expects null for every one, and
+        // Neo4j 5 agrees (`(1 ENDS WITH 'x') IS NULL` -> true). This test
+        // previously asserted the refusal the engine happened to implement.
         let result = eval_binary_op(&BinaryOp::EndsWith,
             Value::Property(PropertyValue::Integer(1)),
             Value::Property(PropertyValue::String("x".to_string())),
         );
-        assert!(result.is_err());
+        assert_eq!(result.unwrap(), Value::Property(PropertyValue::Null));
     }
 
     #[test]
@@ -9519,12 +13132,17 @@ mod tests {
     }
 
     #[test]
-    fn test_binary_op_contains_type_error() {
+    fn test_binary_op_contains_non_string_is_null() {
+        // Not an error: `1 CONTAINS 'x'` is null. openCypher TCK String8/9/10
+        // scenario 8 asks for all 36 pairings drawn from
+        // `[1, 3.14, true, [], {}, null]` and expects null for every one, and
+        // Neo4j 5 agrees (`(1 CONTAINS 'x') IS NULL` -> true). This test
+        // previously asserted the refusal the engine happened to implement.
         let result = eval_binary_op(&BinaryOp::Contains,
             Value::Property(PropertyValue::Integer(1)),
             Value::Property(PropertyValue::String("x".to_string())),
         );
-        assert!(result.is_err());
+        assert_eq!(result.unwrap(), Value::Property(PropertyValue::Null));
     }
 
     #[test]
@@ -9830,7 +13448,9 @@ mod tests {
             Value::Property(PropertyValue::Null),
             Value::Property(PropertyValue::Null),
         ).unwrap();
-        assert_eq!(result, Value::Property(PropertyValue::Boolean(true)));
+        // Cypher: null = null is *unknown*, not true. This is why `IS NULL` exists as a
+        // separate operator -- equality can never confirm nullness.
+        assert_eq!(result, Value::Property(PropertyValue::Null));
     }
 
     #[test]
@@ -9839,7 +13459,8 @@ mod tests {
             Value::Property(PropertyValue::Null),
             Value::Property(PropertyValue::Integer(1)),
         ).unwrap();
-        assert_eq!(result, Value::Property(PropertyValue::Boolean(true)));
+        // Unknown, not true -- a WHERE must exclude the row rather than keep it.
+        assert_eq!(result, Value::Property(PropertyValue::Null));
     }
 
     // -- And/Or type errors --
@@ -9968,8 +13589,9 @@ mod tests {
             Value::Null,
             Value::Property(PropertyValue::Integer(1)),
         ).unwrap();
-        // Null != Integer
-        assert_eq!(result, Value::Property(PropertyValue::Boolean(false)));
+        // Unknown. Filters coerce this to "exclude", so the observable WHERE behaviour is
+        // unchanged from the old `false`, but NOT(unknown) is unknown -- not true.
+        assert_eq!(result, Value::Property(PropertyValue::Null));
     }
 
     // -- Comparison operators --
@@ -10111,7 +13733,7 @@ mod tests {
             PropertyValue::Integer(20),
             PropertyValue::Integer(30),
         ]));
-        let result = eval_index(arr, Value::Property(PropertyValue::Integer(1))).unwrap();
+        let result = eval_index(arr, Value::Property(PropertyValue::Integer(1)), &GraphStore::new()).unwrap();
         assert_eq!(result, Value::Property(PropertyValue::Integer(20)));
     }
 
@@ -10122,14 +13744,14 @@ mod tests {
             PropertyValue::Integer(20),
             PropertyValue::Integer(30),
         ]));
-        let result = eval_index(arr, Value::Property(PropertyValue::Integer(-1))).unwrap();
+        let result = eval_index(arr, Value::Property(PropertyValue::Integer(-1)), &GraphStore::new()).unwrap();
         assert_eq!(result, Value::Property(PropertyValue::Integer(30)));
     }
 
     #[test]
     fn test_eval_index_array_out_of_bounds() {
         let arr = Value::Property(PropertyValue::Array(vec![PropertyValue::Integer(10)]));
-        let result = eval_index(arr, Value::Property(PropertyValue::Integer(5))).unwrap();
+        let result = eval_index(arr, Value::Property(PropertyValue::Integer(5)), &GraphStore::new()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
@@ -10140,6 +13762,7 @@ mod tests {
         let result = eval_index(
             Value::Property(PropertyValue::Map(map)),
             Value::Property(PropertyValue::String("key".to_string())),
+            &GraphStore::new(),
         ).unwrap();
         assert_eq!(result, Value::Property(PropertyValue::Integer(42)));
     }
@@ -10151,6 +13774,7 @@ mod tests {
         let result = eval_index(
             Value::Property(PropertyValue::Map(map)),
             Value::Property(PropertyValue::String("missing".to_string())),
+            &GraphStore::new(),
         ).unwrap();
         assert_eq!(result, Value::Null);
     }
@@ -10160,6 +13784,7 @@ mod tests {
         let result = eval_index(
             Value::Property(PropertyValue::Integer(1)),
             Value::Property(PropertyValue::Integer(0)),
+            &GraphStore::new(),
         ).unwrap();
         assert_eq!(result, Value::Null);
     }

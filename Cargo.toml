@@ -108,6 +108,38 @@ samyama-sdk = { path = "crates/samyama-sdk", version = "1.7.0" }
 http-body-util = "0.1"
 
 [[bench]]
+name = "aggregate_throughput"
+harness = false
+
+[[bench]]
+name = "property_access"
+harness = false
+
+[[bench]]
+name = "varlength_expand"
+harness = false
+
+[[bench]]
+name = "ingest_profile"
+harness = false
+
+[[bench]]
+name = "cardinality_accuracy"
+harness = false
+
+[[bench]]
+name = "memory_footprint"
+harness = false
+
+[[bench]]
+name = "prop_scaling"
+harness = false
+
+[[bench]]
+name = "hierarchy_benchmark"
+harness = false
+
+[[bench]]
 name = "graph_benchmarks"
 harness = false
 
@@ -155,3 +187,23 @@ harness = false
 opt-level = 3
 lto = true
 codegen-units = 1
+
+[[bench]]
+name = "aggregate_grouping"
+harness = false
+
+[[bench]]
+name = "filter_throughput"
+harness = false
+
+[[bench]]
+name = "record_ops"
+harness = false
+
+[[bench]]
+name = "adjacency_walk"
+harness = false
+
+[[bench]]
+name = "sort_topn"
+harness = false

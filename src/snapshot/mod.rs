@@ -20,16 +20,77 @@ use flate2::Compression;
 use crate::graph::property::PropertyValue;
 use crate::graph::store::GraphStore;
 use crate::graph::types::NodeId;
-use format::{ExportStats, ImportStats, SnapshotEdge, SnapshotHeader, SnapshotNode, SNAPSHOT_VERSION};
+use format::{
+    ExportStats, ImportStats, SnapshotEdge, SnapshotHeader, SnapshotHierarchyIndex, SnapshotNode,
+    SNAPSHOT_VERSION,
+};
 
 /// Export all nodes and edges from the store into a gzip-compressed .sgsnap stream.
 ///
 /// v2 format: merges ColumnStore properties into node records and exports stub
 /// edges from adjacency lists (not just the Edge arena). This captures the full
 /// graph state including bulk-loaded data from create_node_stub/create_edge_stub.
+/// A dense set of edge ids, used to tell adjacency-only (stub) edges from full ones.
+///
+/// This is probed once per adjacency entry -- twice over the whole graph, since the header
+/// pre-pass counts before the body writes. At 1.35B edges a `HashSet<u64>` is both ~20 GB
+/// and a random-access cache miss on every probe, which is most of why export ran at
+/// 0.77 MB/s and was CPU-bound rather than IO-bound (#314). Edge ids are dense, so one bit
+/// each is enough: ~170 MB for the same 1.35B edges, contiguous and cache-friendly.
+struct EdgeIdSet {
+    bits: Vec<u64>,
+}
+
+impl EdgeIdSet {
+    fn from_ids(ids: impl Iterator<Item = u64>) -> Self {
+        let ids: Vec<u64> = ids.collect();
+        let max = ids.iter().copied().max().unwrap_or(0);
+        let mut set = Self {
+            bits: vec![0u64; (max as usize / 64) + 1],
+        };
+        for id in ids {
+            set.insert(id);
+        }
+        set
+    }
+
+    fn insert(&mut self, id: u64) {
+        let word = id as usize / 64;
+        if word < self.bits.len() {
+            self.bits[word] |= 1u64 << (id % 64);
+        }
+    }
+
+    fn contains(&self, id: u64) -> bool {
+        let word = id as usize / 64;
+        word < self.bits.len() && (self.bits[word] >> (id % 64)) & 1 == 1
+    }
+}
+
+/// Default gzip level for snapshot export.
+///
+/// Was `Compression::default()` (6), which is the slowest part of an export and runs on one
+/// core. On a representative snapshot payload level 3 is **2.25x faster for 3% more bytes**,
+/// and level 1 is 3.6x faster for 24% more -- worth having, but 24% of a 22 GB federation
+/// snapshot is another 5 GB to store and move, so 3 is the better default (#314).
+pub const DEFAULT_SNAPSHOT_COMPRESSION: u32 = 3;
+
+/// Export at the default compression level.
 pub fn export_tenant(
     store: &GraphStore,
     writer: impl Write,
+) -> Result<ExportStats, Box<dyn std::error::Error>> {
+    export_tenant_with_compression(store, writer, DEFAULT_SNAPSHOT_COMPRESSION)
+}
+
+/// Export at an explicit gzip level (0-9).
+///
+/// Lower is faster and larger. Use 1 when the snapshot is a local capture whose size does
+/// not matter; the default trades almost no size for most of the speed.
+pub fn export_tenant_with_compression(
+    store: &GraphStore,
+    writer: impl Write,
+    compression_level: u32,
 ) -> Result<ExportStats, Box<dyn std::error::Error>> {
     let nodes = store.all_nodes();
     let full_edges = store.all_edges(); // Full Edge objects (may be empty for stub-loaded)
@@ -47,7 +108,7 @@ pub fn export_tenant(
     let mut adjacency_edge_count: u64 = 0;
 
     // Collect full edge IDs to avoid double-counting
-    let full_edge_ids: HashSet<u64> = full_edges.iter().map(|e| e.id.as_u64()).collect();
+    let full_edge_ids = EdgeIdSet::from_ids(full_edges.iter().map(|e| e.id.as_u64()));
 
     // Count adjacency-only (stub) edges
     for node in &nodes {
@@ -55,7 +116,7 @@ pub fn export_tenant(
         // Frozen outgoing neighbors
         let frozen = store.frozen_outgoing_neighbors(idx);
         for &(_nid, eid) in &frozen {
-            if !full_edge_ids.contains(&eid.as_u64()) {
+            if !full_edge_ids.contains(eid.as_u64()) {
                 adjacency_edge_count += 1;
                 if let Some(et) = store.get_edge_type(eid) {
                     edge_type_set.insert(et.as_str().to_string());
@@ -65,7 +126,7 @@ pub fn export_tenant(
         // Write buffer outgoing
         let buf = store.get_outgoing_neighbor_slice(node.id);
         for &(_nid, eid) in buf {
-            if !full_edge_ids.contains(&eid.as_u64()) {
+            if !full_edge_ids.contains(eid.as_u64()) {
                 adjacency_edge_count += 1;
                 if let Some(et) = store.get_edge_type(eid) {
                     edge_type_set.insert(et.as_str().to_string());
@@ -88,7 +149,7 @@ pub fn export_tenant(
     let total_edge_count = full_edges.len() as u64 + adjacency_edge_count;
 
     // Create gzip encoder
-    let mut gz = GzEncoder::new(writer, Compression::default());
+    let mut gz = GzEncoder::new(writer, Compression::new(compression_level.min(9)));
 
     // Write header (v2)
     let header = SnapshotHeader {
@@ -105,6 +166,25 @@ pub fn export_tenant(
     let header_json = serde_json::to_string(&header)?;
     gz.write_all(header_json.as_bytes())?;
     gz.write_all(b"\n")?;
+
+    // Write hierarchy index declarations (ADR-035). Declarations only — the structures
+    // rebuild on import. Declined hierarchies are exported too: the probe is a property of
+    // the data, so a hierarchy that declines here may be in regime after the import that
+    // reshapes it, and dropping the declaration would silently lose the user's intent.
+    for info in store.hierarchy_index.list() {
+        let record = SnapshotHierarchyIndex {
+            t: "h".to_string(),
+            name: info.name.clone(),
+            edge_types: info.edge_types.clone(),
+            reverse: false,
+            measure_label: None,
+            measure_property: info.measure.clone(),
+            ops: info.ops.iter().map(|o| o.to_string()).collect(),
+        };
+        let json = serde_json::to_string(&record)?;
+        gz.write_all(json.as_bytes())?;
+        gz.write_all(b"\n")?;
+    }
 
     // Write nodes (with ColumnStore properties merged)
     for node in &nodes {
@@ -165,7 +245,7 @@ pub fn export_tenant(
         // Frozen outgoing
         let frozen = store.frozen_outgoing_neighbors(idx);
         for &(tgt_nid, eid) in &frozen {
-            if full_edge_ids.contains(&eid.as_u64()) { continue; }
+            if full_edge_ids.contains(eid.as_u64()) { continue; }
             let et = store.get_edge_type(eid)
                 .map(|e| e.as_str().to_string())
                 .unwrap_or_default();
@@ -185,7 +265,7 @@ pub fn export_tenant(
         // Write buffer outgoing
         let buf = store.get_outgoing_neighbor_slice(node.id);
         for &(tgt_nid, eid) in buf {
-            if full_edge_ids.contains(&eid.as_u64()) { continue; }
+            if full_edge_ids.contains(eid.as_u64()) { continue; }
             let et = store.get_edge_type(eid)
                 .map(|e| e.as_str().to_string())
                 .unwrap_or_default();
@@ -236,6 +316,29 @@ pub fn import_tenant_with_dedup(
     reader: impl Read,
     dedup_keys: &[&str],
 ) -> Result<ImportStats, Box<dyn std::error::Error>> {
+    // A failed import used to leave whatever it had already applied in the graph: a
+    // truncated snapshot returned "unexpected end of file" *and* several million nodes,
+    // so the caller saw an error and a partially-populated graph, with no way to tell how
+    // much of it had landed (#199). Track what this import creates and undo it on failure.
+    let mut created_nodes: Vec<crate::graph::NodeId> = Vec::new();
+    match import_tenant_inner(store, reader, dedup_keys, &mut created_nodes) {
+        Ok(stats) => Ok(stats),
+        Err(e) => {
+            // Reverse order so edges go with their endpoints.
+            for id in created_nodes.iter().rev() {
+                let _ = store.delete_node("default", *id);
+            }
+            Err(e)
+        }
+    }
+}
+
+fn import_tenant_inner(
+    store: &mut GraphStore,
+    reader: impl Read,
+    dedup_keys: &[&str],
+    created_nodes: &mut Vec<crate::graph::NodeId>,
+) -> Result<ImportStats, Box<dyn std::error::Error>> {
     let decoder = GzDecoder::new(reader);
     let buf_reader = BufReader::new(decoder);
     let mut lines = buf_reader.lines();
@@ -268,6 +371,7 @@ pub fn import_tenant_with_dedup(
     let mut merged_node_count: u64 = 0;
     let mut imported_labels: HashSet<String> = HashSet::new();
     let mut imported_edge_types: HashSet<String> = HashSet::new();
+    let mut hierarchy_decls: Vec<SnapshotHierarchyIndex> = Vec::new();
 
     // Normalize dedup values: lowercase + trim for case-insensitive matching
     let normalize_dedup = |s: &str| -> String { s.trim().to_lowercase() };
@@ -276,10 +380,38 @@ pub fn import_tenant_with_dedup(
     // Only populated when the caller provides dedup_keys.
     let mut dedup_index: HashMap<(String, String, String), NodeId> = HashMap::new();
 
-    // Pre-populate dedup index from existing store nodes (only if dedup requested)
+    // Pre-populate dedup index from existing store nodes (only if dedup requested).
+    //
+    // Only the labels this snapshot actually contains are indexed, and they are reached
+    // through the label index rather than by walking the whole store. A node whose label
+    // does not appear in the incoming file can never merge with anything in it, so
+    // indexing it is pure cost -- and that cost was O(store) on *every* import, which for
+    // a federation growing 66M -> 266M nodes means re-scanning a store that gets larger
+    // each time and indexing hundreds of millions of nodes that can never match (#316).
+    //
+    // The header is an exact inventory: `export_tenant` materialises `labels` by scanning
+    // the data it writes, so it cannot drift from the file's contents.
     if !dedup_keys.is_empty() {
-    for node in store.all_nodes() {
-        let label = node.labels.iter().next().map(|l| l.as_str().to_string()).unwrap_or_default();
+    let snapshot_labels: Vec<crate::graph::Label> = header
+        .labels
+        .iter()
+        .map(|l| crate::graph::Label::new(l.as_str()))
+        .collect();
+    for snapshot_label in &snapshot_labels {
+        let label = snapshot_label.as_str().to_string();
+        let node_ids: Vec<NodeId> = store
+            .get_nodes_by_label(snapshot_label)
+            .iter()
+            .map(|n| n.id)
+            .collect();
+        for node_id in node_ids {
+        let Some(node) = store.get_node(node_id) else { continue };
+        // Indexed under this label specifically, not "whichever label iterated first":
+        // `labels` is a set, so "first" is not a stable contract, and a dual-labelled node
+        // such as :ChemblTarget + :Protein could be indexed under either. If the two sides
+        // disagreed the lookup missed and the merge silently did not happen (#317).
+        // Matching now depends on label *intersection*, which is order-independent.
+        {
         for &key in dedup_keys {
             // Check node HashMap properties
             if let Some(val) = node.get_property(key) {
@@ -302,6 +434,8 @@ pub fn import_tenant_with_dedup(
                 _ => {}
             }
         }
+        }
+        }
     }
     } // end if !dedup_keys.is_empty()
 
@@ -323,18 +457,27 @@ pub fn import_tenant_with_dedup(
                 .unwrap_or_else(|| "".to_string());
 
             // --- Entity dedup: check if this node already exists (only if dedup requested) ---
+            // Try every label the incoming node carries, for the same reason the index
+            // holds every label: a match on any shared label is a match.
+            let snap_labels: Vec<String> = if snap_node.labels.is_empty() {
+                vec![String::new()]
+            } else {
+                snap_node.labels.clone()
+            };
             let mut existing_id: Option<NodeId> = None;
-            for &key in dedup_keys.iter() {
+            'dedup: for &key in dedup_keys.iter() {
                 if let Some(json_val) = snap_node.props.get(key) {
                     let val_str = match json_val {
                         serde_json::Value::String(s) => normalize_dedup(s),
                         serde_json::Value::Number(n) => n.to_string(),
                         _ => continue,
                     };
-                    let lookup = (first_label.clone(), key.to_string(), val_str);
-                    if let Some(&eid) = dedup_index.get(&lookup) {
-                        existing_id = Some(eid);
-                        break;
+                    for label in &snap_labels {
+                        let lookup = (label.clone(), key.to_string(), val_str.clone());
+                        if let Some(&eid) = dedup_index.get(&lookup) {
+                            existing_id = Some(eid);
+                            break 'dedup;
+                        }
                     }
                 }
             }
@@ -388,6 +531,7 @@ pub fn import_tenant_with_dedup(
             if use_stubs {
                 // v2: use lightweight stubs + column properties
                 let new_id = store.create_node_stub(first_label.as_str());
+                created_nodes.push(new_id);
                 // Add remaining labels
                 if let Some(node) = store.get_node_mut(new_id) {
                     for label in snap_node.labels.iter().skip(1) {
@@ -417,13 +561,19 @@ pub fn import_tenant_with_dedup(
                             serde_json::Value::Number(n) => n.to_string(),
                             _ => continue,
                         };
-                        dedup_index.insert((first_label.clone(), key.to_string(), val_str), new_id);
+                        for label in &snap_labels {
+                            dedup_index.insert(
+                                (label.clone(), key.to_string(), val_str.clone()),
+                                new_id,
+                            );
+                        }
                     }
                 }
                 id_remap.insert(snap_node.id, new_id);
             } else {
                 // v1: use full create_node with HashMap properties
                 let new_id = store.create_node(first_label.as_str());
+                created_nodes.push(new_id);
                 if let Some(node) = store.get_node_mut(new_id) {
                     for label in snap_node.labels.iter().skip(1) {
                         node.add_label(label.as_str());
@@ -440,7 +590,12 @@ pub fn import_tenant_with_dedup(
                             PropertyValue::Integer(i) => i.to_string(),
                             _ => continue,
                         };
-                        dedup_index.insert((first_label.clone(), key.to_string(), val_str), new_id);
+                        for label in &snap_labels {
+                            dedup_index.insert(
+                                (label.clone(), key.to_string(), val_str.clone()),
+                                new_id,
+                            );
+                        }
                     }
                 }
                 id_remap.insert(snap_node.id, new_id);
@@ -452,6 +607,12 @@ pub fn import_tenant_with_dedup(
             }
 
             imported_node_count += 1;
+        } else if line.contains("\"t\":\"h\"") {
+            // Hierarchy index declaration (ADR-035). Deferred until nodes and edges are
+            // in, because building the poset reads the covering relation we are still
+            // importing.
+            let decl: SnapshotHierarchyIndex = serde_json::from_str(&line)?;
+            hierarchy_decls.push(decl);
         } else if line.contains("\"t\":\"e\"") {
             // Parse as edge
             let snap_edge: SnapshotEdge = serde_json::from_str(&line)?;
@@ -497,24 +658,13 @@ pub fn import_tenant_with_dedup(
         // Skip unrecognized lines
     }
 
-    // Compact adjacency lists to CSR for memory efficiency (DS-07)
-    if imported_edge_count > 0 {
-        store.compact_adjacency();
-        // Bulk-loaded edges go through create_edge_stub which intentionally
-        // skips edge_type_index updates for speed. Rebuild the index so the
-        // planner can see the imported edge types — without this, OPTIONAL
-        // MATCH plans against imported snapshots fall back to NodeScan(all)
-        // and time out on multi-million-node stores.
-        store.rebuild_edge_type_index();
-    }
-
-    // Backfill HNSW vector indices from imported node properties.
-    // create_node_stub / create_node bypass the event loop that normally calls
-    // add_vector, so Vector properties are readable via Cypher but invisible to
-    // queryNodes. Rebuild here mirrors rebuild_edge_type_index above.
-    // No-op when no vector indices are registered (common case).
-    if imported_node_count > 0 {
-        store.rebuild_vector_index();
+    // Everything the stub inserts skipped: CSR compaction, the edge-type index,
+    // the catalog's triple statistics, and the HNSW vector index. Kept as one
+    // call because taking half of this list is exactly how the edge-type index
+    // and then the catalog each came to be missing after import -- both times
+    // leaving data that was entirely correct and a planner that was not.
+    if imported_node_count > 0 || imported_edge_count > 0 {
+        store.finish_bulk_load();
     }
 
     if merged_node_count > 0 {
@@ -526,12 +676,58 @@ pub fn import_tenant_with_dedup(
     let mut edge_types: Vec<String> = imported_edge_types.into_iter().collect();
     edge_types.sort();
 
+    // Rebuild hierarchy indexes from their declarations, now that the covering relation
+    // exists. A hierarchy that declines on the imported data is registered with its
+    // diagnostic rather than dropped; a hierarchy over a cycle is skipped with a warning,
+    // because refusing the whole import over one bad declaration would be the wrong
+    // trade — the graph itself is fine.
+    let mut hierarchy_count: u64 = 0;
+    if !hierarchy_decls.is_empty() {
+        let mgr = std::sync::Arc::clone(&store.hierarchy_index);
+        for decl in hierarchy_decls {
+            let mut spec = crate::index::hierarchy::HierarchySpec::new(
+                decl.name.clone(),
+                decl.edge_types
+                    .iter()
+                    .map(|t| crate::graph::types::EdgeType::new(t.as_str()))
+                    .collect(),
+            );
+            spec.reverse = decl.reverse;
+            if let Some(prop) = &decl.measure_property {
+                let ops: Vec<crate::index::hierarchy::RollupOp> = decl
+                    .ops
+                    .iter()
+                    .filter_map(|o| crate::index::hierarchy::RollupOp::parse(o))
+                    .collect();
+                spec = spec.with_measure(
+                    decl.measure_label
+                        .as_ref()
+                        .map(|l| crate::graph::types::Label::new(l.as_str())),
+                    prop.clone(),
+                    if ops.is_empty() {
+                        vec![crate::index::hierarchy::RollupOp::Sum]
+                    } else {
+                        ops
+                    },
+                );
+            }
+            match mgr.create(store, spec) {
+                Ok(_) => hierarchy_count += 1,
+                Err(e) => eprintln!(
+                    "[hierarchy] skipped index '{}' from snapshot: {}",
+                    decl.name, e
+                ),
+            }
+        }
+    }
+
     Ok(ImportStats {
         node_count: imported_node_count,
         edge_count: imported_edge_count,
         merged_count: merged_node_count,
         labels,
         edge_types,
+        hierarchy_count,
     })
 }
 
@@ -652,6 +848,72 @@ fn json_to_property(val: &serde_json::Value) -> PropertyValue {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// A hierarchy that survives a snapshot round-trip, measure and all.
+    ///
+    /// This is the test that defends the columnar-read rule in ADR-035 §5: an imported
+    /// graph has nothing in the sparse property map, so a roll-up that read
+    /// `node.properties` would come back zero here while every other assertion still
+    /// passed. Asserting the *value* after import — not merely the index's existence — is
+    /// what makes that failure mode visible.
+    #[test]
+    fn hierarchy_declaration_survives_round_trip_and_rolls_up_after_import() {
+        use crate::graph::types::EdgeType;
+        use crate::index::hierarchy::{HierarchySpec, RollupOp, RollupValue};
+
+        let mut store = GraphStore::new();
+        let root = store.create_node("Class");
+        for i in 1..=4i64 {
+            let leaf = store.create_node("Drug");
+            store.create_edge(leaf, root, "IS_A").unwrap();
+            store
+                .get_node_mut(leaf)
+                .unwrap()
+                .set_property("units", PropertyValue::Integer(i));
+        }
+        let mgr = std::sync::Arc::clone(&store.hierarchy_index);
+        mgr.create(
+            &store,
+            HierarchySpec::new("atc", vec![EdgeType::new("IS_A")]).with_measure(
+                None,
+                "units",
+                vec![RollupOp::Sum, RollupOp::Count],
+            ),
+        )
+        .unwrap();
+
+        let mut buf = Vec::new();
+        export_tenant(&store, &mut buf).unwrap();
+
+        let mut restored = GraphStore::new();
+        let stats = import_tenant(&mut restored, Cursor::new(buf)).unwrap();
+        assert_eq!(stats.hierarchy_count, 1, "declaration must survive the round trip");
+
+        let entry = restored.hierarchy_index.get("atc").expect("index rebuilt on import");
+        let guard = entry.read().unwrap();
+        assert!(guard.usable(), "a freshly rebuilt index is not stale");
+        let idx = guard.index.as_ref().unwrap();
+
+        // Node ids are remapped on import, so find the root by its subtree size.
+        let root_idx = (0..idx.poset().n() as u32)
+            .find(|&i| idx.descendant_count(i) == 5)
+            .expect("the root subsumes all five nodes");
+        assert_eq!(idx.rollup(root_idx, RollupOp::Sum), Some(RollupValue::Int(10)));
+        assert_eq!(idx.rollup(root_idx, RollupOp::Count), Some(RollupValue::Int(5)));
+    }
+
+    #[test]
+    fn snapshot_without_hierarchies_reports_none() {
+        let mut store = GraphStore::new();
+        let a = store.create_node("Person");
+        let b = store.create_node("Person");
+        store.create_edge(a, b, "KNOWS").unwrap();
+        let mut buf = Vec::new();
+        export_tenant(&store, &mut buf).unwrap();
+        let mut restored = GraphStore::new();
+        let stats = import_tenant(&mut restored, Cursor::new(buf)).unwrap();
+        assert_eq!(stats.hierarchy_count, 0);
+    }
 
     #[test]
     fn test_round_trip_basic() {

@@ -38,6 +38,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[path = "common/missing_data.rs"]
+mod missing_data;
+
 #[derive(Debug)]
 struct Args {
     data_dir: PathBuf,
@@ -79,6 +82,9 @@ fn parse_args() -> Args {
             "--out" => { a.out = PathBuf::from(&argv[i + 1]); i += 2; }
             "--export-spec" => { a.export_spec = Some(PathBuf::from(&argv[i + 1])); i += 2; }
             "--export-snapshot" => { a.export_snapshot = Some(PathBuf::from(&argv[i + 1])); i += 2; }
+            // Consumed by `missing_data::skip`, which reads it straight from
+            // `env::args`. Accepted here so the parser does not reject it (#566).
+            "--require-data" => { i += 1; }
             other => { eprintln!("unknown arg: {}", other); std::process::exit(2); }
         }
     }
@@ -110,7 +116,9 @@ fn build_grid_kg(data_dir: &std::path::Path) -> (GraphStore, Vec<Generator>, Vec
     // Generators.
     let gen_csv = data_dir.join("sample_generators.csv");
     let mut gens = Vec::new();
-    let f = File::open(&gen_csv).expect("generators csv");
+    let f = File::open(&gen_csv).unwrap_or_else(|e| {
+        missing_data::skip("smart-grid sample data", &gen_csv, &e, "--data-dir")
+    });
     for (i, line) in BufReader::new(f).lines().enumerate() {
         let line = line.unwrap();
         if i == 0 { continue; } // header

@@ -112,12 +112,23 @@ impl CommandHandler {
             return RespValue::Error("ERR wrong number of arguments for 'GRAPH.QUERY' command".to_string());
         }
 
-        // Extract graph name (for future multi-tenancy)
+        // Extract graph name. This build serves a single graph: the name used to be
+        // accepted and ignored, so two datasets written under different names landed in the
+        // same store and silently merged (#366). Refuse the name instead -- a loud error on
+        // the first query beats corrupting a loaded dataset.
         let graph_name = match args[1].as_string() {
             Ok(Some(s)) => s,
             Ok(None) => return RespValue::Error("ERR null graph name".to_string()),
             Err(e) => return RespValue::Error(format!("ERR {}", e)),
         };
+        if graph_name != "default" {
+            return RespValue::Error(format!(
+                "ERR this build serves a single graph ('default'); graph '{}' does not exist. \
+                 The name was previously ignored and the query ran against 'default', \
+                 merging datasets. Use 'default', or run a separate instance per dataset.",
+                graph_name
+            ));
+        }
 
         // Extract query string
         let query_str = match args[2].as_string() {
@@ -326,6 +337,20 @@ impl CommandHandler {
         match value {
             // _node prefixed with underscore - node data available but not used in
             // simple string formatting (only showing id for RESP compatibility)
+            Value::List(items) => {
+                RespValue::Array(items.iter().map(|i| self.format_value(i)).collect())
+            }
+            Value::Map(entries) => RespValue::Array(
+                entries
+                    .iter()
+                    .flat_map(|(k, v)| {
+                        [
+                            RespValue::BulkString(Some(k.clone().into_bytes())),
+                            self.format_value(v),
+                        ]
+                    })
+                    .collect(),
+            ),
             Value::Node(id, _node) => {
                 // Format node as JSON-like string
                 let node_str = format!("Node({:?})", id);
@@ -423,7 +448,7 @@ mod tests {
 
         let cmd = RespValue::Array(vec![
             RespValue::BulkString(Some(b"GRAPH.QUERY".to_vec())),
-            RespValue::BulkString(Some(b"mygraph".to_vec())),
+            RespValue::BulkString(Some(b"default".to_vec())),
             RespValue::BulkString(Some(b"MATCH (n:Person) RETURN n".to_vec())),
         ]);
 
@@ -458,7 +483,7 @@ mod tests {
 
         let cmd = RespValue::Array(vec![
             RespValue::BulkString(Some(b"GRAPH.RO_QUERY".to_vec())),
-            RespValue::BulkString(Some(b"mygraph".to_vec())),
+            RespValue::BulkString(Some(b"default".to_vec())),
             RespValue::BulkString(Some(b"MATCH (n:Person) RETURN n.name".to_vec())),
         ]);
         let response = handler.handle_command(&cmd, &store).await;
@@ -472,7 +497,7 @@ mod tests {
 
         let cmd = RespValue::Array(vec![
             RespValue::BulkString(Some(b"GRAPH.DELETE".to_vec())),
-            RespValue::BulkString(Some(b"mygraph".to_vec())),
+            RespValue::BulkString(Some(b"default".to_vec())),
         ]);
         let response = handler.handle_command(&cmd, &store).await;
         // Should return OK or similar
@@ -534,11 +559,48 @@ mod tests {
 
         let cmd = RespValue::Array(vec![
             RespValue::BulkString(Some(b"GRAPH.QUERY".to_vec())),
-            RespValue::BulkString(Some(b"mygraph".to_vec())),
+            RespValue::BulkString(Some(b"default".to_vec())),
             RespValue::BulkString(Some(b"CREATE (n:Person {name: 'Alice'})".to_vec())),
         ]);
         let response = handler.handle_command(&cmd, &store).await;
         assert!(matches!(response, RespValue::Array(_)));
+    }
+
+    #[tokio::test]
+    async fn test_graph_query_rejects_non_default_graph_name() {
+        // The name used to be parsed and thrown away, so `GRAPH.QUERY analytics ...` and
+        // `GRAPH.QUERY staging ...` both ran against the one store and silently merged
+        // their data (#366). A single-graph build must refuse the name, not ignore it.
+        let handler = CommandHandler::new(None);
+        let store = Arc::new(RwLock::new(GraphStore::new()));
+
+        let cmd = RespValue::Array(vec![
+            RespValue::BulkString(Some(b"GRAPH.QUERY".to_vec())),
+            RespValue::BulkString(Some(b"analytics".to_vec())),
+            RespValue::BulkString(Some(b"MATCH (n) RETURN n".to_vec())),
+        ]);
+        let response = handler.handle_command(&cmd, &store).await;
+
+        match response {
+            RespValue::Error(msg) => {
+                assert!(msg.contains("analytics"), "should name the rejected graph: {msg}");
+                assert!(msg.contains("single graph"), "should explain why: {msg}");
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+
+        // and writes under a rejected name must not have landed anywhere
+        let cmd = RespValue::Array(vec![
+            RespValue::BulkString(Some(b"GRAPH.QUERY".to_vec())),
+            RespValue::BulkString(Some(b"analytics".to_vec())),
+            RespValue::BulkString(Some(b"CREATE (:Leak {id: 1})".to_vec())),
+        ]);
+        let _ = handler.handle_command(&cmd, &store).await;
+        assert_eq!(
+            store.read().await.get_nodes_by_label(&crate::graph::Label::new("Leak")).len(),
+            0,
+            "a rejected query must not write to the default graph"
+        );
     }
 
     // ========== Coverage expansion tests ==========
@@ -551,7 +613,7 @@ mod tests {
         // Only 2 args (command + graph name, missing query)
         let cmd = RespValue::Array(vec![
             RespValue::BulkString(Some(b"GRAPH.QUERY".to_vec())),
-            RespValue::BulkString(Some(b"mygraph".to_vec())),
+            RespValue::BulkString(Some(b"default".to_vec())),
         ]);
         let response = handler.handle_command(&cmd, &store).await;
         assert_eq!(
@@ -594,7 +656,7 @@ mod tests {
 
         let cmd = RespValue::Array(vec![
             RespValue::BulkString(Some(b"GRAPH.QUERY".to_vec())),
-            RespValue::BulkString(Some(b"mygraph".to_vec())),
+            RespValue::BulkString(Some(b"default".to_vec())),
             RespValue::BulkString(None), // null query
         ]);
         let response = handler.handle_command(&cmd, &store).await;
@@ -689,7 +751,7 @@ mod tests {
 
         let handler = CommandHandler::new(None);
         let node = Node::new(NodeId::new(1), "Person");
-        let value = Value::Node(NodeId::new(1), node);
+        let value = Value::Node(NodeId::new(1), Box::new(node));
         let result = handler.format_value(&value);
         match result {
             RespValue::BulkString(Some(bytes)) => {
@@ -724,7 +786,7 @@ mod tests {
 
         let handler = CommandHandler::new(None);
         let edge = Edge::new(EdgeId::new(10), NodeId::new(1), NodeId::new(2), "KNOWS");
-        let value = Value::Edge(EdgeId::new(10), edge);
+        let value = Value::Edge(EdgeId::new(10), Box::new(edge));
         let result = handler.format_value(&value);
         match result {
             RespValue::BulkString(Some(bytes)) => {
@@ -1045,7 +1107,7 @@ mod tests {
         // Test a query that has write keywords in the middle (e.g., MATCH ... SET ...)
         let cmd = RespValue::Array(vec![
             RespValue::BulkString(Some(b"GRAPH.QUERY".to_vec())),
-            RespValue::BulkString(Some(b"mygraph".to_vec())),
+            RespValue::BulkString(Some(b"default".to_vec())),
             RespValue::BulkString(Some(b"MATCH (n:Person {name: 'Alice'}) SET n.age = 30 RETURN n".to_vec())),
         ]);
         // Should detect " SET " and treat as write query
