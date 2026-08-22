@@ -51,6 +51,12 @@ pub struct Materialize {
     pub target_label: String,
     #[serde(default = "default_target_key")]
     pub target_key: String,
+    /// Optional org-supplied controlled vocabulary (e.g. a sensor-type → failure-mode
+    /// taxonomy the org already maintains). When set, the fill prompt prefers these exact
+    /// names for types the taxonomy covers and falls back to the LLM's general knowledge
+    /// only where the taxonomy is silent — tiered grounding, not a per-node answer key.
+    #[serde(default)]
+    pub vocabulary: Option<serde_json::Value>,
 }
 
 /// Per-`(label, property)` policy. An empty-source spec is declared-but-inert.
@@ -212,17 +218,35 @@ pub fn build_list_prompt(label: &str, mat: &Materialize, context: &[(String, Str
     if ctx.is_empty() {
         ctx.push_str("(no other properties known)\n");
     }
+    // Tiered grounding: prefer the org's own taxonomy where it covers this type, and lean on
+    // the LLM's general knowledge only where the taxonomy is silent.
+    let vocab_block = match &mat.vocabulary {
+        Some(v) => {
+            let pretty = serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string());
+            format!(
+                "The organization maintains an approved taxonomy mapping each {label} type to its \
+                 {target}s (JSON):\n{vocab}\n\
+                 Find the entry whose key best matches this {label}'s type from the known properties \
+                 above and output ONLY those exact {target} names, verbatim. If no taxonomy entry \
+                 matches this {label}, fall back to general domain knowledge for well-known types.\n",
+                label = label,
+                target = mat.target_label,
+                vocab = pretty,
+            )
+        }
+        None => String::new(),
+    };
     format!(
         "In an industrial-asset knowledge graph, list the {target}s that this {label} relates to \
-         via `{edge}`.\nKnown properties:\n{ctx}\n\
-         If this {label} denotes a well-known general type, output the {target}s **one per line**, \
-         short canonical names only — no numbering, bullets, prose, or blank lines. Only if this is \
-         an instance-specific relationship that cannot be inferred from general knowledge, return \
-         exactly UNKNOWN.",
+         via `{edge}`.\nKnown properties:\n{ctx}\n{vocab_block}\
+         Output the {target}s **one per line**, short canonical names only — no numbering, bullets, \
+         prose, or blank lines. Only if this is an instance-specific relationship that cannot be \
+         inferred from the taxonomy or general knowledge, return exactly UNKNOWN.",
         target = mat.target_label,
         label = label,
         edge = mat.edge_type,
         ctx = ctx,
+        vocab_block = vocab_block,
     )
 }
 
@@ -424,6 +448,7 @@ pub fn verify(config: &EnrichConfig, store: &mut GraphStore, node_ids: &[NodeId]
                         .collect();
                     rel_promotions.push((property.clone(), targets, Materialize {
                         edge_type: edge.clone(), target_label: tl.clone(), target_key: tk.clone(),
+                        vocabulary: None,
                     }));
                 }
             } else if let Some(PropertyValue::String(v)) = e.get("value") {
@@ -485,4 +510,49 @@ pub fn worker_from_env() -> Result<EnrichmentWorker, String> {
 pub fn global_config() -> &'static std::sync::RwLock<EnrichConfig> {
     static G: std::sync::OnceLock<std::sync::RwLock<EnrichConfig>> = std::sync::OnceLock::new();
     G.get_or_init(|| std::sync::RwLock::new(EnrichConfig::default()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mat(vocabulary: Option<serde_json::Value>) -> Materialize {
+        Materialize {
+            edge_type: "MONITORS".to_string(),
+            target_label: "FailureMode".to_string(),
+            target_key: "name".to_string(),
+            vocabulary,
+        }
+    }
+
+    #[test]
+    fn list_prompt_injects_org_vocabulary_when_set() {
+        let vocab = serde_json::json!({ "Supply Temperature": ["Evaporator Water side fouling"] });
+        let ctx = vec![("name".to_string(), "Chiller 7 Supply Temperature".to_string())];
+        let p = build_list_prompt("Sensor", &mat(Some(vocab)), &ctx);
+        // tier 1: org taxonomy is presented with its exact strings
+        assert!(p.contains("approved taxonomy"), "tiered vocab instruction missing:\n{p}");
+        assert!(p.contains("Evaporator Water side fouling"), "org vocab strings missing:\n{p}");
+        // tier 2: LLM fallback where the taxonomy is silent
+        assert!(p.contains("fall back to general domain knowledge"), "LLM-fallback tier missing:\n{p}");
+    }
+
+    #[test]
+    fn list_prompt_omits_vocabulary_block_when_none() {
+        let ctx = vec![("name".to_string(), "Chiller 7 Supply Temperature".to_string())];
+        let p = build_list_prompt("Sensor", &mat(None), &ctx);
+        assert!(!p.contains("approved taxonomy"), "vocab block should be absent when None:\n{p}");
+    }
+
+    #[test]
+    fn parse_list_strips_bullets_and_drops_unknown() {
+        let got = parse_list("- Evaporator Water side fouling\n2) Condenser Water side fouling\nUNKNOWN\n\n");
+        assert_eq!(
+            got,
+            vec![
+                "Evaporator Water side fouling".to_string(),
+                "Condenser Water side fouling".to_string(),
+            ]
+        );
+    }
 }
