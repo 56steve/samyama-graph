@@ -1,19 +1,24 @@
 //! Governed query-time enrichment (GAK) — single-graph OSS port of the enterprise
-//! ADR-031 pipeline (epic #696, sub-issues #698–#701).
+//! ADR-031 pipeline (epic #696, sub-issues #698–#702).
 //!
 //! The loop: a **policy** declares which `(Label, property)` pairs are enrichable →
 //! a query **surfaces** nodes → [`detect_gaps`] finds declared properties that are
 //! null → the [`EnrichmentWorker`] asks the LLM to fill each, **quarantines** the
-//! answer under `_enrichment` with provenance (never the real property), and
+//! answer under `_enrichment` with provenance (never the real property/graph), and
 //! **honest-declines** (`UNKNOWN` ⇒ nothing written) → a later [`verify`] pass
 //! promotes a pending value to the real property iff its confidence clears the
-//! spec's `trust_floor`. No policy ⇒ nothing is ever enriched (the safety default).
+//! spec's `trust_floor`. No policy ⇒ nothing is ever enriched (the safe default).
+//!
+//! #702: a spec may carry a [`Materialize`], making the gap **relationship-shaped** —
+//! the worker asks for a *list* of target entities and `verify` materializes
+//! `(node)-[:edge_type]->(:target_label {target_key})` nodes + edges (provenance-tagged)
+//! instead of promoting a scalar. This is the "subgraph as the missing data layer" form.
 
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::graph::{GraphStore, Label, NodeId, PropertyValue};
+use crate::graph::{EdgeType, GraphStore, Label, NodeId, PropertyValue};
 use crate::nlq::client::NLQClient;
 use crate::query::{RecordBatch, Value};
 
@@ -24,7 +29,7 @@ pub const LLM_DEFAULT_CONFIDENCE: f64 = 0.4;
 /// OSS serves a single graph; the store API still takes a tenant id.
 const TENANT: &str = "default";
 
-// ─────────────────────────────────────────────────────────── config (#698)
+// ─────────────────────────────────────────────────────────── config (#698/#702)
 
 /// Where an enriched value may come from. OSS wires the `Llm` source only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -32,6 +37,20 @@ const TENANT: &str = "default";
 pub enum EnrichSource {
     /// The LLM's parametric knowledge — unsourced, lowest trust.
     Llm,
+}
+
+fn default_target_key() -> String {
+    "name".to_string()
+}
+
+/// A relationship-shaped gap (#702). When present on a spec, the property is filled as a
+/// *list* of target entities and materialized as `(node)-[:edge_type]->(:target_label {target_key})`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Materialize {
+    pub edge_type: String,
+    pub target_label: String,
+    #[serde(default = "default_target_key")]
+    pub target_key: String,
 }
 
 /// Per-`(label, property)` policy. An empty-source spec is declared-but-inert.
@@ -42,6 +61,9 @@ pub struct EnrichSpec {
     /// Minimum confidence to promote out of quarantine. `0.0` = promote on any pass.
     #[serde(default)]
     pub trust_floor: f64,
+    /// If set, this is a relationship gap: fill a list and materialize a subgraph (#702).
+    #[serde(default)]
+    pub materialize: Option<Materialize>,
 }
 
 /// Single-graph enrichment policy: `Label -> property -> spec`. No policy ⇒ inert.
@@ -63,11 +85,13 @@ impl EnrichConfig {
 // ─────────────────────────────────────────────────────────── gap detection (#699)
 
 /// A declared-enrichable property that is missing on a surfaced node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct GapEvent {
     pub node_id: u64,
     pub label: String,
     pub property: String,
+    /// Relationship-shaped when set (#702).
+    pub materialize: Option<Materialize>,
 }
 
 /// Node ids a query result surfaced (its `Node`/`NodeRef` bindings). Gaps are only
@@ -117,6 +141,7 @@ pub fn detect_gaps(config: &EnrichConfig, store: &GraphStore, node_ids: &[NodeId
                             node_id: id.as_u64(),
                             label: label.clone(),
                             property: property.clone(),
+                            materialize: spec.materialize.clone(),
                         });
                     }
                 }
@@ -126,7 +151,7 @@ pub fn detect_gaps(config: &EnrichConfig, store: &GraphStore, node_ids: &[NodeId
     gaps
 }
 
-// ─────────────────────────────────────────────────────────── worker (#700)
+// ─────────────────────────────────────────────────────────── worker (#700/#702)
 
 /// A filled value ready to be quarantined (produced off the store lock).
 #[derive(Debug, Clone)]
@@ -137,6 +162,9 @@ pub struct Outcome {
     pub confidence: f64,
     pub method: String,
     pub prompt_hash: String,
+    /// Relationship targets + materialize spec, when this is a subgraph gap (#702).
+    pub targets: Option<Vec<String>>,
+    pub materialize: Option<Materialize>,
 }
 
 fn prompt_hash(prompt: &str) -> String {
@@ -146,7 +174,7 @@ fn prompt_hash(prompt: &str) -> String {
     format!("{:016x}", h.finish())
 }
 
-/// Prompt to complete `property` of a `label`, with honest-decline for instance facts.
+/// Prompt to complete a scalar `property` of a `label`, with honest-decline for instance facts.
 pub fn build_prompt(label: &str, property: &str, context: &[(String, String)]) -> String {
     let mut ctx = String::new();
     for (k, v) in context {
@@ -172,6 +200,48 @@ pub fn build_prompt(label: &str, property: &str, context: &[(String, String)]) -
     )
 }
 
+/// Prompt to list the `edge_type` targets of a `label` (a relationship gap, #702).
+pub fn build_list_prompt(label: &str, mat: &Materialize, context: &[(String, String)]) -> String {
+    let mut ctx = String::new();
+    for (k, v) in context {
+        if k == ENRICHMENT_PROPERTY {
+            continue;
+        }
+        ctx.push_str(&format!("- {}: {}\n", k, v));
+    }
+    if ctx.is_empty() {
+        ctx.push_str("(no other properties known)\n");
+    }
+    format!(
+        "In an industrial-asset knowledge graph, list the {target}s that this {label} relates to \
+         via `{edge}`.\nKnown properties:\n{ctx}\n\
+         If this {label} denotes a well-known general type, output the {target}s **one per line**, \
+         short canonical names only — no numbering, bullets, prose, or blank lines. Only if this is \
+         an instance-specific relationship that cannot be inferred from general knowledge, return \
+         exactly UNKNOWN.",
+        target = mat.target_label,
+        label = label,
+        edge = mat.edge_type,
+        ctx = ctx,
+    )
+}
+
+/// Parse a newline list, stripping bullets/numbering; drops `UNKNOWN`/blank lines.
+fn parse_list(answer: &str) -> Vec<String> {
+    answer
+        .lines()
+        .map(|l| {
+            l.trim()
+                .trim_start_matches(|c: char| {
+                    c == '-' || c == '*' || c == '•' || c.is_ascii_digit() || c == '.' || c == ')' || c == ' '
+                })
+                .trim()
+                .to_string()
+        })
+        .filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case("UNKNOWN"))
+        .collect()
+}
+
 /// The enrichment worker: an LLM client + the model label for provenance.
 pub struct EnrichmentWorker {
     client: NLQClient,
@@ -183,11 +253,32 @@ impl EnrichmentWorker {
         Self { client, model }
     }
 
-    /// Fill one gap from the LLM. `context` = the node's known properties. Returns
-    /// `None` when the model declines (`UNKNOWN`) or returns nothing — never fabricates.
+    /// Fill one gap from the LLM. Returns `None` when the model declines (`UNKNOWN`) or returns
+    /// nothing — never fabricates. Relationship gaps (#702) yield a list of targets.
     pub async fn fill(&self, gap: &GapEvent, context: &[(String, String)]) -> Option<Outcome> {
-        let prompt = build_prompt(&gap.label, &gap.property, context);
         // NLQClient::generate_cypher is a generic chat call (misnamed); reuse it.
+        if let Some(mat) = &gap.materialize {
+            let prompt = build_list_prompt(&gap.label, mat, context);
+            let answer = self.client.generate_cypher(&prompt).await.ok()?;
+            if answer.trim().eq_ignore_ascii_case("UNKNOWN") {
+                return None; // honest-decline
+            }
+            let targets = parse_list(&answer);
+            if targets.is_empty() {
+                return None;
+            }
+            return Some(Outcome {
+                node_id: gap.node_id,
+                property: gap.property.clone(),
+                value: targets.join("; "),
+                confidence: LLM_DEFAULT_CONFIDENCE,
+                method: format!("llm:{}", self.model),
+                prompt_hash: prompt_hash(&prompt),
+                targets: Some(targets),
+                materialize: Some(mat.clone()),
+            });
+        }
+        let prompt = build_prompt(&gap.label, &gap.property, context);
         let answer = self.client.generate_cypher(&prompt).await.ok()?;
         let value = answer.trim();
         if value.is_empty() || value.eq_ignore_ascii_case("UNKNOWN") {
@@ -200,11 +291,13 @@ impl EnrichmentWorker {
             confidence: LLM_DEFAULT_CONFIDENCE,
             method: format!("llm:{}", self.model),
             prompt_hash: prompt_hash(&prompt),
+            targets: None,
+            materialize: None,
         })
     }
 }
 
-// ─────────────────────────── quarantine + verification (#700/#701)
+// ─────────────────────────── quarantine + verification (#700/#701/#702)
 
 fn read_enrichment_map(store: &GraphStore, node_id: NodeId) -> HashMap<String, PropertyValue> {
     match store.node_properties_merged(node_id).get(ENRICHMENT_PROPERTY) {
@@ -213,7 +306,7 @@ fn read_enrichment_map(store: &GraphStore, node_id: NodeId) -> HashMap<String, P
     }
 }
 
-/// Persist an outcome into `_enrichment.<property>` (quarantined; the real property is untouched).
+/// Persist an outcome into `_enrichment.<property>` (quarantined; the real property/graph is untouched).
 pub fn quarantine(store: &mut GraphStore, out: &Outcome) -> Result<(), String> {
     let node_id = NodeId(out.node_id);
     let mut root = read_enrichment_map(store, node_id);
@@ -224,10 +317,50 @@ pub fn quarantine(store: &mut GraphStore, out: &Outcome) -> Result<(), String> {
     entry.insert("confidence".into(), PropertyValue::Float(out.confidence));
     entry.insert("method".into(), PropertyValue::String(out.method.clone()));
     entry.insert("prompt_hash".into(), PropertyValue::String(out.prompt_hash.clone()));
+    if let (Some(targets), Some(mat)) = (&out.targets, &out.materialize) {
+        let arr: Vec<PropertyValue> = targets.iter().map(|t| PropertyValue::String(t.clone())).collect();
+        entry.insert("kind".into(), PropertyValue::String("relationship".into()));
+        entry.insert("targets".into(), PropertyValue::Array(arr));
+        entry.insert("edge_type".into(), PropertyValue::String(mat.edge_type.clone()));
+        entry.insert("target_label".into(), PropertyValue::String(mat.target_label.clone()));
+        entry.insert("target_key".into(), PropertyValue::String(mat.target_key.clone()));
+    }
     root.insert(out.property.clone(), PropertyValue::Map(entry));
     store
         .set_node_property(TENANT, node_id, ENRICHMENT_PROPERTY, PropertyValue::Map(root))
         .map_err(|e| format!("{:?}", e))
+}
+
+/// Materialize `(node)-[:edge]->(:target_label {target_key: name})` for each name, MERGE-ing
+/// target nodes by `target_key`; tags new targets `source:"LLM-derived"`. Returns edges created.
+fn materialize_edges(store: &mut GraphStore, node_id: NodeId, targets: &[String], mat: &Materialize) -> usize {
+    let tlabel = Label::new(mat.target_label.clone());
+    // Existing target name -> id (immutable phase).
+    let mut existing: HashMap<String, NodeId> = HashMap::new();
+    if let Some(ids) = store.nodes_with_label(&tlabel) {
+        let ids: Vec<NodeId> = ids.iter().copied().collect();
+        for tid in ids {
+            if let Some(PropertyValue::String(nm)) = store.node_properties_merged(tid).get(&mat.target_key) {
+                existing.insert(nm.clone(), tid);
+            }
+        }
+    }
+    let mut created = 0usize;
+    for name in targets {
+        let tid = if let Some(&id) = existing.get(name) {
+            id
+        } else {
+            let id = store.create_node(tlabel.clone());
+            let _ = store.set_node_property(TENANT, id, mat.target_key.clone(), PropertyValue::String(name.clone()));
+            let _ = store.set_node_property(TENANT, id, "source", PropertyValue::String("LLM-derived".into()));
+            existing.insert(name.clone(), id);
+            id
+        };
+        if store.create_edge(node_id, tid, mat.edge_type.clone()).is_ok() {
+            created += 1;
+        }
+    }
+    created
 }
 
 /// Report from a verification pass.
@@ -235,11 +368,12 @@ pub fn quarantine(store: &mut GraphStore, out: &Outcome) -> Result<(), String> {
 pub struct VerifyReport {
     pub nodes_processed: usize,
     pub promoted: usize,
+    pub edges_materialized: usize,
     pub still_pending: usize,
 }
 
-/// Verify+promote pending enrichments on the given nodes: for each pending property
-/// whose confidence clears its `trust_floor`, set the real property and mark it verified.
+/// Verify+promote pending enrichments on the given nodes: scalar values become the real property;
+/// relationship values (#702) materialize `(node)-[:edge]->(target)` subgraphs — both gated on `trust_floor`.
 pub fn verify(config: &EnrichConfig, store: &mut GraphStore, node_ids: &[NodeId]) -> VerifyReport {
     let mut rep = VerifyReport::default();
     for &id in node_ids {
@@ -248,7 +382,6 @@ pub fn verify(config: &EnrichConfig, store: &mut GraphStore, node_ids: &[NodeId]
             continue;
         }
         rep.nodes_processed += 1;
-        // Which label does this node carry that has a policy? Use the first matching.
         let label = store.get_node(id).and_then(|n| {
             config
                 .policies
@@ -256,7 +389,8 @@ pub fn verify(config: &EnrichConfig, store: &mut GraphStore, node_ids: &[NodeId]
                 .find(|l| n.has_label(&Label::new((*l).clone())))
                 .cloned()
         });
-        let mut promotions: Vec<(String, String)> = Vec::new(); // (property, value)
+        let mut scalar_promotions: Vec<(String, String)> = Vec::new();
+        let mut rel_promotions: Vec<(String, Vec<String>, Materialize)> = Vec::new();
         for (property, entry) in root.iter() {
             let PropertyValue::Map(e) = entry else { continue };
             let status = match e.get("status") {
@@ -274,26 +408,43 @@ pub fn verify(config: &EnrichConfig, store: &mut GraphStore, node_ids: &[NodeId]
                 .as_deref()
                 .and_then(|l| config.trust_floor_for(l, property))
                 .unwrap_or(0.0);
-            if confidence >= floor {
-                if let Some(PropertyValue::String(v)) = e.get("value") {
-                    promotions.push((property.clone(), v.clone()));
-                }
-            } else {
+            if confidence < floor {
                 rep.still_pending += 1;
+                continue;
+            }
+            let is_rel = matches!(e.get("kind"), Some(PropertyValue::String(k)) if k == "relationship");
+            if is_rel {
+                if let (Some(PropertyValue::Array(arr)), Some(PropertyValue::String(edge)),
+                        Some(PropertyValue::String(tl)), Some(PropertyValue::String(tk))) =
+                    (e.get("targets"), e.get("edge_type"), e.get("target_label"), e.get("target_key"))
+                {
+                    let targets: Vec<String> = arr
+                        .iter()
+                        .filter_map(|v| if let PropertyValue::String(s) = v { Some(s.clone()) } else { None })
+                        .collect();
+                    rel_promotions.push((property.clone(), targets, Materialize {
+                        edge_type: edge.clone(), target_label: tl.clone(), target_key: tk.clone(),
+                    }));
+                }
+            } else if let Some(PropertyValue::String(v)) = e.get("value") {
+                scalar_promotions.push((property.clone(), v.clone()));
             }
         }
-        for (property, value) in promotions {
-            // Promote onto the real property.
-            if store
-                .set_node_property(TENANT, id, property.clone(), PropertyValue::String(value))
-                .is_ok()
-            {
-                // Mark the quarantined entry verified (retain provenance).
+        for (property, value) in scalar_promotions {
+            if store.set_node_property(TENANT, id, property.clone(), PropertyValue::String(value)).is_ok() {
                 if let Some(PropertyValue::Map(e)) = root.get_mut(&property) {
                     e.insert("status".into(), PropertyValue::String("verified".into()));
                 }
                 rep.promoted += 1;
             }
+        }
+        for (property, targets, mat) in rel_promotions {
+            let n = materialize_edges(store, id, &targets, &mat);
+            rep.edges_materialized += n;
+            if let Some(PropertyValue::Map(e)) = root.get_mut(&property) {
+                e.insert("status".into(), PropertyValue::String("verified".into()));
+            }
+            rep.promoted += 1;
         }
         let _ = store.set_node_property(TENANT, id, ENRICHMENT_PROPERTY, PropertyValue::Map(root));
     }
@@ -318,7 +469,12 @@ pub fn worker_from_env() -> Result<EnrichmentWorker, String> {
         model: model.clone(),
         api_key: std::env::var("OPENAI_API_KEY").ok(),
         api_base_url: std::env::var("NLQ_API_BASE_URL").ok(),
-        system_prompt: None,
+        // Neutral domain prompt — the NLQ client otherwise defaults to "You are a Cypher
+        // expert", which biases enrichment answers toward Cypher instead of facts.
+        system_prompt: Some(
+            "You are a precise industrial asset-management domain expert. Answer factually \
+             and follow the requested output format exactly.".to_string(),
+        ),
     };
     let client = NLQClient::new(&config).map_err(|e| e.to_string())?;
     Ok(EnrichmentWorker::new(client, model))
