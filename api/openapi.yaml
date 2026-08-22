@@ -554,6 +554,48 @@ paths:
                     type: integer
                   still_pending:
                     type: integer
+  /api/nlq:
+    post:
+      operationId: naturalLanguageQuery
+      summary: Translate a natural-language question into read-only Cypher
+      description: |
+        Translate a natural-language question into a read-only OpenCypher query using
+        a configured LLM provider. NLQ must be enabled via environment
+        (`NLQ_MODEL`, `OPENAI_API_KEY`, optional `NLQ_API_BASE_URL`). Returns the
+        generated Cypher only; execute it with `/api/query`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - question
+              properties:
+                question:
+                  type: string
+                  description: The natural-language question to translate.
+            examples:
+              ask:
+                summary: Ask for equipment by work-order count
+                value:
+                  question: "Which chillers have more than 100 work orders?"
+      responses:
+        '200':
+          description: Cypher generated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cypher:
+                    type: string
+        '400':
+          description: NLQ disabled or generation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
 components:
   schemas:
