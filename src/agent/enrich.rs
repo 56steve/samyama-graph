@@ -511,3 +511,48 @@ pub fn global_config() -> &'static std::sync::RwLock<EnrichConfig> {
     static G: std::sync::OnceLock<std::sync::RwLock<EnrichConfig>> = std::sync::OnceLock::new();
     G.get_or_init(|| std::sync::RwLock::new(EnrichConfig::default()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mat(vocabulary: Option<serde_json::Value>) -> Materialize {
+        Materialize {
+            edge_type: "MONITORS".to_string(),
+            target_label: "FailureMode".to_string(),
+            target_key: "name".to_string(),
+            vocabulary,
+        }
+    }
+
+    #[test]
+    fn list_prompt_injects_org_vocabulary_when_set() {
+        let vocab = serde_json::json!({ "Supply Temperature": ["Evaporator Water side fouling"] });
+        let ctx = vec![("name".to_string(), "Chiller 7 Supply Temperature".to_string())];
+        let p = build_list_prompt("Sensor", &mat(Some(vocab)), &ctx);
+        // tier 1: org taxonomy is presented with its exact strings
+        assert!(p.contains("approved taxonomy"), "tiered vocab instruction missing:\n{p}");
+        assert!(p.contains("Evaporator Water side fouling"), "org vocab strings missing:\n{p}");
+        // tier 2: LLM fallback where the taxonomy is silent
+        assert!(p.contains("fall back to general domain knowledge"), "LLM-fallback tier missing:\n{p}");
+    }
+
+    #[test]
+    fn list_prompt_omits_vocabulary_block_when_none() {
+        let ctx = vec![("name".to_string(), "Chiller 7 Supply Temperature".to_string())];
+        let p = build_list_prompt("Sensor", &mat(None), &ctx);
+        assert!(!p.contains("approved taxonomy"), "vocab block should be absent when None:\n{p}");
+    }
+
+    #[test]
+    fn parse_list_strips_bullets_and_drops_unknown() {
+        let got = parse_list("- Evaporator Water side fouling\n2) Condenser Water side fouling\nUNKNOWN\n\n");
+        assert_eq!(
+            got,
+            vec![
+                "Evaporator Water side fouling".to_string(),
+                "Condenser Water side fouling".to_string(),
+            ]
+        );
+    }
+}
