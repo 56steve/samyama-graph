@@ -18,6 +18,7 @@ This guide explains how to get set up and how to get a change merged.
 - [Opening a Pull Request](#opening-a-pull-request)
 - [Where to Start](#where-to-start)
 - [Project Layout](#project-layout)
+- [Releasing](#releasing)
 
 ## Code of Conduct
 
@@ -246,6 +247,89 @@ examples/          # Runnable demos and data loaders
 tests/             # Integration tests
 docs/              # Architecture docs, ADRs, compatibility notes
 ```
+
+## Releasing
+
+Releases publish six crates to crates.io and the `samyama` package to PyPI. A
+merge to `main` never publishes anything — CI validates, a published GitHub
+Release publishes.
+
+### Versioning
+
+Every crate shares one version, defined once in `[workspace.package]` in the
+root `Cargo.toml` and inherited via `version.workspace = true`. `sdk/python` is
+its own cargo workspace (it is in the root `exclude` list) so it cannot inherit;
+its `Cargo.toml` and `pyproject.toml` must be bumped by hand to the same number.
+
+The publish workflow refuses to run if those three numbers disagree, or if they
+disagree with the release tag. Registries do not allow a version to be
+published twice, so this is checked before anything is uploaded rather than
+discovered halfway through.
+
+### Cutting a release
+
+1. Bump `[workspace.package] version` in the root `Cargo.toml`, and the same
+   number in `sdk/python/Cargo.toml` and `sdk/python/pyproject.toml`.
+2. Open a PR, let CI pass, merge.
+3. Tag `vX.Y.Z` — matching the manifest version exactly, `v` prefix included.
+4. Publish a GitHub Release for that tag.
+5. `publish-crate.yml` and `publish-pypi.yml` run automatically.
+
+The two publishing workflows are independent. If crates.io succeeds and PyPI
+fails, rerun the PyPI workflow — there is no need to cut a new version.
+
+### Crate publish order
+
+crates.io resolves every path dependency's `version` against the real index, so
+a crate cannot even be *packaged* until everything it depends on is published —
+optional dependencies included. `publish-crate.yml` walks this order:
+
+```
+samyama-gpu → samyama-optimization → samyama-graph-algorithms
+  → samyama → samyama-sdk → samyama-cli
+```
+
+For the same reason the dry run cannot be hoisted into a single pass over all
+six: crate N only resolves once crate N-1 is genuinely on the index. Each crate
+is validated immediately before it is uploaded.
+
+### Python wheels
+
+`sdk/python` is a PyO3 extension, so every platform needs a compiled wheel. It
+builds with `abi3-py38`, so one wheel per platform serves CPython 3.8+ and the
+matrix has no Python-version axis. `publish-pypi.yml` builds manylinux
+x86_64/aarch64, macOS x86_64/arm64, Windows x64, plus an sdist.
+
+The sdist is self-contained: maturin walks up to the repository root and
+vendors the whole cargo workspace into it, `crates/` sources included, so
+building from it does not require the crates to be on crates.io. It is around
+4 MB. Installing from it still needs a Rust toolchain on the target machine,
+which is why the wheel matrix matters.
+
+### Credentials
+
+| Registry | Mechanism | Where |
+|---|---|---|
+| PyPI | Trusted Publishing (GitHub OIDC) | `pypi` environment — no stored token |
+| crates.io | `CARGO_REGISTRY_TOKEN` | `crates` environment |
+
+PyPI's trusted publisher is bound to the repository, the workflow filename and
+the environment name, so renaming any of them means reconfiguring it on PyPI.
+
+### Trying it without publishing
+
+Both workflows accept `workflow_dispatch`. `publish-crate.yml` takes a
+`dry_run` input (default on) that packages and validates every crate without
+uploading. `publish-pypi.yml` takes a `target` input — `testpypi`, `pypi`, or
+`none` to build the wheels and upload nothing.
+
+Locally:
+
+```bash
+cargo package -p samyama-optimization      # any crate whose deps are published
+cd sdk/python && maturin build --release   # a wheel for the current platform
+```
+
 
 ---
 

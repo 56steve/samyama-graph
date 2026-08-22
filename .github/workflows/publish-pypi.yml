@@ -1,0 +1,158 @@
+name: Publish Python SDK to PyPI
+
+# Builds and publishes the `samyama` Python package (sdk/python) when a GitHub
+# Release is published.
+#
+# Before this existed, PyPI was updated by hand and showed it: the entire
+# published history was 0.6.0 and 0.6.1, each a single
+# macosx_11_0_x86_64 / CPython-3.12 wheel uploaded from a laptop. Every other
+# platform fell through to the sdist and had to compile RocksDB from source.
+#
+# The package is a PyO3 extension, so it needs a compiled wheel per platform.
+# It is built with abi3-py38 (see sdk/python/Cargo.toml), which makes one wheel
+# per platform valid for CPython 3.8+ — without it this matrix would carry a
+# Python-version axis as well.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Where to upload"
+        type: choice
+        options: [testpypi, pypi, none]
+        default: testpypi
+
+env:
+  PYTHON_SDK_DIR: sdk/python
+
+jobs:
+  wheels:
+    name: wheel (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-latest
+            target: x86_64
+            manylinux: auto
+          # The one most likely to need attention: this cross-compiles RocksDB's
+          # C++ through the manylinux cross image. If it proves unworkable,
+          # dropping this entry costs aarch64 Linux users the wheel, not the
+          # package — they fall back to the sdist, which is buildable (see the
+          # sdist job).
+          - platform: linux-aarch64
+            runner: ubuntu-latest
+            target: aarch64
+            manylinux: auto
+          # manylinux is meaningless off Linux, but every entry sets it so the
+          # action never receives an empty string for an input it expects unset.
+          - platform: macos-x86_64
+            runner: macos-13
+            target: x86_64
+            manylinux: "off"
+          - platform: macos-aarch64
+            runner: macos-14
+            target: aarch64
+            manylinux: "off"
+          - platform: windows-x64
+            runner: windows-latest
+            target: x64
+            manylinux: "off"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: ${{ env.PYTHON_SDK_DIR }}
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist
+          sccache: "true"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.platform }}
+          path: ${{ env.PYTHON_SDK_DIR }}/dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # maturin walks up to the repository root and vendors the whole cargo
+      # workspace into the sdist — the crates/ sources included — so it is
+      # self-contained and does not need samyama-sdk to be on crates.io first.
+      # Verified locally: ~4 MB, carrying 59 vendored crate sources plus the
+      # samyama_mcp Python package.
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: ${{ env.PYTHON_SDK_DIR }}
+          command: sdist
+          args: --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: ${{ env.PYTHON_SDK_DIR }}/dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish to ${{ github.event_name == 'release' && 'PyPI' || inputs.target }}
+    needs: [wheels, sdist]
+    if: github.event_name == 'release' || inputs.target != 'none'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Trusted Publishing: PyPI verifies a short-lived OIDC token naming this
+    # repo, this workflow file and this environment. No long-lived API token is
+    # stored anywhere in GitHub. The environment name is part of what PyPI
+    # checks, so renaming it means reconfiguring the trusted publisher.
+    environment: ${{ github.event_name == 'release' && 'pypi' || inputs.target }}
+    permissions:
+      id-token: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      # Two steps rather than one with a computed repository-url: the action
+      # defaults to PyPI when the input is absent, and feeding it an empty
+      # string is not the same as omitting it.
+      #
+      # `skip-existing` because a rerun after a partial failure should top up
+      # what is missing rather than abort on the files that already landed. A
+      # registry rejecting a re-upload of an identical file is not an error here.
+      - name: Publish to TestPyPI
+        if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+      - name: Publish to PyPI
+        if: github.event_name == 'release' || inputs.target == 'pypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          skip-existing: true
