@@ -20,6 +20,7 @@ use super::handler::{
     import_csv_handler, import_json_handler,
     export_snapshot_handler, restore_snapshot_handler,
     set_enrich_policy_handler, enrich_handler, verify_handler,
+    nlq_handler,
 };
 use super::vector::{list_indexes_handler, create_index_handler, search_handler};
 
@@ -169,6 +170,7 @@ impl HttpServer {
             .route("/api/enrich/policy", post(set_enrich_policy_handler))
             .route("/api/enrich", post(enrich_handler))
             .route("/api/verify", post(verify_handler))
+            .route("/api/nlq", post(nlq_handler))
             .route("/api/status", get(status_handler))
             .route("/api/schema", get(schema_handler))
             .route("/api/sample", post(sample_handler))
