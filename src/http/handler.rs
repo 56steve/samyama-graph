@@ -796,6 +796,75 @@ pub async fn restore_snapshot_handler(
     }
 }
 
+/// Request for a natural-language query (NLQ -> Cypher). Epic #696, step #697.
+#[derive(Deserialize)]
+pub struct NlqRequest {
+    pub question: String,
+}
+
+/// POST /api/nlq -- translate a natural-language question into read-only Cypher using the
+/// schema-grounded NLQ pipeline, and return it. Execution is left to the caller (`/api/query`)
+/// so this stays a thin, side-effect-free translation endpoint.
+///
+/// LLM config is read from the environment: `NLQ_PROVIDER` (default `openai`), `NLQ_MODEL`
+/// (default `gpt-4o`), `OPENAI_API_KEY`, optional `NLQ_API_BASE_URL`. `text_to_cypher`
+/// already rejects any generated query that contains write operations.
+pub async fn nlq_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<NlqRequest>,
+) -> impl IntoResponse {
+    use crate::nlq::NLQPipeline;
+    use crate::persistence::tenant::{NLQConfig, LLMProvider};
+
+    let provider = match std::env::var("NLQ_PROVIDER")
+        .unwrap_or_default()
+        .to_lowercase()
+        .as_str()
+    {
+        "ollama" => LLMProvider::Ollama,
+        "gemini" => LLMProvider::Gemini,
+        "anthropic" => LLMProvider::Anthropic,
+        "azure" | "azureopenai" => LLMProvider::AzureOpenAI,
+        "mock" => LLMProvider::Mock,
+        _ => LLMProvider::OpenAI,
+    };
+    let config = NLQConfig {
+        enabled: true,
+        provider,
+        model: std::env::var("NLQ_MODEL").unwrap_or_else(|_| "gpt-4o".to_string()),
+        api_key: std::env::var("OPENAI_API_KEY").ok(),
+        api_base_url: std::env::var("NLQ_API_BASE_URL").ok(),
+        system_prompt: None,
+    };
+
+    let pipeline = match NLQPipeline::new(config) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    // Snapshot the schema summary and drop the read guard before the async LLM call.
+    let schema = {
+        let store_guard = state.store.read().await;
+        store_guard.schema_summary()
+    };
+
+    match pipeline.text_to_cypher(&payload.question, &schema).await {
+        Ok(cypher) => (StatusCode::OK, Json(json!({ "cypher": cypher }))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
