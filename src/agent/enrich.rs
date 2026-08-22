@@ -51,6 +51,12 @@ pub struct Materialize {
     pub target_label: String,
     #[serde(default = "default_target_key")]
     pub target_key: String,
+    /// Optional org-supplied controlled vocabulary (e.g. a sensor-type → failure-mode
+    /// taxonomy the org already maintains). When set, the fill prompt prefers these exact
+    /// names for types the taxonomy covers and falls back to the LLM's general knowledge
+    /// only where the taxonomy is silent — tiered grounding, not a per-node answer key.
+    #[serde(default)]
+    pub vocabulary: Option<serde_json::Value>,
 }
 
 /// Per-`(label, property)` policy. An empty-source spec is declared-but-inert.
@@ -212,17 +218,35 @@ pub fn build_list_prompt(label: &str, mat: &Materialize, context: &[(String, Str
     if ctx.is_empty() {
         ctx.push_str("(no other properties known)\n");
     }
+    // Tiered grounding: prefer the org's own taxonomy where it covers this type, and lean on
+    // the LLM's general knowledge only where the taxonomy is silent.
+    let vocab_block = match &mat.vocabulary {
+        Some(v) => {
+            let pretty = serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string());
+            format!(
+                "The organization maintains an approved taxonomy mapping each {label} type to its \
+                 {target}s (JSON):\n{vocab}\n\
+                 Find the entry whose key best matches this {label}'s type from the known properties \
+                 above and output ONLY those exact {target} names, verbatim. If no taxonomy entry \
+                 matches this {label}, fall back to general domain knowledge for well-known types.\n",
+                label = label,
+                target = mat.target_label,
+                vocab = pretty,
+            )
+        }
+        None => String::new(),
+    };
     format!(
         "In an industrial-asset knowledge graph, list the {target}s that this {label} relates to \
-         via `{edge}`.\nKnown properties:\n{ctx}\n\
-         If this {label} denotes a well-known general type, output the {target}s **one per line**, \
-         short canonical names only — no numbering, bullets, prose, or blank lines. Only if this is \
-         an instance-specific relationship that cannot be inferred from general knowledge, return \
-         exactly UNKNOWN.",
+         via `{edge}`.\nKnown properties:\n{ctx}\n{vocab_block}\
+         Output the {target}s **one per line**, short canonical names only — no numbering, bullets, \
+         prose, or blank lines. Only if this is an instance-specific relationship that cannot be \
+         inferred from the taxonomy or general knowledge, return exactly UNKNOWN.",
         target = mat.target_label,
         label = label,
         edge = mat.edge_type,
         ctx = ctx,
+        vocab_block = vocab_block,
     )
 }
 
@@ -424,6 +448,7 @@ pub fn verify(config: &EnrichConfig, store: &mut GraphStore, node_ids: &[NodeId]
                         .collect();
                     rel_promotions.push((property.clone(), targets, Materialize {
                         edge_type: edge.clone(), target_label: tl.clone(), target_key: tk.clone(),
+                        vocabulary: None,
                     }));
                 }
             } else if let Some(PropertyValue::String(v)) = e.get("value") {
