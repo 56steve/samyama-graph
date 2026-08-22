@@ -796,6 +796,117 @@ pub async fn restore_snapshot_handler(
     }
 }
 
+// ─────────────────────────── governed GAK endpoints (epic #696: #699-#701)
+use crate::agent::enrich::{self, EnrichConfig};
+
+/// Request carrying a Cypher query that surfaces the nodes to act on.
+#[derive(Deserialize)]
+pub struct EnrichRequest {
+    pub query: String,
+}
+
+/// POST /api/enrich/policy — set the single-graph enrichment policy (`EnrichConfig`).
+pub async fn set_enrich_policy_handler(Json(cfg): Json<EnrichConfig>) -> impl IntoResponse {
+    let declared: usize = cfg.policies.values().map(|m| m.len()).sum();
+    *enrich::global_config().write().unwrap() = cfg;
+    (StatusCode::OK, Json(json!({ "status": "ok", "declared_properties": declared }))).into_response()
+}
+
+/// POST /api/enrich — run `query` to surface nodes, detect declared-enrichable gaps on them,
+/// fill each from the LLM, and **quarantine** under `_enrichment` (honest-decline on UNKNOWN).
+/// Real properties are untouched until POST /api/verify.
+pub async fn enrich_handler(
+    State(state): State<AppState>,
+    Json(req): Json<EnrichRequest>,
+) -> impl IntoResponse {
+    let cfg = enrich::global_config().read().unwrap().clone();
+
+    // Read phase: nothing async is awaited while the store guard or the (non-Send) batch lives.
+    let (gaps, ctxs) = {
+        let store = state.store.read().await;
+        let batch = match state.engine.execute(&req.query, &*store) {
+            Ok(b) => b,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, Json(json!({ "error": format!("{:?}", e) }))).into_response();
+            }
+        };
+        let nodes = enrich::collect_result_nodes(&batch);
+        let gaps = enrich::detect_gaps(&cfg, &store, &nodes);
+        let mut ctxs: HashMap<u64, Vec<(String, String)>> = HashMap::new();
+        for g in &gaps {
+            let props = store.node_properties_merged(crate::graph::NodeId(g.node_id));
+            let ctx: Vec<(String, String)> = props
+                .iter()
+                .map(|(k, v)| {
+                    let sv = match v {
+                        PropertyValue::String(s) => s.clone(),
+                        other => format!("{:?}", other),
+                    };
+                    (k.clone(), sv)
+                })
+                .collect();
+            ctxs.insert(g.node_id, ctx);
+        }
+        (gaps, ctxs)
+    };
+
+    // Fill phase: async LLM calls, no locks held.
+    let worker = match enrich::worker_from_env() {
+        Ok(w) => w,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
+    };
+    let mut outcomes = Vec::new();
+    let mut declined = 0usize;
+    for g in &gaps {
+        let ctx = ctxs.get(&g.node_id).cloned().unwrap_or_default();
+        match worker.fill(g, &ctx).await {
+            Some(o) => outcomes.push(o),
+            None => declined += 1,
+        }
+    }
+
+    // Write phase: quarantine.
+    let mut filled = 0usize;
+    {
+        let mut store = state.store.write().await;
+        for o in &outcomes {
+            if enrich::quarantine(&mut store, o).is_ok() {
+                filled += 1;
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({ "gaps": gaps.len(), "filled": filled, "declined": declined })),
+    )
+        .into_response()
+}
+
+/// POST /api/verify — promote pending enrichments on the nodes `query` surfaces, iff each
+/// clears its spec's `trust_floor`; sets the real property, retains provenance.
+pub async fn verify_handler(
+    State(state): State<AppState>,
+    Json(req): Json<EnrichRequest>,
+) -> impl IntoResponse {
+    let cfg = enrich::global_config().read().unwrap().clone();
+    let node_ids = {
+        let store = state.store.read().await;
+        let batch = match state.engine.execute(&req.query, &*store) {
+            Ok(b) => b,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, Json(json!({ "error": format!("{:?}", e) }))).into_response();
+            }
+        };
+        enrich::collect_result_nodes(&batch)
+    };
+    let report = {
+        let mut store = state.store.write().await;
+        enrich::verify(&cfg, &mut store, &node_ids)
+    };
+    (StatusCode::OK, Json(report)).into_response()
+}
+
 /// Request for a natural-language query (NLQ -> Cypher). Epic #696, step #697.
 #[derive(Deserialize)]
 pub struct NlqRequest {

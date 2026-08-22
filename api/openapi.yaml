@@ -444,6 +444,116 @@ paths:
         '200':
           description: The snapshot was imported
 
+  /api/enrich/policy:
+    post:
+      operationId: setEnrichPolicy
+      summary: Declare the governed enrichment (GAK) policy
+      description: |
+        Declare the Generation-Augmented Knowledge (GAK) policy: which node
+        properties the LLM may fill, the trust floor each must clear for promotion,
+        and any subgraph (edge) materialisation specs. Declared but unfilled
+        properties become the gaps that `/api/enrich` detects.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: >
+                The governed policy. `specs` lists per-label property gaps to fill;
+                a `materialize` block turns a filled list into real nodes and edges.
+            examples:
+              scalarAndSubgraph:
+                summary: A scalar property plus a MONITORS-edge subgraph spec
+                value:
+                  specs:
+                    - label: "Sensor"
+                      property: "monitored_failure_modes"
+                      trust_floor: 0.6
+                      materialize:
+                        edge_type: "MONITORS"
+                        target_label: "FailureMode"
+                        target_key: "name"
+      responses:
+        '200':
+          description: Policy accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  declared_properties:
+                    type: integer
+
+  /api/enrich:
+    post:
+      operationId: enrich
+      summary: Run governed enrichment over a query's surfaced nodes
+      description: |
+        Execute a Cypher query, detect declared-but-null property gaps on the
+        surfaced nodes, fill each with a single LLM call, and quarantine the result
+        under `_enrichment` with provenance. Honest-decline: an UNKNOWN answer writes
+        nothing. Promotion into the live property happens only at `/api/verify`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - query
+              properties:
+                query:
+                  type: string
+                  description: The Cypher query whose surfaced nodes are enriched.
+      responses:
+        '200':
+          description: Enrichment completed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  gaps:
+                    type: integer
+                  filled:
+                    type: integer
+                  declined:
+                    type: integer
+        '400':
+          description: Query or enrichment error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/verify:
+    post:
+      operationId: verifyEnrichment
+      summary: Promote quarantined enrichments that clear the trust floor
+      description: |
+        Walk quarantined `_enrichment` values, promote each whose confidence meets
+        the policy trust floor into the live property, and materialise any declared
+        subgraph edges (for example MONITORS edges to FailureMode nodes). Values
+        below the floor stay pending.
+      responses:
+        '200':
+          description: Verification completed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  nodes_processed:
+                    type: integer
+                  promoted:
+                    type: integer
+                  edges_materialized:
+                    type: integer
+                  still_pending:
+                    type: integer
   /api/nlq:
     post:
       operationId: naturalLanguageQuery
