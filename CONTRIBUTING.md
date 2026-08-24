@@ -250,48 +250,74 @@ docs/              # Architecture docs, ADRs, compatibility notes
 
 ## Releasing
 
-Releases publish six crates to crates.io and the `samyama` package to PyPI. A
-merge to `main` never publishes anything — CI validates, a published GitHub
-Release publishes.
+Releases publish three of the six workspace crates to crates.io, the
+`samyama` package to PyPI, the `samyama-sdk` package to npm, and a multi-arch
+Docker image to GHCR. A merge to `main` never publishes anything on its own —
+CI validates, a published GitHub Release publishes. Cutting that Release is
+itself two GitHub Actions runs, not a manual `git tag`.
 
 ### Versioning
 
 Every crate shares one version, defined once in `[workspace.package]` in the
-root `Cargo.toml` and inherited via `version.workspace = true`. `sdk/python` is
-its own cargo workspace (it is in the root `exclude` list) so it cannot inherit;
-its `Cargo.toml` and `pyproject.toml` must be bumped by hand to the same number.
+root `Cargo.toml` and inherited via `version.workspace = true`. `sdk/python`
+and `sdk/typescript` are outside the cargo workspace (`sdk/python` is in the
+root `exclude` list; `sdk/typescript` isn't cargo at all) so neither can
+inherit — both are bumped to the same number by hand, or by
+`prepare-release.yml` below.
 
-The publish workflow refuses to run if those three numbers disagree, or if they
-disagree with the release tag. Registries do not allow a version to be
+Every publish workflow refuses to run if these numbers disagree with each
+other or with the release tag. Registries do not allow a version to be
 published twice, so this is checked before anything is uploaded rather than
 discovered halfway through.
 
 ### Cutting a release
 
-1. Bump `[workspace.package] version` in the root `Cargo.toml`, and the same
-   number in `sdk/python/Cargo.toml` and `sdk/python/pyproject.toml`.
-2. Open a PR, let CI pass, merge.
-3. Tag `vX.Y.Z` — matching the manifest version exactly, `v` prefix included.
-4. Publish a GitHub Release for that tag.
-5. `publish-crate.yml` and `publish-pypi.yml` run automatically.
+1. **Actions → Prepare Release → Run workflow**, enter the new version (e.g.
+   `1.7.2`, no `v`). This bumps all three version sources, refreshes
+   `Cargo.lock`, and opens a PR titled `release: v1.7.2`.
+2. Review and merge that PR like any other — it changes nothing but version
+   numbers and the lockfile.
+3. The merge itself is the trigger: `tag-release.yml` sees the new,
+   never-tagged version on `main`, re-checks that all three sources still
+   agree, tags `v1.7.2`, and publishes a GitHub Release with generated notes.
+4. That Release fires `publish-crate.yml`, `publish-pypi.yml`,
+   `publish-npm.yml`, and `publish-docker.yml` — in parallel, unattended.
 
-The two publishing workflows are independent. If crates.io succeeds and PyPI
-fails, rerun the PyPI workflow — there is no need to cut a new version.
+No one runs `git tag` or fills in the GitHub Release form by hand. If any one
+publish workflow fails, rerun that workflow alone — there is no need to cut
+another release, and every one of the four is safe to rerun (each skips or
+`--skip-existing`s whatever already landed).
 
-### Crate publish order
+**RELEASE_PAT.** A PR opened by `prepare-release.yml`'s default token sits in
+GitHub's "approval-required" state and never fires `ci.yml`'s own
+`pull_request` trigger — the very check branch protection requires before
+merge. Add a fine-grained PAT scoped to this repo only, with `Contents: write`
++ `Pull requests: write` and nothing else, as the `RELEASE_PAT` secret, and
+that goes away. Without it the workflow still runs and the PR still opens —
+someone just has to click "approve and run" on the CI check once per release.
 
-crates.io resolves every path dependency's `version` against the real index, so
-a crate cannot even be *packaged* until everything it depends on is published —
-optional dependencies included. `publish-crate.yml` walks this order:
+### crates.io scope and publish order
+
+Only `samyama-gpu`, `samyama-optimization`, and `samyama-graph-algorithms` are
+published. `samyama`, `samyama-sdk`, and `samyama-cli` are deliberately not:
+crates.io names can be yanked but never released back, and none of the three
+had any external consumer as of this decision (0 reverse dependencies on the
+two crates that do exist — see samyama-cloud#146). Revisit if a real consumer
+asks for `cargo add samyama-sdk` or `cargo install samyama-cli`.
+
+crates.io resolves every path dependency's `version` against the real index,
+so a crate cannot even be *packaged* until everything it depends on is
+published — optional dependencies included. `samyama-graph-algorithms` has a
+path dependency on `samyama-gpu`, so gpu publishes first regardless of the
+`gpu` feature being off by default:
 
 ```
 samyama-gpu → samyama-optimization → samyama-graph-algorithms
-  → samyama → samyama-sdk → samyama-cli
 ```
 
 For the same reason the dry run cannot be hoisted into a single pass over all
-six: crate N only resolves once crate N-1 is genuinely on the index. Each crate
-is validated immediately before it is uploaded.
+three: crate N only resolves once crate N-1 is genuinely on the index. Each
+crate is validated immediately before it is uploaded.
 
 ### Python wheels
 
@@ -306,28 +332,61 @@ building from it does not require the crates to be on crates.io. It is around
 4 MB. Installing from it still needs a Rust toolchain on the target machine,
 which is why the wheel matrix matters.
 
+### TypeScript SDK
+
+`sdk/typescript` is pure TypeScript with no native binding, so there is no
+platform matrix — one build, one package. `publish-npm.yml` builds and
+publishes it as `samyama-sdk` on npm.
+
+### Docker image
+
+`publish-docker.yml` builds `ghcr.io/samyama-ai/samyama-graph` for
+linux/amd64 and linux/arm64 and runs a real smoke test — starts the container
+and executes a Cypher query through the RESP protocol — before the run is
+considered successful. It only fires on a semver tag (`refs/tags/v*`), so the
+data-release tags this repo also uses (`kg-snapshots-*`) don't produce a
+misleading image build.
+
+GHCR packages default to **private** on first publish. Flip
+`ghcr.io/samyama-ai/samyama-graph` to public in the package settings after the
+first real release, or `docker pull` fails for anyone not authenticated.
+
 ### Credentials
 
 | Registry | Mechanism | Where |
 |---|---|---|
 | PyPI | Trusted Publishing (GitHub OIDC) | `pypi` environment — no stored token |
-| crates.io | `CARGO_REGISTRY_TOKEN` | `crates` environment |
+| crates.io | Trusted Publishing (GitHub OIDC via `rust-lang/crates-io-auth-action`) | `crates` environment — no stored token |
+| npm | Trusted Publishing (GitHub OIDC) | `npm` environment — no stored token |
+| GHCR | `GITHUB_TOKEN` (built in) | — |
+| release PRs | `RELEASE_PAT` (optional; see above) | repo secret |
 
-PyPI's trusted publisher is bound to the repository, the workflow filename and
-the environment name, so renaming any of them means reconfiguring it on PyPI.
+No registry credential is a stored, long-lived secret. That is a direct fix
+for how this pipeline broke the first time: `CRATES_IO_TOKEN` went stale in
+April, every release after that failed on `403 Forbidden`, and nobody
+noticed for four months because nothing was watching the token's expiry.
+OIDC has no expiry to miss.
+
+Each trusted publisher is registered on the registry's side (PyPI, crates.io,
+npm), naming this exact repository, workflow filename, and environment. All
+three fields are matched exactly — renaming a workflow file or an environment
+means re-registering it there.
 
 ### Trying it without publishing
 
-Both workflows accept `workflow_dispatch`. `publish-crate.yml` takes a
-`dry_run` input (default on) that packages and validates every crate without
+Every publish workflow accepts `workflow_dispatch`. `publish-crate.yml` and
+`publish-npm.yml` take a `dry_run` input (default on) that validates without
 uploading. `publish-pypi.yml` takes a `target` input — `testpypi`, `pypi`, or
-`none` to build the wheels and upload nothing.
+`none`. `publish-docker.yml` and `prepare-release.yml`/`tag-release.yml` are
+safe to dispatch directly; the former only pushes on a real tag ref, and
+cutting a release always stops at a PR for review.
 
 Locally:
 
 ```bash
 cargo package -p samyama-optimization      # any crate whose deps are published
 cd sdk/python && maturin build --release   # a wheel for the current platform
+cd sdk/typescript && npm publish --dry-run # validates without needing to be logged in
 ```
 
 

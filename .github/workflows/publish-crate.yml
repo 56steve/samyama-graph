@@ -1,6 +1,16 @@
 name: Publish Crates to crates.io
 
-# Publishes the six public crates when a GitHub Release is published.
+# Publishes three of the six workspace crates when a GitHub Release is
+# published: samyama-gpu, samyama-optimization, samyama-graph-algorithms.
+#
+# samyama, samyama-sdk and samyama-cli are deliberately NOT published here.
+# crates.io names cannot be released once claimed — only yanked — and none of
+# the three have external consumers today (0 reverse dependencies on the two
+# crates that do exist; see samyama-cloud#146). samyama-gpu is not optional:
+# samyama-graph-algorithms carries a path dependency on it, and cargo resolves
+# path dependency `version`s against the real index even when the feature
+# gating them is off, so algorithms cannot be *packaged* until gpu is on the
+# registry.
 #
 # Why `published` and not `created`: `created` also fires for drafts, so a
 # half-written release note could ship a version. `published` is the one
@@ -8,6 +18,11 @@ name: Publish Crates to crates.io
 #
 # Normal pushes and merges never reach this workflow — ci.yml validates, this
 # publishes. That separation is deliberate: not every commit is a release.
+#
+# Auth is crates.io Trusted Publishing (OIDC) — see the Publish step. There is
+# no long-lived secret to expire, which is what silently broke the workflow
+# this replaces: CRATES_IO_TOKEN went stale in April and every release from
+# then on failed on `403 Forbidden` with nobody noticing.
 
 on:
   release:
@@ -28,10 +43,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
-    # Holds CARGO_REGISTRY_TOKEN. Keeping the publishing credential in its own
-    # environment (rather than a plain repo secret) means it can carry
-    # reviewer/branch protection independently of ordinary CI secrets.
+    # No secret lives here — Trusted Publishing authenticates via OIDC, scoped
+    # to this exact repo, workflow file and environment name. The environment
+    # is kept anyway because it is what crates.io's trusted-publisher config
+    # matches against, and because it can still carry reviewer/wait-timer
+    # protection independently of ordinary CI.
     environment: crates
+    permissions:
+      id-token: write   # crates-io-auth-action exchanges this for a 30-minute crates.io token
+      contents: read
 
     steps:
       - name: Checkout code
@@ -93,34 +113,39 @@ jobs:
             echo "tag $TAG matches all manifests"
           fi
 
+      # Exchanges this job's GitHub OIDC identity for a 30-minute crates.io
+      # token, scoped to the crates whose trusted-publisher settings name this
+      # repo + workflow file + `crates` environment. Nothing is written to
+      # disk or logged; the action's post step revokes the token when the job
+      # ends, so nothing outlives this run either way.
+      #
+      # 30 minutes covers the 3-crate sequence with room to spare — each
+      # `cargo publish` blocks until crates.io's index confirms the upload
+      # before returning, which is the slow part, and there are only three of
+      # them. If a future crate list makes that tight, re-run this step mid-job
+      # rather than widening the token lifetime — crates.io does not offer one.
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
       - name: Publish to crates.io
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
         shell: bash
         run: |
           set -uo pipefail
 
-          # Dependency order. Each crate must exist on the registry before
-          # anything that depends on it can even be *packaged* — cargo resolves
-          # the `version` of every path dependency against the real index, and
-          # that includes optional ones. This is why the previous two-crate list
-          # could never have worked: samyama-graph-algorithms carries an
-          # optional dep on samyama-gpu, which had never been published.
-          #
-          #   samyama-gpu
-          #     -> samyama-optimization        (independent, but cheap to do early)
-          #     -> samyama-graph-algorithms    (optional dep on samyama-gpu)
-          #       -> samyama                   (deps on algorithms + optimization + gpu)
-          #         -> samyama-sdk             (dep on samyama)
-          #           -> samyama-cli           (dep on samyama-sdk)
+          # Dependency order. samyama-graph-algorithms carries a path
+          # dependency on samyama-gpu, and cargo resolves a path dependency's
+          # `version` against the real index before it will even *package* the
+          # dependent crate — so gpu has to land first regardless of whether
+          # its feature is enabled. samyama-optimization has no such
+          # dependency; it is listed first because it is cheap and independent.
           CRATES=(
             samyama-gpu
             samyama-optimization
             samyama-graph-algorithms
-            samyama
-            samyama-sdk
-            samyama-cli
           )
 
           # For the same reason, the dry run cannot be hoisted into a separate
