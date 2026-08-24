@@ -225,6 +225,24 @@ fn eval_binary_op(op: &BinaryOp, left: Value, right: Value) -> ExecutionResult<V
             (PropertyValue::Duration { months, days, seconds, .. }, PropertyValue::DateTime(dt)) => {
                 add_duration_to_datetime(*dt, *months, *days, *seconds)
             }
+            // Any of the five temporal types + Duration (#689). Without these
+            // arms, teaching the constructors to produce real types would have
+            // silently removed `datetime(...) + duration(...)`, which Cypher
+            // requires and which the suite already covered.
+            (t @ (PropertyValue::Date(_)
+                | PropertyValue::LocalTime(_)
+                | PropertyValue::Time { .. }
+                | PropertyValue::LocalDateTime { .. }
+                | PropertyValue::ZonedDateTime { .. }),
+             PropertyValue::Duration { months, days, seconds, nanos })
+            | (PropertyValue::Duration { months, days, seconds, nanos },
+               t @ (PropertyValue::Date(_)
+                | PropertyValue::LocalTime(_)
+                | PropertyValue::Time { .. }
+                | PropertyValue::LocalDateTime { .. }
+                | PropertyValue::ZonedDateTime { .. })) => {
+                shift_temporal(t, *months, *days, *seconds, *nanos as i64)?
+            }
             // Duration + Duration
             (PropertyValue::Duration { months: m1, days: d1, seconds: s1, nanos: n1 },
              PropertyValue::Duration { months: m2, days: d2, seconds: s2, nanos: n2 }) => {
@@ -247,6 +265,25 @@ fn eval_binary_op(op: &BinaryOp, left: Value, right: Value) -> ExecutionResult<V
             (PropertyValue::DateTime(dt), PropertyValue::Duration { months, days, seconds, .. }) => {
                 add_duration_to_datetime(*dt, -*months, -*days, -*seconds)
             }
+            (t @ (PropertyValue::Date(_)
+                | PropertyValue::LocalTime(_)
+                | PropertyValue::Time { .. }
+                | PropertyValue::LocalDateTime { .. }
+                | PropertyValue::ZonedDateTime { .. }),
+             PropertyValue::Duration { months, days, seconds, nanos }) => {
+                shift_temporal(t, -*months, -*days, -*seconds, -(*nanos as i64))?
+            }
+            // Two temporals of the same kind subtract to a Duration.
+            (a @ (PropertyValue::Date(_)
+                | PropertyValue::LocalTime(_)
+                | PropertyValue::Time { .. }
+                | PropertyValue::LocalDateTime { .. }
+                | PropertyValue::ZonedDateTime { .. }),
+             b @ (PropertyValue::Date(_)
+                | PropertyValue::LocalTime(_)
+                | PropertyValue::Time { .. }
+                | PropertyValue::LocalDateTime { .. }
+                | PropertyValue::ZonedDateTime { .. })) => temporal_difference(a, b)?,
             // DateTime - DateTime = Duration
             (PropertyValue::DateTime(a), PropertyValue::DateTime(b)) => {
                 let diff_ms = a - b;
@@ -1309,6 +1346,36 @@ fn cypher_ordering(left: &PropertyValue, right: &PropertyValue) -> Option<std::c
             Duration { months: m1, days: d1, seconds: s1, nanos: n1 },
             Duration { months: m2, days: d2, seconds: s2, nanos: n2 },
         ) => Some(m1.cmp(m2).then(d1.cmp(d2)).then(s1.cmp(s2)).then(n1.cmp(n2))),
+
+        // The five temporal types compare within their own kind (#689).
+        //
+        // This function is a *second* comparison path -- `cypher_order` in
+        // `graph::property` is the other -- and its `_ => None` fallthrough
+        // meant every new temporal type silently compared as null the moment
+        // the constructors started producing them. Nine `Temporal7` scenarios
+        // that had been passing went red, which is the duplicated-evaluator
+        // shape this codebase keeps producing: patching the copy in front of
+        // you fixes nothing.
+        (Date(l), Date(r)) => Some(l.cmp(r)),
+        (LocalTime(l), LocalTime(r)) => Some(l.cmp(r)),
+        (
+            Time { nanos: n1, offset_seconds: o1 },
+            Time { nanos: n2, offset_seconds: o2 },
+        ) => Some(
+            (n1 - (*o1 as i64) * 1_000_000_000).cmp(&(n2 - (*o2 as i64) * 1_000_000_000)),
+        ),
+        (LocalDateTime { secs: s1, nanos: n1 }, LocalDateTime { secs: s2, nanos: n2 }) => {
+            Some(s1.cmp(s2).then(n1.cmp(n2)))
+        }
+        (
+            ZonedDateTime { secs: s1, nanos: n1, .. },
+            ZonedDateTime { secs: s2, nanos: n2, .. },
+        ) => Some(s1.cmp(s2).then(n1.cmp(n2))),
+
+        // Cross-kind temporal comparison is null in Cypher, not an ordering:
+        // "is this date greater than that time" has no answer. Falls through
+        // to `None` below, which is that null -- spelled out here because the
+        // wildcard is exactly what hid the bug above.
         _ => None,
     }
 }
@@ -1322,6 +1389,110 @@ fn cypher_ordering(left: &PropertyValue, right: &PropertyValue) -> Option<std::c
 ///
 /// This exists because the comparison was implemented twice and both copies
 /// had independently settled on raising instead. Both now call here.
+
+/// Days-since-epoch of any temporal value that has a date part.
+///
+/// `None` for `LocalTime`/`Time`, which genuinely have no date — the caller
+/// turns that into a type error rather than substituting the epoch, because a
+/// substituted 1970-01-01 reads as a real answer (#689).
+fn date_part_of(v: &PropertyValue) -> Option<i32> {
+    match v {
+        PropertyValue::Date(d) => Some(*d),
+        PropertyValue::LocalDateTime { secs, .. } => Some(secs.div_euclid(86_400) as i32),
+        PropertyValue::ZonedDateTime { secs, offset_seconds, .. } => {
+            Some((secs + *offset_seconds as i64).div_euclid(86_400) as i32)
+        }
+        PropertyValue::DateTime(ms) => Some(ms.div_euclid(86_400_000) as i32),
+        _ => None,
+    }
+}
+
+/// Nanoseconds-since-midnight of any temporal value that has a time part.
+fn time_part_of(v: &PropertyValue) -> Option<i64> {
+    match v {
+        PropertyValue::LocalTime(n) => Some(*n),
+        PropertyValue::Time { nanos, .. } => Some(*nanos),
+        PropertyValue::LocalDateTime { secs, nanos } => {
+            Some(secs.rem_euclid(86_400) * 1_000_000_000 + *nanos as i64)
+        }
+        PropertyValue::ZonedDateTime { secs, nanos, offset_seconds, .. } => {
+            let local = secs + *offset_seconds as i64;
+            Some(local.rem_euclid(86_400) * 1_000_000_000 + *nanos as i64)
+        }
+        PropertyValue::DateTime(ms) => Some(ms.rem_euclid(86_400_000) * 1_000_000),
+        _ => None,
+    }
+}
+
+/// The date and time a composite constructor's map describes.
+///
+/// Handles both the component form (`{year, month, day, hour, ...}`) and the
+/// *selection* form (`{date: d, time: t}`), which Cypher allows and which the
+/// TCK's Temporal3 exercises heavily. A map may mix them: `{date: d, hour: 9}`
+/// takes the date from `d` and the clock from the components.
+fn compose_date_and_time(
+    map: &std::collections::HashMap<String, PropertyValue>,
+) -> Result<(i32, i64), ExecutionError> {
+    use crate::query::executor::temporal as tmp;
+
+    let from_date = map
+        .get("date")
+        .or_else(|| map.get("datetime"))
+        .and_then(date_part_of);
+    let from_time = map
+        .get("time")
+        .or_else(|| map.get("datetime"))
+        .and_then(time_part_of);
+
+    let days = match from_date {
+        Some(d) => d,
+        None if map.contains_key("year") => tmp::date_days(map)?,
+        // No date at all. Cypher's composite types need one, and defaulting to
+        // the epoch is exactly the silent-1970 failure #595 was about.
+        None => {
+            return Err(ExecutionError::RuntimeError(
+                "a date-time needs a date: give `year` or `date`".to_string(),
+            ))
+        }
+    };
+    let has_clock = ["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"]
+        .iter()
+        .any(|k| map.contains_key(*k));
+    let nanos = if has_clock {
+        tmp::time_of_day_nanos(map)?
+    } else {
+        from_time.unwrap_or(0)
+    };
+    Ok((days, nanos))
+}
+
+/// Seconds/nanos of a naive date-time string, with no zone.
+fn parse_naive_date_time(s: &str) -> Result<(i64, u32), ExecutionError> {
+    let t = s.trim();
+    for fmt in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"] {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(t, fmt) {
+            return Ok((dt.and_utc().timestamp(), dt.and_utc().timestamp_subsec_nanos()));
+        }
+        if fmt == "%Y-%m-%d" {
+            if let Ok(d) = chrono::NaiveDate::parse_from_str(t, fmt) {
+                let dt = d.and_hms_opt(0, 0, 0).expect("midnight is a time");
+                return Ok((dt.and_utc().timestamp(), 0));
+            }
+        }
+    }
+    Err(ExecutionError::RuntimeError(format!(
+        "cannot parse date-time: {s}"
+    )))
+}
+
+/// The `PropertyValue` inside a `Value`, when there is one.
+fn value_as_property(v: &Value) -> Option<PropertyValue> {
+    match v {
+        Value::Property(p) => Some(p.clone()),
+        _ => None,
+    }
+}
+
 fn string_position_op(
     op: StringPositionOp,
     left: &PropertyValue,
@@ -1609,6 +1780,14 @@ pub fn eval_function(name: &str, args: &[Value], store: Option<&GraphStore>) -> 
                 Value::Property(PropertyValue::Duration { months, days, seconds, nanos }) => {
                     format!("P{}M{}DT{}S", months, days, seconds)
                 }
+                // The five temporal types render through the one function that
+                // owns the format, so `toString()` and the TCK harness cannot
+                // disagree about what a value looks like (#689).
+                Value::Property(p @ PropertyValue::Date(_))
+                | Value::Property(p @ PropertyValue::LocalTime(_))
+                | Value::Property(p @ PropertyValue::Time { .. })
+                | Value::Property(p @ PropertyValue::LocalDateTime { .. })
+                | Value::Property(p @ PropertyValue::ZonedDateTime { .. }) => p.to_cypher_string(),
                 Value::Null | Value::Property(PropertyValue::Null) => "null".to_string(),
                 _ => return Err(ExecutionError::TypeError("Cannot convert to string".to_string())),
             };
@@ -1991,204 +2170,214 @@ pub fn eval_function(name: &str, args: &[Value], store: Option<&GraphStore>) -> 
             Ok(Value::Property(PropertyValue::Array(result)))
         }
         // date/datetime/duration constructors
+        // The five temporal constructors (#689). Each produces its own type
+        // now; before this they all produced `PropertyValue::DateTime(millis)`,
+        // so `date()`, `time()` and `localdatetime()` were indistinguishable
+        // once evaluated and nanoseconds were destroyed at construction.
         "date" => {
+            use crate::query::executor::temporal as tmp;
             if args.is_empty() {
-                // date() — current date as DateTime
-                let now = chrono::Utc::now().timestamp_millis();
-                Ok(Value::Property(PropertyValue::DateTime(now)))
-            } else {
-                match &args[0] {
-                    Value::Property(PropertyValue::String(s)) => {
-                        // Parse ISO date string
-                        if let Ok(dt) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-                            let millis = dt.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis();
-                            Ok(Value::Property(PropertyValue::DateTime(millis)))
-                        } else {
-                            Err(ExecutionError::RuntimeError(format!("Cannot parse date: {}", s)))
-                        }
-                    }
-                    Value::Property(PropertyValue::Map(map)) => {
-                        let year = map.get("year").and_then(|v| v.as_integer()).unwrap_or(1970) as i32;
-                        let month = map.get("month").and_then(|v| v.as_integer()).unwrap_or(1) as u32;
-                        let day = map.get("day").and_then(|v| v.as_integer()).unwrap_or(1) as u32;
-                        if let Some(dt) = chrono::NaiveDate::from_ymd_opt(year, month, day) {
-                            let millis = dt.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis();
-                            Ok(Value::Property(PropertyValue::DateTime(millis)))
-                        } else {
-                            Err(ExecutionError::RuntimeError(format!("Invalid date: {}-{}-{}", year, month, day)))
-                        }
-                    }
-                    _ => Err(ExecutionError::TypeError("date() requires string or map argument".to_string())),
+                let days = (chrono::Utc::now().timestamp() / 86_400) as i32;
+                return Ok(Value::Property(PropertyValue::Date(days)));
+            }
+            match &args[0] {
+                Value::Property(PropertyValue::String(s)) => {
+                    Ok(Value::Property(tmp::parse_date(s)?))
                 }
+                Value::Property(PropertyValue::Map(map)) => {
+                    // Selection: `date({date: d})` and `date({datetime: dt})`
+                    // take the date part of another temporal.
+                    if let Some(src) = map.get("date").or_else(|| map.get("datetime")) {
+                        if let Some(d) = date_part_of(src) {
+                            return Ok(Value::Property(PropertyValue::Date(d)));
+                        }
+                    }
+                    Ok(Value::Property(PropertyValue::Date(tmp::date_days(map)?)))
+                }
+                Value::Property(PropertyValue::Null) => Ok(Value::Property(PropertyValue::Null)),
+                Value::Property(PropertyValue::Date(d)) => {
+                    Ok(Value::Property(PropertyValue::Date(*d)))
+                }
+                other => match value_as_property(other).and_then(|p| date_part_of(&p)) {
+                    Some(d) => Ok(Value::Property(PropertyValue::Date(d))),
+                    None => Err(ExecutionError::TypeError(
+                        "date() requires a string, a map, or a temporal value".to_string(),
+                    )),
+                },
+            }
+        }
+        "localtime" => {
+            use crate::query::executor::temporal as tmp;
+            if args.is_empty() {
+                let now = chrono::Utc::now();
+                let nanos = now.timestamp().rem_euclid(86_400) * 1_000_000_000
+                    + now.timestamp_subsec_nanos() as i64;
+                return Ok(Value::Property(PropertyValue::LocalTime(nanos)));
+            }
+            match &args[0] {
+                Value::Property(PropertyValue::String(s)) => {
+                    let (nanos, _) = tmp::parse_time_parts(s)?;
+                    Ok(Value::Property(PropertyValue::LocalTime(nanos)))
+                }
+                Value::Property(PropertyValue::Map(map)) => {
+                    if let Some(src) = map.get("time").or_else(|| map.get("datetime")) {
+                        if let Some(n) = time_part_of(src) {
+                            return Ok(Value::Property(PropertyValue::LocalTime(n)));
+                        }
+                    }
+                    Ok(Value::Property(PropertyValue::LocalTime(tmp::time_of_day_nanos(map)?)))
+                }
+                Value::Property(PropertyValue::Null) => Ok(Value::Property(PropertyValue::Null)),
+                other => match value_as_property(other).and_then(|p| time_part_of(&p)) {
+                    Some(n) => Ok(Value::Property(PropertyValue::LocalTime(n))),
+                    None => Err(ExecutionError::TypeError(
+                        "localtime() requires a string, a map, or a temporal value".to_string(),
+                    )),
+                },
+            }
+        }
+        "time" => {
+            use crate::query::executor::temporal as tmp;
+            if args.is_empty() {
+                let now = chrono::Utc::now();
+                let nanos = now.timestamp().rem_euclid(86_400) * 1_000_000_000
+                    + now.timestamp_subsec_nanos() as i64;
+                return Ok(Value::Property(PropertyValue::Time { nanos, offset_seconds: 0 }));
+            }
+            match &args[0] {
+                Value::Property(PropertyValue::String(s)) => {
+                    let (nanos, off) = tmp::parse_time_parts(s)?;
+                    Ok(Value::Property(PropertyValue::Time {
+                        nanos,
+                        offset_seconds: off.unwrap_or(0),
+                    }))
+                }
+                Value::Property(PropertyValue::Map(map)) => {
+                    let offset = match map.get("timezone").and_then(|v| v.as_string()) {
+                        Some(tz) => tmp::parse_timezone(&tz)?.0,
+                        None => 0,
+                    };
+                    if let Some(src) = map.get("time").or_else(|| map.get("datetime")) {
+                        if let Some(n) = time_part_of(src) {
+                            return Ok(Value::Property(PropertyValue::Time {
+                                nanos: n,
+                                offset_seconds: offset,
+                            }));
+                        }
+                    }
+                    Ok(Value::Property(PropertyValue::Time {
+                        nanos: tmp::time_of_day_nanos(map)?,
+                        offset_seconds: offset,
+                    }))
+                }
+                Value::Property(PropertyValue::Null) => Ok(Value::Property(PropertyValue::Null)),
+                other => match value_as_property(other).and_then(|p| time_part_of(&p)) {
+                    Some(n) => Ok(Value::Property(PropertyValue::Time { nanos: n, offset_seconds: 0 })),
+                    None => Err(ExecutionError::TypeError(
+                        "time() requires a string, a map, or a temporal value".to_string(),
+                    )),
+                },
+            }
+        }
+        "localdatetime" => {
+            if args.is_empty() {
+                let now = chrono::Utc::now();
+                return Ok(Value::Property(PropertyValue::LocalDateTime {
+                    secs: now.timestamp(),
+                    nanos: now.timestamp_subsec_nanos(),
+                }));
+            }
+            match &args[0] {
+                Value::Property(PropertyValue::String(s)) => {
+                    let (secs, nanos) = parse_naive_date_time(s)?;
+                    Ok(Value::Property(PropertyValue::LocalDateTime { secs, nanos }))
+                }
+                Value::Property(PropertyValue::Map(map)) => {
+                    crate::query::executor::temporal::reject_unknown_map(map)?;
+                    let (d, t) = compose_date_and_time(map)?;
+                    let total = d as i64 * 86_400 * 1_000_000_000 + t;
+                    Ok(Value::Property(PropertyValue::LocalDateTime {
+                        secs: total.div_euclid(1_000_000_000),
+                        nanos: total.rem_euclid(1_000_000_000) as u32,
+                    }))
+                }
+                Value::Property(PropertyValue::Null) => Ok(Value::Property(PropertyValue::Null)),
+                _ => Err(ExecutionError::TypeError(
+                    "localdatetime() requires a string or map argument".to_string(),
+                )),
             }
         }
         "datetime" => {
+            use crate::query::executor::temporal as tmp;
             if args.is_empty() {
-                let now = chrono::Utc::now().timestamp_millis();
-                Ok(Value::Property(PropertyValue::DateTime(now)))
-            } else {
-                match &args[0] {
-                    Value::Property(PropertyValue::String(s)) => {
-                        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-                            Ok(Value::Property(PropertyValue::DateTime(dt.timestamp_millis())))
-                        } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
-                            Ok(Value::Property(PropertyValue::DateTime(dt.and_utc().timestamp_millis())))
-                        } else {
-                            Err(ExecutionError::RuntimeError(format!("Cannot parse datetime: {}", s)))
-                        }
-                    }
-                    Value::Property(PropertyValue::Map(map)) => {
-                        use chrono::TimeZone;
-
-                        // An epoch, which is what a machine caller has (Axiom 4).
-                        // Handled before the calendar components because it is a
-                        // complete specification on its own -- and because
-                        // without it the map fell through to the defaults below
-                        // and returned 1970-01-01 *silently*, which reads as a
-                        // plausible date rather than a failure (#595).
-                        if let Some(millis) = map.get("epochMillis").and_then(|v| v.as_integer()) {
-                            return Ok(Value::Property(PropertyValue::DateTime(millis)));
-                        }
-                        if let Some(seconds) = map.get("epochSeconds").and_then(|v| v.as_integer()) {
-                            return Ok(Value::Property(PropertyValue::DateTime(seconds * 1000)));
-                        }
-
-                        // A map naming none of the understood keys is a mistake,
-                        // not a request for the epoch. Answering 1970-01-01 for
-                        // it is how the missing `epochMillis` arm stayed
-                        // invisible.
-                        const KNOWN: [&str; 8] = [
-                            "year", "month", "day", "hour", "minute", "second",
-                            "epochMillis", "epochSeconds",
-                        ];
-                        if !map.keys().any(|k| KNOWN.contains(&k.as_str())) {
-                            let mut given: Vec<String> = map.keys().cloned().collect();
-                            given.sort();
-                            return Err(ExecutionError::RuntimeError(format!(
-                                "datetime() understands none of the keys given ({}); expected one of {}",
-                                given.join(", "),
-                                KNOWN.join(", ")
-                            )));
-                        }
-
-                        let year = map.get("year").and_then(|v| v.as_integer()).unwrap_or(1970) as i32;
-                        let month = map.get("month").and_then(|v| v.as_integer()).unwrap_or(1) as u32;
-                        let day = map.get("day").and_then(|v| v.as_integer()).unwrap_or(1) as u32;
-                        let hour = map.get("hour").and_then(|v| v.as_integer()).unwrap_or(0) as u32;
-                        let minute = map.get("minute").and_then(|v| v.as_integer()).unwrap_or(0) as u32;
-                        let second = map.get("second").and_then(|v| v.as_integer()).unwrap_or(0) as u32;
-                        if let Some(dt) = chrono::Utc.with_ymd_and_hms(year, month, day, hour, minute, second).single() {
-                            Ok(Value::Property(PropertyValue::DateTime(dt.timestamp_millis())))
-                        } else {
-                            Err(ExecutionError::RuntimeError(format!(
-                                "Invalid datetime components: year={}, month={}, day={}, hour={}, minute={}, second={}",
-                                year, month, day, hour, minute, second
-                            )))
-                        }
-                    }
-                    _ => Err(ExecutionError::TypeError("datetime() requires string or map argument".to_string())),
-                }
-            }
-        }
-        // CY-28: time() — time of day, stored as millis from epoch midnight
-        "time" => {
-            if args.is_empty() {
-                use chrono::Timelike;
                 let now = chrono::Utc::now();
-                let millis = (now.hour() as i64 * 3600 + now.minute() as i64 * 60 + now.second() as i64) * 1000
-                    + now.timestamp_subsec_millis() as i64;
-                Ok(Value::Property(PropertyValue::DateTime(millis)))
-            } else {
-                match &args[0] {
-                    Value::Property(PropertyValue::String(s)) => {
-                        // Parse HH:MM:SS or HH:MM:SS.sss (ignore timezone for storage)
-                        let time_str = s.split('+').next().unwrap_or(s).split('-').next().unwrap_or(s);
-                        if let Ok(t) = chrono::NaiveTime::parse_from_str(time_str, "%H:%M:%S") {
-                            use chrono::Timelike;
-                            let millis = (t.hour() as i64 * 3600 + t.minute() as i64 * 60 + t.second() as i64) * 1000;
-                            Ok(Value::Property(PropertyValue::DateTime(millis)))
-                        } else if let Ok(t) = chrono::NaiveTime::parse_from_str(time_str, "%H:%M:%S%.f") {
-                            use chrono::Timelike;
-                            let millis = (t.hour() as i64 * 3600 + t.minute() as i64 * 60 + t.second() as i64) * 1000
-                                + (t.nanosecond() / 1_000_000) as i64;
-                            Ok(Value::Property(PropertyValue::DateTime(millis)))
-                        } else {
-                            Err(ExecutionError::RuntimeError(format!("Cannot parse time: {}. Expected HH:MM:SS", s)))
-                        }
-                    }
-                    Value::Property(PropertyValue::Map(map)) => {
-                        let hour = map.get("hour").and_then(|v| v.as_integer()).unwrap_or(0);
-                        let minute = map.get("minute").and_then(|v| v.as_integer()).unwrap_or(0);
-                        let second = map.get("second").and_then(|v| v.as_integer()).unwrap_or(0);
-                        let millis = (hour * 3600 + minute * 60 + second) * 1000;
-                        Ok(Value::Property(PropertyValue::DateTime(millis)))
-                    }
-                    _ => Err(ExecutionError::TypeError("time() requires string or map argument".to_string())),
-                }
+                return Ok(Value::Property(PropertyValue::ZonedDateTime {
+                    secs: now.timestamp(),
+                    nanos: now.timestamp_subsec_nanos(),
+                    offset_seconds: 0,
+                    zone: None,
+                }));
             }
-        }
-        // CY-28: localtime() — same as time() but explicitly no timezone
-        "localtime" => {
-            if args.is_empty() {
-                use chrono::Timelike;
-                let now = chrono::Utc::now();
-                let millis = (now.hour() as i64 * 3600 + now.minute() as i64 * 60 + now.second() as i64) * 1000
-                    + now.timestamp_subsec_millis() as i64;
-                Ok(Value::Property(PropertyValue::DateTime(millis)))
-            } else {
-                match &args[0] {
-                    Value::Property(PropertyValue::String(s)) => {
-                        if let Ok(t) = chrono::NaiveTime::parse_from_str(s, "%H:%M:%S") {
-                            use chrono::Timelike;
-                            let millis = (t.hour() as i64 * 3600 + t.minute() as i64 * 60 + t.second() as i64) * 1000;
-                            Ok(Value::Property(PropertyValue::DateTime(millis)))
-                        } else {
-                            Err(ExecutionError::RuntimeError(format!("Cannot parse localtime: {}. Expected HH:MM:SS", s)))
-                        }
+            match &args[0] {
+                Value::Property(PropertyValue::String(s)) => {
+                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+                        return Ok(Value::Property(PropertyValue::ZonedDateTime {
+                            secs: dt.timestamp(),
+                            nanos: dt.timestamp_subsec_nanos(),
+                            offset_seconds: dt.offset().local_minus_utc(),
+                            zone: None,
+                        }));
                     }
-                    Value::Property(PropertyValue::Map(map)) => {
-                        let hour = map.get("hour").and_then(|v| v.as_integer()).unwrap_or(0);
-                        let minute = map.get("minute").and_then(|v| v.as_integer()).unwrap_or(0);
-                        let second = map.get("second").and_then(|v| v.as_integer()).unwrap_or(0);
-                        let millis = (hour * 3600 + minute * 60 + second) * 1000;
-                        Ok(Value::Property(PropertyValue::DateTime(millis)))
-                    }
-                    _ => Err(ExecutionError::TypeError("localtime() requires string or map argument".to_string())),
+                    let (secs, nanos) = parse_naive_date_time(s)?;
+                    Ok(Value::Property(PropertyValue::ZonedDateTime {
+                        secs,
+                        nanos,
+                        offset_seconds: 0,
+                        zone: None,
+                    }))
                 }
-            }
-        }
-        // CY-28: localdatetime() — datetime without timezone
-        "localdatetime" => {
-            if args.is_empty() {
-                let now = chrono::Utc::now().timestamp_millis();
-                Ok(Value::Property(PropertyValue::DateTime(now)))
-            } else {
-                match &args[0] {
-                    Value::Property(PropertyValue::String(s)) => {
-                        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
-                            Ok(Value::Property(PropertyValue::DateTime(dt.and_utc().timestamp_millis())))
-                        } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
-                            Ok(Value::Property(PropertyValue::DateTime(dt.and_utc().timestamp_millis())))
-                        } else {
-                            Err(ExecutionError::RuntimeError(format!("Cannot parse localdatetime: {}. Expected YYYY-MM-DDTHH:MM:SS", s)))
-                        }
+                Value::Property(PropertyValue::Map(map)) => {
+                    tmp::reject_unknown_map(map)?;
+                    // An epoch is a complete specification on its own, and is
+                    // handled first: without this the map fell through to the
+                    // component defaults and returned 1970-01-01 *silently*,
+                    // which reads as a plausible date rather than a failure
+                    // (#595).
+                    if let Some(millis) = map.get("epochMillis").and_then(|v| v.as_integer()) {
+                        return Ok(Value::Property(PropertyValue::ZonedDateTime {
+                            secs: millis.div_euclid(1000),
+                            nanos: (millis.rem_euclid(1000) * 1_000_000) as u32,
+                            offset_seconds: 0,
+                            zone: None,
+                        }));
                     }
-                    Value::Property(PropertyValue::Map(map)) => {
-                        use chrono::TimeZone;
-                        let year = map.get("year").and_then(|v| v.as_integer()).unwrap_or(1970) as i32;
-                        let month = map.get("month").and_then(|v| v.as_integer()).unwrap_or(1) as u32;
-                        let day = map.get("day").and_then(|v| v.as_integer()).unwrap_or(1) as u32;
-                        let hour = map.get("hour").and_then(|v| v.as_integer()).unwrap_or(0) as u32;
-                        let minute = map.get("minute").and_then(|v| v.as_integer()).unwrap_or(0) as u32;
-                        let second = map.get("second").and_then(|v| v.as_integer()).unwrap_or(0) as u32;
-                        if let Some(dt) = chrono::Utc.with_ymd_and_hms(year, month, day, hour, minute, second).single() {
-                            Ok(Value::Property(PropertyValue::DateTime(dt.timestamp_millis())))
-                        } else {
-                            Err(ExecutionError::RuntimeError(format!("Invalid localdatetime components")))
-                        }
+                    if let Some(secs) = map.get("epochSeconds").and_then(|v| v.as_integer()) {
+                        return Ok(Value::Property(PropertyValue::ZonedDateTime {
+                            secs,
+                            nanos: 0,
+                            offset_seconds: 0,
+                            zone: None,
+                        }));
                     }
-                    _ => Err(ExecutionError::TypeError("localdatetime() requires string or map argument".to_string())),
+                    let (offset_seconds, zone) = match map.get("timezone").and_then(|v| v.as_string()) {
+                        Some(tz) => tmp::parse_timezone(&tz)?,
+                        None => (0, None),
+                    };
+                    let (d, t) = compose_date_and_time(map)?;
+                    let local = d as i64 * 86_400 * 1_000_000_000 + t;
+                    // The components describe local time; store the instant.
+                    let utc = local - offset_seconds as i64 * 1_000_000_000;
+                    Ok(Value::Property(PropertyValue::ZonedDateTime {
+                        secs: utc.div_euclid(1_000_000_000),
+                        nanos: utc.rem_euclid(1_000_000_000) as u32,
+                        offset_seconds,
+                        zone,
+                    }))
                 }
+                Value::Property(PropertyValue::Null) => Ok(Value::Property(PropertyValue::Null)),
+                _ => Err(ExecutionError::TypeError(
+                    "datetime() requires a string or map argument".to_string(),
+                )),
             }
         }
         "duration" => {
@@ -2443,6 +2632,140 @@ fn extract_float(val: &Value) -> ExecutionResult<f64> {
 }
 
 /// Add duration components to a DateTime (millis timestamp)
+
+/// Nanoseconds since the epoch that a temporal value denotes, and a way back.
+///
+/// `Date` is midnight and `LocalTime`/`Time` have no date, so these are the
+/// only two functions that decide what "the same value, shifted" means. Keeping
+/// that decision in one place is the point: the shift used to be written inline
+/// per operator, which is how `+` and `-` came to disagree about whether months
+/// were calendar months.
+fn temporal_epoch_nanos(v: &PropertyValue) -> Option<i128> {
+    match v {
+        PropertyValue::Date(d) => Some(*d as i128 * 86_400 * 1_000_000_000),
+        PropertyValue::LocalTime(n) => Some(*n as i128),
+        PropertyValue::Time { nanos, offset_seconds } => {
+            Some(*nanos as i128 - *offset_seconds as i128 * 1_000_000_000)
+        }
+        PropertyValue::LocalDateTime { secs, nanos } => {
+            Some(*secs as i128 * 1_000_000_000 + *nanos as i128)
+        }
+        PropertyValue::ZonedDateTime { secs, nanos, .. } => {
+            Some(*secs as i128 * 1_000_000_000 + *nanos as i128)
+        }
+        PropertyValue::DateTime(ms) => Some(*ms as i128 * 1_000_000),
+        _ => None,
+    }
+}
+
+/// Shift a temporal value by a duration, keeping its own type.
+///
+/// Months are calendar months, so they are applied to the date rather than as
+/// a fixed number of seconds -- adding one month to 31 January is 28 February,
+/// not 3 March. Days and below are exact.
+fn shift_temporal(
+    v: &PropertyValue,
+    months: i64,
+    days: i64,
+    seconds: i64,
+    nanos: i64,
+) -> Result<PropertyValue, ExecutionError> {
+    use chrono::Datelike;
+    let exact = days as i128 * 86_400 * 1_000_000_000
+        + seconds as i128 * 1_000_000_000
+        + nanos as i128;
+
+    // Calendar months first, on whatever date part the value has.
+    let month_shift_nanos = if months == 0 {
+        0i128
+    } else {
+        let day0 = match v {
+            PropertyValue::Date(d) => *d as i64,
+            PropertyValue::LocalDateTime { secs, .. } => secs.div_euclid(86_400),
+            PropertyValue::ZonedDateTime { secs, offset_seconds, .. } => {
+                (secs + *offset_seconds as i64).div_euclid(86_400)
+            }
+            // A time of day has no calendar to move.
+            _ => return Err(ExecutionError::TypeError(
+                "cannot add months to a value with no date part".to_string(),
+            )),
+        };
+        let base = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+            .and_then(|e| e.checked_add_signed(chrono::Duration::days(day0)))
+            .ok_or_else(|| ExecutionError::RuntimeError("date out of range".into()))?;
+        let total = base.year() as i64 * 12 + (base.month0() as i64) + months;
+        let (y, m0) = (total.div_euclid(12), total.rem_euclid(12));
+        // Clamp the day into the target month, which is what a calendar month
+        // shift means: 31 Jan + 1 month is 28/29 Feb.
+        let last = days_in_month(y as i32, m0 as u32 + 1);
+        let shifted = chrono::NaiveDate::from_ymd_opt(y as i32, m0 as u32 + 1, base.day().min(last))
+            .ok_or_else(|| ExecutionError::RuntimeError("date out of range".into()))?;
+        (shifted.signed_duration_since(base).num_days() as i128) * 86_400 * 1_000_000_000
+    };
+
+    let total = temporal_epoch_nanos(v)
+        .ok_or_else(|| ExecutionError::TypeError("not a temporal value".to_string()))?
+        + month_shift_nanos
+        + exact;
+    Ok(rebuild_temporal_like(v, total))
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    let (ny, nm) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+    let first = chrono::NaiveDate::from_ymd_opt(year, month, 1);
+    let next = chrono::NaiveDate::from_ymd_opt(ny, nm, 1);
+    match (first, next) {
+        (Some(a), Some(b)) => b.signed_duration_since(a).num_days() as u32,
+        _ => 31,
+    }
+}
+
+/// Put an epoch-nanosecond total back into the same type it came from, so a
+/// `Date` plus a duration is still a `Date`.
+fn rebuild_temporal_like(like: &PropertyValue, total_nanos: i128) -> PropertyValue {
+    const DAY: i128 = 86_400 * 1_000_000_000;
+    match like {
+        PropertyValue::Date(_) => PropertyValue::Date(total_nanos.div_euclid(DAY) as i32),
+        PropertyValue::LocalTime(_) => {
+            PropertyValue::LocalTime(total_nanos.rem_euclid(DAY) as i64)
+        }
+        PropertyValue::Time { offset_seconds, .. } => PropertyValue::Time {
+            nanos: (total_nanos + *offset_seconds as i128 * 1_000_000_000).rem_euclid(DAY) as i64,
+            offset_seconds: *offset_seconds,
+        },
+        PropertyValue::LocalDateTime { .. } => PropertyValue::LocalDateTime {
+            secs: total_nanos.div_euclid(1_000_000_000) as i64,
+            nanos: total_nanos.rem_euclid(1_000_000_000) as u32,
+        },
+        PropertyValue::ZonedDateTime { offset_seconds, zone, .. } => PropertyValue::ZonedDateTime {
+            secs: total_nanos.div_euclid(1_000_000_000) as i64,
+            nanos: total_nanos.rem_euclid(1_000_000_000) as u32,
+            offset_seconds: *offset_seconds,
+            zone: zone.clone(),
+        },
+        _ => PropertyValue::DateTime((total_nanos / 1_000_000) as i64),
+    }
+}
+
+/// `a - b` for two temporals: the duration between them.
+fn temporal_difference(
+    a: &PropertyValue,
+    b: &PropertyValue,
+) -> Result<PropertyValue, ExecutionError> {
+    let (na, nb) = match (temporal_epoch_nanos(a), temporal_epoch_nanos(b)) {
+        (Some(x), Some(y)) => (x, y),
+        _ => return Err(ExecutionError::TypeError("not temporal values".to_string())),
+    };
+    let diff = na - nb;
+    let secs_total = diff.div_euclid(1_000_000_000) as i64;
+    Ok(PropertyValue::Duration {
+        months: 0,
+        days: secs_total / 86_400,
+        seconds: secs_total % 86_400,
+        nanos: diff.rem_euclid(1_000_000_000) as i32,
+    })
+}
+
 fn add_duration_to_datetime(dt_millis: i64, months: i64, days: i64, seconds: i64) -> PropertyValue {
     use chrono::{Datelike, Months, Duration, TimeZone};
     let dt = chrono::Utc.timestamp_millis_opt(dt_millis).single();
@@ -12680,10 +13003,13 @@ mod tests {
 
     #[test]
     fn test_eval_function_date_no_args() {
+        // `date()` returns a Date, not a timestamp (#689). Asserting the
+        // *type* is the point: before, every temporal constructor returned the
+        // same `DateTime(millis)` and this test passed for `time()` too.
         let result = eval_function("date", &[], None).unwrap();
         match result {
-            Value::Property(PropertyValue::DateTime(ts)) => assert!(ts > 0),
-            _ => panic!("Expected DateTime"),
+            Value::Property(PropertyValue::Date(days)) => assert!(days > 0),
+            other => panic!("Expected Date, got {other:?}"),
         }
     }
 
@@ -12691,13 +13017,10 @@ mod tests {
     fn test_eval_function_date_string() {
         let result = eval_function("date", &[Value::Property(PropertyValue::String("2024-01-15".to_string()))], None).unwrap();
         match result {
-            Value::Property(PropertyValue::DateTime(ts)) => {
-                // 2024-01-15 00:00:00 UTC
-                let expected = chrono::NaiveDate::from_ymd_opt(2024, 1, 15).unwrap()
-                    .and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis();
-                assert_eq!(ts, expected);
+            Value::Property(p @ PropertyValue::Date(_)) => {
+                assert_eq!(p.to_cypher_string(), "2024-01-15");
             }
-            _ => panic!("Expected DateTime"),
+            other => panic!("Expected Date, got {other:?}"),
         }
     }
 
@@ -12709,10 +13032,8 @@ mod tests {
         map.insert("day".to_string(), PropertyValue::Integer(15));
         let result = eval_function("date", &[Value::Property(PropertyValue::Map(map))], None).unwrap();
         match result {
-            Value::Property(PropertyValue::DateTime(ts)) => {
-                let expected = chrono::NaiveDate::from_ymd_opt(2024, 6, 15).unwrap()
-                    .and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis();
-                assert_eq!(ts, expected);
+            Value::Property(p @ PropertyValue::Date(_)) => {
+                assert_eq!(p.to_cypher_string(), "2024-06-15");
             }
             _ => panic!("Expected DateTime"),
         }
@@ -12744,8 +13065,8 @@ mod tests {
     fn test_eval_function_datetime_no_args() {
         let result = eval_function("datetime", &[], None).unwrap();
         match result {
-            Value::Property(PropertyValue::DateTime(ts)) => assert!(ts > 0),
-            _ => panic!("Expected DateTime"),
+            Value::Property(PropertyValue::ZonedDateTime { secs, .. }) => assert!(secs > 0),
+            other => panic!("Expected ZonedDateTime, got {other:?}"),
         }
     }
 
@@ -12753,11 +13074,10 @@ mod tests {
     fn test_eval_function_datetime_rfc3339() {
         let result = eval_function("datetime", &[Value::Property(PropertyValue::String("2024-01-15T10:30:00Z".to_string()))], None).unwrap();
         match result {
-            Value::Property(PropertyValue::DateTime(ts)) => {
-                let expected = chrono::DateTime::parse_from_rfc3339("2024-01-15T10:30:00Z").unwrap().timestamp_millis();
-                assert_eq!(ts, expected);
+            Value::Property(p @ PropertyValue::ZonedDateTime { .. }) => {
+                assert_eq!(p.to_cypher_string(), "2024-01-15T10:30Z");
             }
-            _ => panic!("Expected DateTime"),
+            other => panic!("Expected ZonedDateTime, got {other:?}"),
         }
     }
 
@@ -12765,8 +13085,10 @@ mod tests {
     fn test_eval_function_datetime_naive() {
         let result = eval_function("datetime", &[Value::Property(PropertyValue::String("2024-01-15T10:30:00".to_string()))], None).unwrap();
         match result {
-            Value::Property(PropertyValue::DateTime(_ts)) => {} // valid
-            _ => panic!("Expected DateTime"),
+            Value::Property(p @ PropertyValue::ZonedDateTime { .. }) => {
+                assert_eq!(p.to_cypher_string(), "2024-01-15T10:30Z");
+            }
+            other => panic!("Expected ZonedDateTime, got {other:?}"),
         }
     }
 
@@ -12781,9 +13103,11 @@ mod tests {
         map.insert("second".to_string(), PropertyValue::Integer(45));
         let result = eval_function("datetime", &[Value::Property(PropertyValue::Map(map))], None).unwrap();
         match result {
-            Value::Property(PropertyValue::DateTime(ts)) => {
+            Value::Property(p @ PropertyValue::ZonedDateTime { .. }) => {
+                assert_eq!(p.to_cypher_string(), "2024-03-15T10:30:45Z");
                 use chrono::TimeZone;
                 let expected = chrono::Utc.with_ymd_and_hms(2024, 3, 15, 10, 30, 45).unwrap().timestamp_millis();
+                let ts = p.as_epoch_millis().unwrap();
                 assert_eq!(ts, expected);
             }
             _ => panic!("Expected DateTime"),
