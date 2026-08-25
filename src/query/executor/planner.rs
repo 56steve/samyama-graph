@@ -1504,16 +1504,14 @@ impl QueryPlanner {
         // it was seeded further down: the rest of the planner -- filters,
         // aggregation, ORDER BY, SKIP/LIMIT -- then applies unchanged.
         //
-        // Which slot holds it depends on how many WITH stages follow, which is
-        // a parser detail rather than a semantic one: with a single WITH the
-        // leading UNWIND is `query.unwind_clause`, and with two or more it is
-        // the *first* extra stage's unwind. Both mean the same query.
+        // The leading UNWIND always lives in `query.unwind_clause`; each WITH
+        // stage's `Option<UnwindClause>` carries only that stage's own trailing
+        // UNWIND (or None). Previously with more than one WITH stage the
+        // parser moved the leading UNWIND into stage 0, and the planner had to
+        // fetch it from there — that shape lost a stage's trailing UNWIND
+        // whenever both were present (#785, multi-stage form).
         let leading_unwind: Option<&UnwindClause> = if query.unwind_leading {
-            if query.extra_with_stages.is_empty() {
-                query.unwind_clause.as_ref()
-            } else {
-                query.extra_with_stages[0].1.as_ref()
-            }
+            query.unwind_clause.as_ref()
         } else {
             None
         };
@@ -1585,16 +1583,18 @@ impl QueryPlanner {
         // Each stage: (with_clause, unwind, post_match_clauses, post_where_clause)
         let mut all_with_stages: Vec<(&WithClause, Option<&UnwindClause>, Vec<&MatchClause>, Option<&WhereClause>)> = Vec::new();
 
-        for (idx, (wc, uw, mcs, wh)) in query.extra_with_stages.iter().enumerate() {
-            // Stage 0 holds the leading UNWIND when there is more than one WITH;
-            // it was applied before the barriers, above.
-            let stage_unwind = if idx == 0 && leading_unwind.is_some() { None } else { uw.as_ref() };
-            all_with_stages.push((wc, stage_unwind, mcs.iter().collect(), wh.as_ref()));
+        for (_idx, (wc, uw, mcs, wh)) in query.extra_with_stages.iter().enumerate() {
+            // Each stage carries its own trailing UNWIND (or None). The leading
+            // UNWIND was applied before the first barrier and never appears
+            // here.
+            all_with_stages.push((wc, uw.as_ref(), mcs.iter().collect(), wh.as_ref()));
         }
         if let Some(wc) = &query.with_clause {
-            // A *leading* UNWIND was applied before the barriers, above. Only a
-            // trailing one belongs to this stage.
-            let stage_unwind = if query.unwind_leading && query.extra_with_stages.is_empty() {
+            // The leading UNWIND (`unwind_leading` = true) was applied before
+            // the barriers. `query.unwind_clause` only belongs to the final
+            // stage when it is *not* leading — i.e. a `MATCH … UNWIND … WITH …`
+            // shape, where the UNWIND stays with the reading prefix.
+            let stage_unwind = if query.unwind_leading {
                 None
             } else {
                 query.unwind_clause.as_ref()

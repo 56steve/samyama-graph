@@ -960,12 +960,11 @@ fn parse_match_statement(pair: pest::iterators::Pair<Rule>, query: &mut Query) -
                     let prev_with = query.with_clause.take().unwrap();
                     // The UNWIND that belongs to the stage being closed is the
                     // one written *after* its WITH, not the query's leading
-                    // one. Taking `unwind_clause` here moved the head UNWIND
-                    // into a later stage, which is the same position-losing
-                    // mistake as #785 pointing the other way; it survived only
-                    // because `unwind_leading` then suppressed the stage copy.
+                    // one. The leading UNWIND stays in `unwind_clause`; the
+                    // planner reads it from there. If no trailing UNWIND
+                    // exists for this stage, the slot is `None`.
                     let prev_unwind = if query.post_with_unwind_clauses.is_empty() {
-                        query.unwind_clause.take()
+                        None
                     } else {
                         Some(query.post_with_unwind_clauses.remove(0))
                     };
