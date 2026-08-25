@@ -505,7 +505,57 @@ fn eval_index(collection: Value, index: Value, store: &GraphStore) -> ExecutionR
          Value::Property(PropertyValue::String(key))) => {
             Ok(Value::Property(collection.resolve_property(key, store)))
         }
-        _ => Ok(Value::Null),
+
+        // Null in, null out — an unknown collection or index has an unknown
+        // element, which is Cypher's answer and not an error.
+        (Value::Null | Value::Property(PropertyValue::Null), _)
+        | (_, Value::Null | Value::Property(PropertyValue::Null)) => Ok(Value::Null),
+
+        // Everything else is a **type error**, not null (#789).
+        //
+        // The catch-all here used to answer null for every unhandled pair, so
+        // `true[0]` and `[1,2]['x']` returned a value where Cypher raises. That
+        // is the failure mode this codebase keeps producing: a wrong answer
+        // that looks like a legitimate "no such element".
+        //
+        // The two cases are distinguished because the TCK does: indexing a
+        // *non-list* is one error, indexing a list with a *non-integer* is
+        // another, and reporting one for the other sends the reader to the
+        // wrong operand.
+        (Value::Property(p), _) if p.as_list_items().is_some() => {
+            Err(ExecutionError::TypeError(format!(
+                "a list index must be an integer, not {}",
+                type_name_of(&index)
+            )))
+        }
+        (Value::List(_), _) => Err(ExecutionError::TypeError(format!(
+            "a list index must be an integer, not {}",
+            type_name_of(&index)
+        ))),
+        (Value::Property(PropertyValue::Map(_)) | Value::Map(_), _) => {
+            Err(ExecutionError::TypeError(format!(
+                "a map key must be a string, not {}",
+                type_name_of(&index)
+            )))
+        }
+        _ => Err(ExecutionError::TypeError(format!(
+            "cannot index {}: it is not a list or a map",
+            type_name_of(&collection)
+        ))),
+    }
+}
+
+/// A value's type, for an error message that names the operand rather than
+/// saying something went wrong somewhere.
+fn type_name_of(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Property(p) => p.type_name(),
+        Value::Node(..) | Value::NodeRef(_) => "Node",
+        Value::Edge(..) | Value::EdgeRef(..) => "Relationship",
+        Value::Path { .. } => "Path",
+        Value::List(_) => "List",
+        Value::Map(_) => "Map",
     }
 }
 
@@ -15094,14 +15144,29 @@ mod tests {
         assert_eq!(result, Value::Null);
     }
 
+    /// Indexing a non-collection is a **type error**, not null (#789).
+    ///
+    /// This asserted `Value::Null`, which was the behaviour and is not
+    /// Cypher's: `List1 [6]` expects `TypeError: InvalidArgumentType` for
+    /// `true[0]`, `123[0]`, `4.7[0]` and `'1'[0]`. The test encoded the defect,
+    /// checked against the TCK rather than against the new code.
+    ///
+    /// The distinction it destroyed is the useful one: a list with no element
+    /// 5 is a different thing from a value that was never a list. The
+    /// neighbouring `test_eval_index_map_missing_key` still asserts null, and
+    /// still passes, because a missing key genuinely is null.
     #[test]
     fn test_eval_index_non_collection() {
-        let result = eval_index(
+        let err = eval_index(
             Value::Property(PropertyValue::Integer(1)),
             Value::Property(PropertyValue::Integer(0)),
             &GraphStore::new(),
-        ).unwrap();
-        assert_eq!(result, Value::Null);
+        )
+        .expect_err("indexing an integer is a type error");
+        assert!(
+            format!("{err:?}").contains("not a list or a map"),
+            "the message should name the problem: {err:?}"
+        );
     }
 
     #[test]
