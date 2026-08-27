@@ -8,14 +8,38 @@ members = [
 ]
 exclude = ["sdk/python"]
 
+# Single source of truth for the release version. Every workspace crate
+# inherits it via `version.workspace = true`, so a release is one edit here
+# and the tag/manifest guard in publish-crate.yml has exactly one number to
+# check. sdk/python is its own workspace (excluded above) and is kept in
+# lockstep by hand — the same guard covers it.
+[workspace.package]
+version = "1.7.1"
+
 [package]
 name = "samyama"
-version = "1.7.0"
+version.workspace = true
 edition = "2021"
 authors = ["Samyama Graph Database Team"]
 description = "High-performance distributed graph database with OpenCypher support"
 license = "Apache-2.0"
 repository = "https://github.com/samyama-ai/samyama-graph"
+
+# crates.io caps a published crate at 10 MB compressed. Unexcluded, this one
+# carries ~11.6 MB of case-study demo GIFs, an MP4 and benchmark screenshots.
+# Those are already-compressed formats, so they do not shrink in the .crate and
+# the upload is rejected outright — 19 MB of files, most of it pictures.
+#
+# Dropping them takes the package to ~7.2 MB of almost entirely .rs, which
+# compresses several-fold. Nothing here is needed to build or use the library;
+# the only embedded asset, src/http/static/, is a single HTML file and is
+# untouched. The repository itself is unchanged for anyone reading it on GitHub.
+exclude = [
+    "*.gif",
+    "*.mp4",
+    "*.png",
+    "*.cast",
+]
 
 [dependencies]
 # Core dependencies
@@ -90,16 +114,16 @@ flate2 = "1.0"
 rayon = "1.10"
 
 # Optimization Engine (Phase 7)
-samyama-optimization = { path = "crates/samyama-optimization", version = "1.7.0" }
+samyama-optimization = { path = "crates/samyama-optimization", version = "1.7.1" }
 uuid = { version = "1.8", features = ["v4"] }
 tokio-stream = "0.1"
 futures = "0.3"
-samyama-graph-algorithms = { path = "crates/samyama-graph-algorithms", version = "1.7.0" }
+samyama-graph-algorithms = { path = "crates/samyama-graph-algorithms", version = "1.7.1" }
 ndarray = "0.15"
 reqwest = { version = "0.13.1", features = ["json"] }
 
 # GPU acceleration (optional; pulls the wgpu/cudarc dep tree only under --features gpu)
-samyama-gpu = { path = "crates/samyama-gpu", version = "1.1.0", optional = true }
+samyama-gpu = { path = "crates/samyama-gpu", version = "1.7.1", optional = true }
 
 [features]
 default = []
@@ -112,7 +136,7 @@ cuda = ["gpu", "samyama-gpu/cuda"]
 [dev-dependencies]
 tempfile = "3.8"
 criterion = "0.5"
-samyama-sdk = { path = "crates/samyama-sdk", version = "1.7.0" }
+samyama-sdk = { path = "crates/samyama-sdk", version = "1.7.1" }
 http-body-util = "0.1"
 
 # These examples carry `#[cfg(test)]` tests. Cargo defaults an example target to

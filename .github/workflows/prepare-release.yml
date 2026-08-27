@@ -1,0 +1,113 @@
+name: Prepare Release
+
+# Stage 1 of 2 in closing the "cut a release" loop. Until now, every release
+# has been a person hand-editing three version files across two languages,
+# running `git tag`, and filling in the GitHub Release UI — the actual source
+# of the staleness this repo's whole publish pipeline was built to fix. This
+# workflow does the bump and opens the PR; tag-release.yml (stage 2) does the
+# tag and the Release once that PR lands on main. Nothing publishes from this
+# workflow directly — main requires a reviewed PR and a green CI check, and
+# this respects that rather than bypassing it.
+#
+# Usage: Actions -> Prepare Release -> Run workflow -> version: 1.7.2
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "New version, no leading v (e.g. 1.7.2)"
+        required: true
+
+jobs:
+  bump:
+    name: Bump versions and open a release PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate version format
+        run: |
+          set -euo pipefail
+          V="${{ inputs.version }}"
+          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$V' is not a bare semver (expected e.g. 1.7.2, no leading v)"
+            exit 1
+          fi
+          if git rev-parse "v$V" >/dev/null 2>&1; then
+            echo "::error::tag v$V already exists"
+            exit 1
+          fi
+
+      # [workspace.package] version is the single source of truth for all six
+      # cargo crates — this is the one edit that moves all of them.
+      - name: Bump workspace version
+        run: |
+          set -euo pipefail
+          V="${{ inputs.version }}"
+          sed -i "0,/^version = \"[^\"]*\"/s//version = \"$V\"/" Cargo.toml
+          grep -q "^version = \"$V\"" Cargo.toml || { echo "::error::Cargo.toml bump did not take"; exit 1; }
+
+      # sdk/python is its own cargo workspace (excluded from the root one) and
+      # sdk/typescript is not cargo at all — neither can inherit
+      # [workspace.package], so both are bumped explicitly here, exactly like
+      # the workspace crates are versioned everywhere else in this repo.
+      - name: Bump sdk/python
+        run: |
+          set -euo pipefail
+          V="${{ inputs.version }}"
+          sed -i "0,/^version = \"[^\"]*\"/s//version = \"$V\"/" sdk/python/Cargo.toml
+          sed -i "0,/^version = \"[^\"]*\"/s//version = \"$V\"/" sdk/python/pyproject.toml
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Bump sdk/typescript
+        working-directory: sdk/typescript
+        run: npm version "${{ inputs.version }}" --no-git-tag-version --allow-same-version
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Cargo.lock records each workspace member's own version. A plain
+      # `cargo check` (no --locked, no --frozen) updates the lockfile in place
+      # whenever it detects the manifests changed — it cannot touch external
+      # dependency resolution here, since path dependencies pin no version
+      # range, only the six local entries move. This was verified by hand
+      # during the version-unification work this PR builds on: the same
+      # command was what actually produced the Cargo.lock diff there.
+      - name: Refresh Cargo.lock
+        run: cargo check --workspace
+
+      # A PR opened with the default GITHUB_TOKEN goes into GitHub's
+      # "approval-required" state and never fires ci.yml's own `pull_request`
+      # trigger — which is exactly the check branch protection requires
+      # before merge. Without RELEASE_PAT (a fine-grained PAT scoped to this
+      # repo, Contents: write + Pull requests: write, no other permissions)
+      # this PR still opens, but CI needs a human to approve the run once
+      # before it starts — see docs.github.com/en/actions/using-workflows/
+      # triggering-a-workflow#triggering-a-workflow-from-a-workflow. The `||`
+      # falls back to GITHUB_TOKEN so this step works either way; only the
+      # approval prompt depends on which one is set.
+      - name: Open release PR
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+          commit-message: "release: v${{ inputs.version }}"
+          branch: release/v${{ inputs.version }}
+          title: "release: v${{ inputs.version }}"
+          body: |
+            Version bump only — bumps all three version sources
+            (`Cargo.toml` workspace version, `sdk/python`, `sdk/typescript`)
+            to `${{ inputs.version }}` and refreshes `Cargo.lock`.
+
+            Merging this to `main` is what triggers `tag-release.yml`, which
+            tags `v${{ inputs.version }}` and publishes a GitHub Release. That
+            Release is what fires the four publish workflows (crates.io,
+            PyPI, npm, Docker) — nothing publishes until this merges.
+          labels: release
