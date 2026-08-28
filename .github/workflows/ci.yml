@@ -132,9 +132,16 @@ jobs:
         #
         # Raise the floor when it goes up; lowering it is allowed but must say
         # why in the same commit.
+        #
+        # Lowered 3665 -> 3656 on 2026-08-26 (then 3658 with #890): the harness began **checking
+        # declared side effects** (#888). Nothing regressed — 13 scenarios that
+        # had been passing on an empty result while the write they exist to test
+        # went unchecked now fail, including `MERGE (a)` creating a second node
+        # instead of matching the one that exists. Same shape as the outline
+        # expansion in #756: the ruler got honest and the count fell.
         run: |
           git clone --depth 1 --branch 2024.3             https://github.com/opencypher/openCypher.git /tmp/openCypher
-          cargo run --release --example tck_runner --             --features /tmp/openCypher/tck/features --min-pass 3428
+          cargo run --release --example tck_runner --             --features /tmp/openCypher/tck/features --min-pass 3700
 
       - name: CH-DETERM-THREADS — the answer does not depend on the thread count
         # LANG-14 (#611). CH-DETERM varies the *process*, which catches a
@@ -150,6 +157,13 @@ jobs:
         # after — a determinism gate added afterwards cannot tell a new bug
         # from a pre-existing one.
         run: ./scripts/check_thread_determinism.sh /tmp/openCypher/tck/features
+
+      - name: The release gate refuses for three reasons, not one
+        # It is the missing and the stale verdict that actually happen, and
+        # both look like "nothing is wrong" to a check that only compares a
+        # status string. This runs in CI because a gate nobody tests is a gate
+        # nobody can rely on at the moment it matters.
+        run: python3 scripts/test_check_release_gate.py
 
       - name: LINT-RATCHET — the clippy warning count may not rise
         # A ceiling, not a clean-tree gate: the debt stops growing while what

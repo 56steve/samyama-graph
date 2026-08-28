@@ -169,6 +169,32 @@ impl PartialEq for Value {
             // Path
             (Value::Path { nodes: n1, edges: e1 }, Value::Path { nodes: n2, edges: e2 }) => n1 == n2 && e1 == e2,
             (Value::Null, Value::Null) => true,
+            // Lists and maps had no arm at all, so they fell to `_ => false`
+            // and **no two lists were ever equal** -- `[] == []` included, and
+            // `a == a` with it, for a type that also implements `Eq` (#925).
+            //
+            // Nothing errored. `GROUP BY` a list simply never merged two
+            // groups and `DISTINCT` never removed a duplicate, so a query
+            // returned one row too many with every row individually right.
+            (Value::List(a), Value::List(b)) => a == b,
+            (Value::Map(a), Value::Map(b)) => a == b,
+            // The two spellings of one list. `PropertyValue::Array` cannot
+            // hold a node, so a list of relationships has to be a
+            // `Value::List` while a list read from a property is an `Array` --
+            // and a query that groups over both is mixing spellings, not
+            // types. Same for maps.
+            (Value::List(a), Value::Property(PropertyValue::Array(b)))
+            | (Value::Property(PropertyValue::Array(b)), Value::List(a)) => {
+                a.len() == b.len()
+                    && a.iter().zip(b).all(|(x, y)| *x == Value::Property(y.clone()))
+            }
+            (Value::Map(a), Value::Property(PropertyValue::Map(b)))
+            | (Value::Property(PropertyValue::Map(b)), Value::Map(a)) => {
+                a.len() == b.len()
+                    && a.iter().all(|(k, v)| {
+                        b.get(k).is_some_and(|w| *v == Value::Property(w.clone()))
+                    })
+            }
             _ => false,
         }
     }
@@ -177,21 +203,61 @@ impl PartialEq for Value {
 impl Eq for Value {}
 
 impl Hash for Value {
+    /// Hash **canonically**, not per variant.
+    ///
+    /// `Eq` treats `Value::List` and `Value::Property(Array)` as the same
+    /// list, and `Value::Map` and `Value::Property(Map)` as the same map, so
+    /// the two spellings have to reach the same hash or the `Hash`/`Eq`
+    /// contract is broken and a HashMap loses entries it holds.
+    ///
+    /// That is why a list is hashed here rather than delegating to its
+    /// elements' `Hash`: the elements are `PropertyValue` on one side and
+    /// `Value` on the other, and only hashing each element *as the `Value` it
+    /// is equal to* makes the two agree.
     fn hash<H: Hasher>(&self, state: &mut H) {
         // Use semantic tags so NodeRef and Node hash the same
         match self {
             Value::Node(id, _) | Value::NodeRef(id) => { 0u8.hash(state); id.hash(state); }
             Value::Edge(id, _) | Value::EdgeRef(id, ..) => { 1u8.hash(state); id.hash(state); }
+            // A property that is a list or a map hashes as the list or map it
+            // is, not as "a property".
+            Value::Property(PropertyValue::Array(items)) => {
+                5u8.hash(state);
+                items.len().hash(state);
+                for item in items { Value::Property(item.clone()).hash(state); }
+            }
+            Value::Property(PropertyValue::Map(entries)) => {
+                hash_map_entries(state, entries.iter().map(|(k, v)| (k, Value::Property(v.clone()))));
+            }
             Value::Property(p) => { 2u8.hash(state); p.hash(state); }
             Value::Path { nodes, edges } => { 3u8.hash(state); nodes.hash(state); edges.hash(state); }
-            Value::List(items) => { 5u8.hash(state); items.hash(state); }
+            Value::List(items) => {
+                5u8.hash(state);
+                items.len().hash(state);
+                for item in items { item.hash(state); }
+            }
             Value::Map(entries) => {
-                6u8.hash(state);
-                for (k, v) in entries { k.hash(state); v.hash(state); }
+                hash_map_entries(state, entries.iter().map(|(k, v)| (k, v.clone())));
             }
             Value::Null => { 4u8.hash(state); }
         }
     }
+}
+
+/// Hash a map's entries in key order.
+///
+/// `Value::Map` is a `BTreeMap` and `PropertyValue::Map` is a `HashMap`, whose
+/// iteration order is not stable between runs let alone between the two types.
+/// Sorting by key is what makes one hash of the other possible at all.
+fn hash_map_entries<'a, H: Hasher>(
+    state: &mut H,
+    entries: impl Iterator<Item = (&'a String, Value)>,
+) {
+    6u8.hash(state);
+    let mut pairs: Vec<(&String, Value)> = entries.collect();
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    pairs.len().hash(state);
+    for (k, v) in pairs { k.hash(state); v.hash(state); }
 }
 
 impl Record {
@@ -512,21 +578,60 @@ impl Value {
                 }
             }
             Value::Property(PropertyValue::Duration { months, days, seconds, nanos }) => {
+                // Duration accessors come in two families, and the difference
+                // is the whole design (#819):
+                //
+                //   * **Totals** -- `minutes` is the entire time part in
+                //     minutes (61 for PT1H1M1S), `nanoseconds` is the entire
+                //     time part in nanoseconds.
+                //   * **Remainders**, spelled `<unit>Of<Unit>` -- `minutesOfHour`
+                //     is the same value modulo the next unit up (1).
+                //
+                // `minutes` was returning the remainder and `nanoseconds` was
+                // returning only the sub-second field, so both read as the
+                // wrong family. Nine more accessors were absent and returned
+                // null, which is indistinguishable from a legitimate zero.
+                //
+                // Time and date parts never mix: a month is not a fixed number
+                // of days, so `days` cannot be derived from `months`, and the
+                // two families are computed independently.
+                const NPS: i64 = 1_000_000_000;
+                // Total sub-day time, normalized so the nanosecond remainder is
+                // **non-negative** -- `duration.between` of -86399.9s reports
+                // `seconds = -86400` with `nanosecondsOfSecond = +100000000`,
+                // not -86399 with -900000000.
+                //
+                // This is a presentation split and does not contradict the
+                // sign-consistency invariant (#806), which governs the stored
+                // components: those stay -86399/-900000000 so the duration
+                // still renders as `PT-23H-59M-59.9S`.
+                let total_nanos = *seconds as i128 * NPS as i128 + *nanos as i128;
+                let sec = total_nanos.div_euclid(NPS as i128) as i64;
+                let nos = total_nanos.rem_euclid(NPS as i128) as i64;
+                let int = |x: i64| PropertyValue::Integer(x);
                 match property {
-                    "months" => PropertyValue::Integer(*months),
-                    "days" => PropertyValue::Integer(*days),
-                    "seconds" => PropertyValue::Integer(*seconds),
-                    "nanoseconds" => PropertyValue::Integer(*nanos as i64),
-                    "hours" => PropertyValue::Integer(*seconds / 3600),
-                    "minutes" => PropertyValue::Integer((*seconds % 3600) / 60),
-                    "minutesOfHour" => PropertyValue::Integer((*seconds % 3600) / 60),
-                    "secondsOfMinute" => PropertyValue::Integer(*seconds % 60),
-                    // The sub-second accessors. `nanosecondsOfSecond` returned
-                    // null, so a scenario asserting 0 got null -- which reads
-                    // as "no such field" rather than "zero nanoseconds".
-                    "nanosecondsOfSecond" => PropertyValue::Integer(*nanos as i64),
-                    "millisecondsOfSecond" => PropertyValue::Integer(*nanos as i64 / 1_000_000),
-                    "microsecondsOfSecond" => PropertyValue::Integer(*nanos as i64 / 1_000),
+                    // Date part: totals, then remainders.
+                    "years" => int(*months / 12),
+                    "quarters" => int(*months / 3),
+                    "months" => int(*months),
+                    "weeks" => int(*days / 7),
+                    "days" => int(*days),
+                    "quartersOfYear" => int(*months / 3 % 4),
+                    "monthsOfQuarter" => int(*months % 3),
+                    "monthsOfYear" => int(*months % 12),
+                    "daysOfWeek" => int(*days % 7),
+                    // Time part: totals, then remainders.
+                    "hours" => int(sec / 3600),
+                    "minutes" => int(sec / 60),
+                    "seconds" => int(sec),
+                    "milliseconds" => int((total_nanos / 1_000_000) as i64),
+                    "microseconds" => int((total_nanos / 1_000) as i64),
+                    "nanoseconds" => int(total_nanos as i64),
+                    "minutesOfHour" => int(sec % 3600 / 60),
+                    "secondsOfMinute" => int(sec % 60),
+                    "millisecondsOfSecond" => int(nos / 1_000_000),
+                    "microsecondsOfSecond" => int(nos / 1_000),
+                    "nanosecondsOfSecond" => int(nos),
                     _ => PropertyValue::Null,
                 }
             }
@@ -1230,7 +1335,12 @@ fn temporal_component(v: &PropertyValue, property: &str) -> PropertyValue {
         }),
         "week" => date.map_or(PropertyValue::Null, |d| int(d.iso_week().week() as i64)),
         "weekYear" => date.map_or(PropertyValue::Null, |d| int(d.iso_week().year() as i64)),
-        "dayOfWeek" => date.map_or(PropertyValue::Null, |d| {
+        // Cypher spells the **accessor** `weekDay` and the **constructor key**
+        // `dayOfWeek`, for the same quantity. Only the constructor spelling was
+        // here, so `d.weekDay` returned null -- indistinguishable from a
+        // component the value does not have, which is what a date's `hour`
+        // legitimately returns (#862).
+        "weekDay" | "dayOfWeek" => date.map_or(PropertyValue::Null, |d| {
             int(d.weekday().number_from_monday() as i64)
         }),
         "ordinalDay" => date.map_or(PropertyValue::Null, |d| int(d.ordinal() as i64)),
@@ -1261,5 +1371,112 @@ fn temporal_component(v: &PropertyValue, property: &str) -> PropertyValue {
             let _ = DAY_NS;
             PropertyValue::Null
         }
+    }
+}
+
+/// Cypher's orderability over `Value`, for `ORDER BY`.
+///
+/// openCypher defines one total order across types, ascending:
+///
+/// ```text
+/// Map < Node < Relationship < List < Path < String < Boolean < Number < NaN < null
+/// ```
+///
+/// [`crate::graph::property::cypher_order`] already implements the part of
+/// that order a `PropertyValue` can express. It cannot express the rest: a
+/// `PropertyValue` holds no node, relationship or path, so sorting through
+/// `as_property()` folded every entity to `Null` (#917). The rows still came
+/// back — the right rows, in fact — with every node, relationship and path
+/// bunched at the null end and indistinguishable from each other and from a
+/// missing value. `ORDER BY` reported success and answered wrongly.
+///
+/// So the comparison has to happen at `Value`, above the property type, and
+/// this function is where the three entity ranks live. Everything it can hand
+/// to `cypher_order` it hands over, so there is still one implementation of
+/// the property half rather than two that drift.
+pub fn cypher_order_value(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    // Ranks are the ascending order above. `Value::List`/`Value::Map` and
+    // their `PropertyValue` spellings are the same type to a query and must
+    // rank the same, or `[1]` and a list of nodes sort into different places.
+    fn rank(v: &Value) -> u8 {
+        match v {
+            Value::Map(_) => 0,
+            Value::Node(..) | Value::NodeRef(_) => 1,
+            Value::Edge(..) | Value::EdgeRef(..) => 2,
+            Value::List(_) => 3,
+            Value::Path { .. } => 4,
+            Value::Null => 9,
+            Value::Property(p) => match p {
+                PropertyValue::Map(_) => 0,
+                PropertyValue::Array(_) | PropertyValue::Vector(_) => 3,
+                PropertyValue::String(_) => 5,
+                PropertyValue::Boolean(_) => 6,
+                PropertyValue::Float(f) if f.is_nan() => 8,
+                PropertyValue::Null => 9,
+                _ => 7,
+            },
+        }
+    }
+
+    let (ra, rb) = (rank(a), rank(b));
+    if ra != rb {
+        return ra.cmp(&rb);
+    }
+
+    match (a, b) {
+        // Both are properties of the same rank: the existing order decides,
+        // including NaN and the element-wise list comparison.
+        (Value::Property(x), Value::Property(y)) => crate::graph::property::cypher_order(x, y),
+        // Element-wise, then by length — the same rule `cypher_order` applies
+        // to `PropertyValue::Array`, restated here because the elements are
+        // `Value`s and may be entities.
+        (Value::List(x), Value::List(y)) => {
+            for (xi, yi) in x.iter().zip(y.iter()) {
+                let c = cypher_order_value(xi, yi);
+                if c != Ordering::Equal {
+                    return c;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
+        // A `Value::Map` against a `PropertyValue::Map`, or a list against an
+        // array: same rank, different spelling. Compare by sorted key, then by
+        // the value under it, so the two spellings interleave.
+        (Value::Map(x), Value::Map(y)) => {
+            let (mut xk, mut yk): (Vec<_>, Vec<_>) =
+                (x.keys().collect(), y.keys().collect());
+            xk.sort();
+            yk.sort();
+            for (kx, ky) in xk.iter().zip(yk.iter()) {
+                let c = kx.cmp(ky);
+                if c != Ordering::Equal {
+                    return c;
+                }
+                let c = cypher_order_value(&x[*kx], &y[*ky]);
+                if c != Ordering::Equal {
+                    return c;
+                }
+            }
+            xk.len().cmp(&yk.len())
+        }
+        // Entities of the same kind. openCypher leaves the order among them
+        // undefined; element id is stable and total, which is what a sort
+        // needs. Two runs over the same graph therefore agree.
+        _ => entity_id(a).cmp(&entity_id(b)),
+    }
+}
+
+fn entity_id(v: &Value) -> (u64, usize) {
+    match v {
+        Value::Node(id, _) | Value::NodeRef(id) => (id.as_u64(), 0),
+        Value::Edge(id, _) | Value::EdgeRef(id, ..) => (id.as_u64(), 0),
+        // A path has no id; length then first node orders it deterministically.
+        Value::Path { nodes, edges } => (
+            nodes.first().map(|n| n.as_u64()).unwrap_or(0),
+            edges.len(),
+        ),
+        _ => (0, 0),
     }
 }

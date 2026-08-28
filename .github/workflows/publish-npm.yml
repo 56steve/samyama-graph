@@ -1,0 +1,101 @@
+name: Publish TypeScript SDK to npm
+
+# Publishes sdk/typescript as `samyama-sdk` on npm when a GitHub Release is
+# published. There was no automation for this at all before now — the last
+# publish (0.6.1) was a hand upload, same vintage as the equivalent PyPI
+# wheel, and nothing has shipped since.
+#
+# Unlike the Python SDK, this package is pure TypeScript with no native
+# binding, so there is no platform matrix: one build produces one artifact
+# that runs anywhere Node runs.
+#
+# Auth is npm Trusted Publishing (OIDC), GA since 2025-07-31 — same model as
+# the PyPI and crates.io workflows in this repo, no stored token. This is not
+# a hygiene nicety: in May 2026 the Mini Shai-Hulud worm compromised the
+# TanStack and @antv ecosystems specifically via stolen npm tokens. A stored
+# NPM_TOKEN is a live target, not a theoretical one.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and validate the package, upload nothing"
+        type: boolean
+        default: true
+
+env:
+  SDK_DIR: sdk/typescript
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    environment: npm
+    permissions:
+      id-token: write   # required for OIDC trusted publishing
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Trusted Publishing needs npm CLI >= 11.5.1. The version bundled with a
+      # given setup-node Node release lags behind npm's own releases, so it is
+      # pinned explicitly rather than trusted to already be new enough.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Update npm to a Trusted-Publishing-capable version
+        run: npm install -g npm@^11.5.1
+
+      - name: Install dependencies
+        working-directory: ${{ env.SDK_DIR }}
+        run: npm ci
+
+      # package.json has no version.workspace equivalent — like sdk/python, it
+      # sits outside the cargo workspace and is bumped by hand. Checked
+      # explicitly against the release tag for the same reason as the crates
+      # and PyPI guards: npm also refuses to re-publish an existing version.
+      - name: Verify package version matches the release tag
+        if: github.event_name == 'release'
+        working-directory: ${{ env.SDK_DIR }}
+        run: |
+          set -euo pipefail
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          TAG="${{ github.event.release.tag_name }}"
+          if [ "${TAG#v}" != "$PKG_VERSION" ]; then
+            echo "::error::package.json is $PKG_VERSION, release tag is $TAG"
+            exit 1
+          fi
+          echo "tag $TAG matches package.json ($PKG_VERSION)"
+
+      - name: Build
+        working-directory: ${{ env.SDK_DIR }}
+        run: npm run build
+
+      - name: Publish
+        working-directory: ${{ env.SDK_DIR }}
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = "true" ]; then
+            npm publish --dry-run
+            echo "DRY_RUN set — validated, not uploading"
+            exit 0
+          fi
+
+          # npm rejects a re-publish of an existing version outright, so a
+          # rerun after a partial multi-package release failure is a no-op
+          # here rather than an error.
+          if npm view samyama-sdk@"$(node -p "require('./package.json').version")" version >/dev/null 2>&1; then
+            echo "already on npm — skipping"
+            exit 0
+          fi
+
+          npm publish
